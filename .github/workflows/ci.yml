@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Check formatting (advisory)
+        run: cargo fmt --all -- --check || echo "::warning::rustfmt differences found"
+      - name: Build release binary
+        run: cargo build --release -p db-mcp-server
+      - name: Rust unit, contract, security and integration tests
+        run: cargo test --workspace --release
+      - name: Node end-to-end tests (stdio + HTTP + CLI approval)
+        run: npm test
+      - name: Feature matrix smoke test
+        run: node scripts/feature-smoke.js
+      - name: npm pack dry run
+        run: npm pack --dry-run

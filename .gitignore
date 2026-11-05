@@ -38,3 +38,6 @@ research/fixtures/*.db-shm
 reference/dbhub/dist/
 reference/dbhub/*.tgz
 reference/dbhub/node_modules/
+
+# Runtime state created by the starter config (db-mcp init)
+.db-mcp/

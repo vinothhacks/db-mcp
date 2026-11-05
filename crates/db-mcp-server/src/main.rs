@@ -252,9 +252,36 @@ async fn run_stdio_loop(handler: McpProtocolHandler, caller: CallerIdentity) -> 
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Stack size for the thread that drives the async runtime and for every Tokio worker thread.
+///
+/// SQL parsing (`sqlparser`) and the lineage / call-graph analyzers recurse deeply, and the large
+/// `tools/call` state machine lives on the stack of whichever thread polls it. Windows gives the
+/// main thread only 1 MiB (Linux: 8 MiB), which overflows on `trace_table_dependencies`; running
+/// everything on explicitly sized threads makes behaviour identical across platforms.
+const RUNTIME_STACK_SIZE: usize = 64 * 1024 * 1024;
+const WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let handle = std::thread::Builder::new()
+        .name("db-mcp-main".to_string())
+        .stack_size(RUNTIME_STACK_SIZE)
+        .spawn(move || -> anyhow::Result<()> {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_name("db-mcp-worker")
+                .thread_stack_size(WORKER_STACK_SIZE)
+                .build()?;
+            runtime.block_on(async_main(cli))
+        })
+        .map_err(|e| anyhow::anyhow!("failed to spawn runtime thread: {e}"))?;
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!("db-mcp runtime thread panicked"),
+    }
+}
+
+async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let command = cli.command.unwrap_or(Commands::Serve {
         transport: "stdio".to_string(),
         bind: None,
