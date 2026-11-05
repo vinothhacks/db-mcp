@@ -1,0 +1,15 @@
+{
+  "name": "bytebase/bytebase",
+  "pinned_commit": "e914b2c7803f5a126d984c017b3e52a90f816420",
+  "version": "3.4.0",
+  "repository": "https://github.com/bytebase/bytebase",
+  "license": "Apache-2.0 (core) / Bytebase Enterprise License (ee/ enterprise features)",
+  "language": "Go / TypeScript",
+  "clean_room_boundary": "Strict clean-room implementation from behavioral specifications only. No code copied from Bytebase.",
+  "studied_capabilities": [
+    "Identity-scoped connection authorization and operating modes (Development, ReadOnly, GovernedProduction)",
+    "Governed change workflow: propose_change -> out-of-band approval -> apply_change",
+    "Cryptographic approval hash binding (SQL + params + connection_id + proposing_principal + policy_revision + schema_fingerprint + expiry + constraints)",
+    "Structured audit trail and secret/sensitive-data disclosure controls"
+  ]
+}

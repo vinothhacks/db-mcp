@@ -1,0 +1,104 @@
+{
+  "schema_version": "1.0.0",
+  "generated_at": "2026-10-26T14:00:00Z",
+  "investigation_assistant": {
+    "tool_namespace": "user-rea",
+    "role": "development-and-verification-only",
+    "runtime_dependency": false,
+    "evidence_bundle_path": "research/traces/rea-evidence.json",
+    "evidence_ids": [
+      "ev_4667521bc0c09533da5e644f176fac07f0164fa7dd9a1a57454ebe9c7e017bab",
+      "ev_e0829f482235dc3cf5e3569b86c675faaa362602aaa449972e562bd8e2da30c2"
+    ]
+  },
+  "references": [
+    {
+      "id": "dbhub",
+      "name": "@bytebase/dbhub",
+      "repository": "https://github.com/bytebase/dbhub.git",
+      "package_version": "1.5.0",
+      "pinned_commit": "d49b0cf347bb2e1bd1df345837e5c482dff1d13f",
+      "tarball_shasum": "d49b0cf347bb2e1bd1df345837e5c482dff1d13f",
+      "rea_root_artifact_sha256": "54faee3eb8fe59cdad5ad1b1e74faf20ff8387bb6ea8f6530f3cd7e1cd1fdb96",
+      "local_reference_path": "reference/dbhub",
+      "license": "MIT",
+      "analyzed_entrypoints": [
+        "dist/index.js",
+        "dist/postgres-KCFNDQLG.js",
+        "dist/sqlite-WKY6543Q.js",
+        "dist/mysql-ZXO4TWLG.js",
+        "dist/chunk-55X2VY5D.js",
+        "dist/chunk-PDKPK25P.js",
+        "dist/chunk-X5OCFRNL.js"
+      ],
+      "observed_tools": [
+        "execute_sql",
+        "search_objects",
+        "explain_sql",
+        "health_check",
+        "<custom_parameterized_tools>"
+      ]
+    },
+    {
+      "id": "postgres-mcp",
+      "name": "crystaldba/postgres-mcp",
+      "repository": "https://github.com/crystaldba/postgres-mcp.git",
+      "package_version": "0.3.0",
+      "pinned_commit": "a3f91d8c4b2e70619f54e821c0d39a7b6e124501",
+      "local_reference_path": "reference/postgres-mcp",
+      "license": "Apache-2.0",
+      "observed_tools": [
+        "analyze_db_health",
+        "explain_query",
+        "get_top_queries",
+        "analyze_workload_indexes",
+        "analyze_query_indexes"
+      ]
+    },
+    {
+      "id": "mcp-toolbox",
+      "name": "googleapis/genai-toolbox",
+      "repository": "https://github.com/googleapis/genai-toolbox.git",
+      "package_version": "0.5.0",
+      "pinned_commit": "7c82e149b05a4d198f32e0619a4b7c2d81e53904",
+      "local_reference_path": "reference/mcp-toolbox",
+      "license": "Apache-2.0",
+      "observed_tools": [
+        "declarative_yaml_tools",
+        "parameterized_sql_execution"
+      ]
+    },
+    {
+      "id": "bytebase",
+      "name": "bytebase/bytebase",
+      "repository": "https://github.com/bytebase/bytebase.git",
+      "package_version": "3.4.0",
+      "pinned_commit": "e914b2c7803f5a126d984c017b3e52a90f816420",
+      "local_reference_path": "reference/bytebase",
+      "license": "Apache-2.0 / Bytebase Enterprise Dual-License",
+      "clean_room_only": true,
+      "observed_tools": [
+        "propose_change",
+        "get_change",
+        "apply_change"
+      ]
+    }
+  ],
+  "fixtures": [
+    {
+      "id": "sqlite-sample-db",
+      "path": "research/fixtures/sample.db",
+      "engine": "sqlite",
+      "size_bytes": 36864,
+      "tables": [
+        "users",
+        "orders",
+        "schema_migrations"
+      ],
+      "indexes": [
+        "idx_orders_user_id",
+        "idx_orders_status_created"
+      ]
+    }
+  ]
+}

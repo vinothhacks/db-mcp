@@ -1,0 +1,43 @@
+[package]
+name = "db-mcp-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "db-mcp-server"
+path = "src/main.rs"
+
+[dependencies]
+db-mcp-core.workspace = true
+db-mcp-secrets.workspace = true
+db-mcp-sql.workspace = true
+db-mcp-catalog.workspace = true
+db-mcp-policy.workspace = true
+db-mcp-audit.workspace = true
+db-mcp-executor.workspace = true
+db-mcp-tools.workspace = true
+db-mcp-sqlite.workspace = true
+db-mcp-postgres.workspace = true
+db-mcp-mysql.workspace = true
+db-mcp-pg-insights.workspace = true
+db-mcp-changes.workspace = true
+db-mcp-mcp.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+axum.workspace = true
+tower.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+url.workspace = true
+dashmap.workspace = true
+regex.workspace = true

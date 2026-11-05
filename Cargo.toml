@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/db-mcp-core",
+    "crates/db-mcp-secrets",
+    "crates/db-mcp-sql",
+    "crates/db-mcp-catalog",
+    "crates/db-mcp-policy",
+    "crates/db-mcp-audit",
+    "crates/db-mcp-executor",
+    "crates/db-mcp-tools",
+    "crates/db-mcp-sqlite",
+    "crates/db-mcp-postgres",
+    "crates/db-mcp-mysql",
+    "crates/db-mcp-pg-insights",
+    "crates/db-mcp-changes",
+    "crates/db-mcp-mcp",
+    "crates/db-mcp-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["DB-MCP Contributors"]
+rust-version = "1.75"
+
+[workspace.dependencies]
+tokio = { version = "1.38", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt", "codec"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+anyhow = "1.0"
+async-trait = "0.1"
+sqlparser = { version = "0.50", features = ["serde", "visitor"] }
+rusqlite = { version = "0.31", features = ["bundled", "serde_json", "chrono"] }
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.8", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+toml = "0.8"
+serde_yaml = "0.9"
+clap = { version = "4.5", features = ["derive", "env"] }
+axum = { version = "0.7", features = ["macros", "json"] }
+tower = { version = "0.4", features = ["util"] }
+url = { version = "2.5", features = ["serde"] }
+dashmap = "6.0"
+regex = "1.10"
+
+# Internal workspace crates
+db-mcp-core = { path = "crates/db-mcp-core" }
+db-mcp-secrets = { path = "crates/db-mcp-secrets" }
+db-mcp-sql = { path = "crates/db-mcp-sql" }
+db-mcp-catalog = { path = "crates/db-mcp-catalog" }
+db-mcp-policy = { path = "crates/db-mcp-policy" }
+db-mcp-audit = { path = "crates/db-mcp-audit" }
+db-mcp-executor = { path = "crates/db-mcp-executor" }
+db-mcp-tools = { path = "crates/db-mcp-tools" }
+db-mcp-sqlite = { path = "crates/db-mcp-sqlite" }
+db-mcp-postgres = { path = "crates/db-mcp-postgres" }
+db-mcp-mysql = { path = "crates/db-mcp-mysql" }
+db-mcp-pg-insights = { path = "crates/db-mcp-pg-insights" }
+db-mcp-changes = { path = "crates/db-mcp-changes" }
+db-mcp-mcp = { path = "crates/db-mcp-mcp" }

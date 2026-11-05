@@ -1,0 +1,32 @@
+[package]
+name = "db-mcp-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+db-mcp-core.workspace = true
+db-mcp-secrets.workspace = true
+db-mcp-sql.workspace = true
+db-mcp-catalog.workspace = true
+db-mcp-policy.workspace = true
+db-mcp-audit.workspace = true
+db-mcp-executor.workspace = true
+db-mcp-tools.workspace = true
+db-mcp-sqlite.workspace = true
+db-mcp-postgres.workspace = true
+db-mcp-mysql.workspace = true
+db-mcp-pg-insights.workspace = true
+db-mcp-changes.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+dashmap.workspace = true

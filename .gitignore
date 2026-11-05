@@ -1,0 +1,40 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Node
+node_modules/
+npm-debug.log*
+*.tgz
+
+# Local secrets / env
+.env
+.env.*
+!.env.example
+
+# Editor / tooling
+.rocketride/
+.serena/
+.vscode/
+.idea/
+*.swp
+
+# Prebuilt binaries and release staging
+/dist/
+
+# Generated runtime state (recreated on startup / by tests)
+research/traces/*.db
+research/traces/*.db-journal
+research/traces/*.db-wal
+research/traces/*.db-shm
+research/traces/*.jsonl
+research/traces/rea-*.json
+research/fixtures/*.db
+research/fixtures/*.db-journal
+research/fixtures/*.db-wal
+research/fixtures/*.db-shm
+
+# Third-party reference bundle (Bytebase DBHub, MIT) -- kept only as pinned metadata
+reference/dbhub/dist/
+reference/dbhub/*.tgz
+reference/dbhub/node_modules/

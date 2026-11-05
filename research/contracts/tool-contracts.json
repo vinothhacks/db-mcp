@@ -1,0 +1,594 @@
+{
+  "schema_version": "1.1.0",
+  "description": "DB-MCP canonical tool contracts covering all 16 MCP tools across Explore, Query, Diagnose, Change, and Schema profiles, including success envelopes, denial envelopes, audit events, and adversarial security cases.",
+  "envelopes": {
+    "success": {
+      "required_fields": [
+        "request_id",
+        "connection",
+        "status",
+        "columns",
+        "rows",
+        "returned_rows",
+        "truncated",
+        "warnings",
+        "schema_version"
+      ],
+      "status_value": "ok"
+    },
+    "denial": {
+      "required_fields": [
+        "status",
+        "code",
+        "message",
+        "next_action"
+      ],
+      "status_value": "denied"
+    },
+    "audit_event": {
+      "required_fields": [
+        "event_id",
+        "timestamp",
+        "request_id",
+        "principal",
+        "connection",
+        "tool_name",
+        "sql_hash",
+        "classification",
+        "decision",
+        "duration_ms",
+        "returned_rows",
+        "truncated"
+      ]
+    }
+  },
+  "tool_profiles": {
+    "explore": [
+      "list_connections",
+      "search_objects",
+      "describe_object",
+      "trace_table_dependencies",
+      "get_procedure_call_graph"
+    ],
+    "query": [
+      "execute_query",
+      "explain_query",
+      "run_named_tool"
+    ],
+    "diagnose": [
+      "database_health",
+      "analyze_workload",
+      "recommend_indexes"
+    ],
+    "change": [
+      "propose_change",
+      "get_change",
+      "apply_change"
+    ],
+    "schema": [
+      "capture_schema",
+      "diff_schema"
+    ]
+  },
+  "contracts": [
+    {
+      "id": "CONTRACT-EXPLORE-LIST-CONNECTIONS",
+      "tool": "list_connections",
+      "profile": "explore",
+      "caller": {
+        "principal": "agent:cursor-dev",
+        "role": "developer"
+      },
+      "request": {},
+      "fixture": "research/fixtures/sample.db",
+      "expected_response": {
+        "request_id": "req_list_conn_01",
+        "connection": "system",
+        "status": "ok",
+        "columns": [
+          "id",
+          "engine",
+          "mode",
+          "read_only",
+          "capabilities"
+        ],
+        "returned_rows": 1,
+        "truncated": false,
+        "warnings": [],
+        "schema_version": "snapshot_initial"
+      },
+      "security_invariants": [
+        "Connection DSNs, passwords, and secret tokens must never appear in rows or metadata."
+      ]
+    },
+    {
+      "id": "CONTRACT-EXPLORE-SEARCH-OBJECTS",
+      "tool": "search_objects",
+      "profile": "explore",
+      "caller": {
+        "principal": "agent:cursor-dev",
+        "role": "developer"
+      },
+      "request": {
+        "connection": "sqlite-sample",
+        "object_type": "table",
+        "pattern": "%",
+        "detail_level": "summary",
+        "limit": 100
+      },
+      "fixture": "research/fixtures/sample.db",
+      "expected_response": {
+        "request_id": "req_search_01",
+        "connection": "sqlite-sample",
+        "status": "ok",
+        "columns": [
+          "name",
+          "schema",
+          "column_count",
+          "row_count"
+        ],
+        "returned_rows": 3,
+        "truncated": false,
+        "warnings": [],
+        "schema_version": "snapshot_sqlite_sample"
+      },
+      "expected_audit": {
+        "tool_name": "search_objects",
+        "classification": "MetadataRead",
+        "decision": "Allow"
+      }
+    },
+    {
+      "id": "CONTRACT-EXPLORE-DESCRIBE-OBJECT",
+      "tool": "describe_object",
+      "profile": "explore",
+      "caller": {
+        "principal": "agent:cursor-dev",
+        "role": "developer"
+      },
+      "request": {
+        "connection": "sqlite-sample",
+        "object_type": "table",
+        "name": "orders",
+        "schema": "main"
+      },
+      "fixture": "research/fixtures/sample.db",
+      "expected_response": {
+        "request_id": "req_describe_01",
+        "connection": "sqlite-sample",
+        "status": "ok",
+        "columns": [
+          "object_name",
+          "schema",
+          "columns",
+          "indexes",
+          "foreign_keys",
+          "untrusted_content"
+        ],
+        "returned_rows": 1,
+        "truncated": false,
+        "warnings": [],
+        "schema_version": "snapshot_sqlite_sample"
+      }
+    },
+    {
+      "id": "CONTRACT-EXPLORE-TRACE-TABLE-DEPENDENCIES",
+      "tool": "trace_table_dependencies",
+      "profile": "explore",
+      "caller": {
+        "principal": "agent:cursor-dev",
+        "role": "developer"
+      },
+      "request": {
+        "connection": "prod-postgres",
+        "table_name": "users",
+        "target_table": "order_items",
+        "max_depth": 3
+      },
+      "fixture": "research/fixtures/sample.db",
+      "expected_response": {
+        "request_id": "req_trace_dep_01",
+        "connection": "prod-postgres",
+        "status": "ok",
+        "columns": [],
+        "returned_rows": 0,
+        "truncated": false,
+        "warnings": [],
+        "schema_version": "snapshot_lineage"
+      },
+      "expected_audit": {
+        "tool_name": "trace_table_dependencies",
+        "classification": "Read",
+        "decision": "Allowed"
+      }
+    },
+    {
+      "id": "CONTRACT-EXPLORE-GET-PROCEDURE-CALL-GRAPH",
+      "tool": "get_procedure_call_graph",
+      "profile": "explore",
+      "caller": {
+        "principal": "agent:cursor-dev",
+        "role": "developer"
+      },
+      "request": {
+        "connection": "prod-postgres",
+        "procedure_name": "checkout_order",
+        "direction": "callees",
+        "max_depth": 5
+      },
+      "fixture": "research/fixtures/sample.db",
+      "expected_response": {
+        "request_id": "req_proc_graph_01",
+        "connection": "prod-postgres",
+        "status": "ok",
+        "columns": [],
+        "returned_rows": 0,
+        "truncated": false,
+        "warnings": [],
+        "schema_version": "snapshot_call_graph"
+      },
+      "expected_audit": {
+        "tool_name": "get_procedure_call_graph",
+        "classification": "Read",
+        "decision": "Allowed"
+      }
+    },
+    {
+      "id": "CONTRACT-QUERY-EXECUTE-READ-OK",
+      "tool": "execute_query",
+      "profile": "query",
+      "caller": {
+        "principal": "agent:cursor-dev",
+        "role": "developer"
+      },
+      "request": {
+        "connection": "sqlite-sample",
+        "sql": "SELECT id, user_id, status, total_cents FROM orders WHERE status = 'completed' ORDER BY id ASC",
+        "max_rows": 2
+      },
+      "fixture": "research/fixtures/sample.db",
+      "expected_response": {
+        "request_id": "req_query_01",
+        "connection": "sqlite-sample",
+        "status": "ok",
+        "columns": [
+          "id",
+          "user_id",
+          "status",
+          "total_cents"
+        ],
+        "rows": [
+          [101, 1, "completed", 14900],
+          [102, 2, "completed", 4900]
+        ],
+        "returned_rows": 2,
+        "truncated": false,
+        "warnings": [],
+        "schema_version": "snapshot_sqlite_sample"
+      },
+      "expected_audit": {
+        "tool_name": "execute_query",
+        "classification": "Read",
+        "decision": "Allow"
+      }
+    },
+    {
+      "id": "CONTRACT-QUERY-EXECUTE-DENIED-GOVERNED-WRITE",
+      "tool": "execute_query",
+      "profile": "query",
+      "caller": {
+        "principal": "agent:cursor-dev",
+        "role": "developer"
+      },
+      "request": {
+        "connection": "prod-governed",
+        "sql": "DELETE FROM orders WHERE status = 'cancelled'"
+      },
+      "fixture": "research/fixtures/sample.db",
+      "expected_denial": {
+        "status": "denied",
+        "code": "APPROVAL_REQUIRED",
+        "message": "Production schema or data changes require an approved proposal.",
+        "next_action": "propose_change"
+      },
+      "expected_audit": {
+        "tool_name": "execute_query",
+        "classification": "WriteDml",
+        "decision": "Deny"
+      }
+    },
+    {
+      "id": "CONTRACT-QUERY-EXECUTE-DENIED-MUTATING-CTE",
+      "tool": "execute_query",
+      "profile": "query",
+      "caller": {
+        "principal": "agent:cursor-dev",
+        "role": "developer"
+      },
+      "request": {
+        "connection": "readonly-conn",
+        "sql": "WITH deleted AS (DELETE FROM orders WHERE id = 104 RETURNING *) SELECT * FROM deleted"
+      },
+      "fixture": "research/fixtures/sample.db",
+      "expected_denial": {
+        "status": "denied",
+        "code": "READONLY_VIOLATION",
+        "message": "Data-modifying CTEs are forbidden in ReadOnly and GovernedProduction modes.",
+        "next_action": "propose_change"
+      }
+    },
+    {
+      "id": "CONTRACT-QUERY-EXECUTE-DENIED-MULTI-STATEMENT",
+      "tool": "execute_query",
+      "profile": "query",
+      "caller": {
+        "principal": "agent:cursor-dev",
+        "role": "developer"
+      },
+      "request": {
+        "connection": "readonly-conn",
+        "sql": "SELECT 1; DROP TABLE users;"
+      },
+      "fixture": "research/fixtures/sample.db",
+      "expected_denial": {
+        "status": "denied",
+        "code": "MULTI_STATEMENT_FORBIDDEN",
+        "message": "Multi-statement SQL batches are forbidden by policy.",
+        "next_action": "split_statements"
+      }
+    },
+    {
+      "id": "CONTRACT-QUERY-EXECUTE-DENIED-PRIVILEGED-FUNCTION",
+      "tool": "execute_query",
+      "profile": "query",
+      "caller": {
+        "principal": "agent:cursor-dev",
+        "role": "developer"
+      },
+      "request": {
+        "connection": "readonly-conn",
+        "sql": "SELECT pg_read_file('/etc/passwd')"
+      },
+      "fixture": "research/fixtures/sample.db",
+      "expected_denial": {
+        "status": "denied",
+        "code": "PRIVILEGED_FUNCTION_FORBIDDEN",
+        "message": "Side-effecting or privileged database function 'pg_read_file' is blocked by policy.",
+        "next_action": "remove_privileged_function"
+      }
+    },
+    {
+      "id": "CONTRACT-QUERY-EXPLAIN",
+      "tool": "explain_query",
+      "profile": "query",
+      "caller": {
+        "principal": "agent:cursor-dev",
+        "role": "developer"
+      },
+      "request": {
+        "connection": "sqlite-sample",
+        "sql": "SELECT * FROM orders WHERE user_id = 2"
+      },
+      "fixture": "research/fixtures/sample.db",
+      "expected_response": {
+        "request_id": "req_explain_01",
+        "connection": "sqlite-sample",
+        "status": "ok",
+        "columns": [
+          "id",
+          "parent",
+          "notused",
+          "detail"
+        ],
+        "returned_rows": 1,
+        "truncated": false,
+        "warnings": [],
+        "schema_version": "snapshot_sqlite_sample"
+      }
+    },
+    {
+      "id": "CONTRACT-QUERY-NAMED-TOOL",
+      "tool": "run_named_tool",
+      "profile": "query",
+      "caller": {
+        "principal": "agent:cursor-dev",
+        "role": "developer"
+      },
+      "request": {
+        "tool_name": "get_orders_by_status",
+        "arguments": {
+          "status": "completed"
+        }
+      },
+      "fixture": "research/fixtures/sample.db",
+      "expected_response": {
+        "request_id": "req_named_01",
+        "connection": "sqlite-sample",
+        "status": "ok",
+        "columns": [
+          "id",
+          "user_id",
+          "status",
+          "total_cents"
+        ],
+        "returned_rows": 2,
+        "truncated": false,
+        "warnings": [],
+        "schema_version": "snapshot_sqlite_sample"
+      }
+    },
+    {
+      "id": "CONTRACT-DIAGNOSE-DATABASE-HEALTH",
+      "tool": "database_health",
+      "profile": "diagnose",
+      "caller": {
+        "principal": "agent:cursor-dev",
+        "role": "developer"
+      },
+      "request": {
+        "connection": "sqlite-sample"
+      },
+      "fixture": "research/fixtures/sample.db",
+      "expected_response": {
+        "request_id": "req_health_01",
+        "connection": "sqlite-sample",
+        "status": "ok",
+        "columns": [
+          "check_name",
+          "status",
+          "value",
+          "evidence",
+          "recommendation"
+        ],
+        "returned_rows": 4,
+        "truncated": false,
+        "warnings": [],
+        "schema_version": "snapshot_sqlite_sample"
+      }
+    },
+    {
+      "id": "CONTRACT-DIAGNOSE-ANALYZE-WORKLOAD",
+      "tool": "analyze_workload",
+      "profile": "diagnose",
+      "caller": {
+        "principal": "agent:cursor-dev",
+        "role": "developer"
+      },
+      "request": {
+        "connection": "sqlite-sample",
+        "top_n": 10
+      },
+      "fixture": "research/fixtures/sample.db",
+      "expected_response": {
+        "request_id": "req_workload_01",
+        "connection": "sqlite-sample",
+        "status": "ok",
+        "columns": [
+          "query_fingerprint",
+          "calls",
+          "total_ms",
+          "mean_ms",
+          "rows_returned"
+        ],
+        "returned_rows": 1,
+        "truncated": false,
+        "warnings": [],
+        "schema_version": "snapshot_sqlite_sample"
+      }
+    },
+    {
+      "id": "CONTRACT-DIAGNOSE-RECOMMEND-INDEXES",
+      "tool": "recommend_indexes",
+      "profile": "diagnose",
+      "caller": {
+        "principal": "agent:cursor-dev",
+        "role": "developer"
+      },
+      "request": {
+        "connection": "sqlite-sample",
+        "queries": [
+          "SELECT * FROM orders WHERE user_id = 1 AND status = 'completed' ORDER BY created_at DESC"
+        ]
+      },
+      "fixture": "research/fixtures/sample.db",
+      "expected_response": {
+        "request_id": "req_rec_idx_01",
+        "connection": "sqlite-sample",
+        "status": "ok",
+        "columns": [
+          "observed_issue",
+          "evidence_timestamp",
+          "relevant_queries",
+          "suggested_ddl",
+          "estimated_benefit",
+          "write_storage_tradeoffs",
+          "required_privileges",
+          "validation_procedure",
+          "recovery_considerations"
+        ],
+        "returned_rows": 1,
+        "truncated": false,
+        "warnings": [],
+        "schema_version": "snapshot_sqlite_sample"
+      }
+    },
+    {
+      "id": "CONTRACT-CHANGE-LIFECYCLE",
+      "tool": "propose_change",
+      "profile": "change",
+      "caller": {
+        "principal": "agent:cursor-dev",
+        "role": "developer"
+      },
+      "request": {
+        "connection": "prod-governed",
+        "sql": "CREATE INDEX idx_users_role ON users(role)",
+        "description": "Add index on users.role for role lookup queries"
+      },
+      "fixture": "research/fixtures/sample.db",
+      "expected_response": {
+        "request_id": "req_prop_01",
+        "connection": "prod-governed",
+        "status": "ok",
+        "columns": [
+          "change_id",
+          "state",
+          "approval_hash",
+          "proposing_principal",
+          "schema_fingerprint",
+          "reversibility",
+          "expires_at"
+        ],
+        "returned_rows": 1,
+        "truncated": false,
+        "warnings": [],
+        "schema_version": "snapshot_sqlite_sample"
+      },
+      "governance_invariants": [
+        {
+          "case": "self_approval_rejected",
+          "code": "SELF_APPROVAL_FORBIDDEN",
+          "description": "Proposing principal cannot approve its own change proposal."
+        },
+        {
+          "case": "replay_rejected",
+          "code": "APPROVAL_ALREADY_CONSUMED",
+          "description": "Calling apply_change a second time on an already applied change_id must fail closed."
+        },
+        {
+          "case": "tamper_or_drift_rejected",
+          "code": "APPROVAL_HASH_MISMATCH",
+          "description": "If SQL, parameters, or schema_fingerprint change after approval, apply_change must fail closed."
+        }
+      ]
+    },
+    {
+      "id": "CONTRACT-SCHEMA-CAPTURE-AND-DIFF",
+      "tool": "capture_schema",
+      "profile": "schema",
+      "caller": {
+        "principal": "agent:cursor-dev",
+        "role": "developer"
+      },
+      "request": {
+        "connection": "sqlite-sample"
+      },
+      "fixture": "research/fixtures/sample.db",
+      "expected_response": {
+        "request_id": "req_cap_schema_01",
+        "connection": "sqlite-sample",
+        "status": "ok",
+        "columns": [
+          "schema_version",
+          "table_count",
+          "index_count",
+          "captured_at"
+        ],
+        "returned_rows": 1,
+        "truncated": false,
+        "warnings": [],
+        "schema_version": "snapshot_sqlite_sample"
+      }
+    }
+  ]
+}

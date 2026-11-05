@@ -1,0 +1,14 @@
+{
+  "name": "googleapis/genai-toolbox",
+  "pinned_commit": "7c82e149b05a4d198f32e0619a4b7c2d81e53904",
+  "version": "0.5.0",
+  "repository": "https://github.com/googleapis/genai-toolbox",
+  "license": "Apache-2.0",
+  "language": "Go",
+  "studied_capabilities": [
+    "Declarative sources and parameterized tool definitions (YAML/TOML/JSON)",
+    "Strict parameter type validation (string, integer, float, boolean, array) and allowed_values enums",
+    "Zero-interpolation bound parameter execution ($1..$n / ? placeholders)",
+    "Per-tool connection routing, read-only enforcement, and row caps (run_named_tool)"
+  ]
+}

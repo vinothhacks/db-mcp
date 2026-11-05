@@ -1,0 +1,398 @@
+# DB-MCP Example Server Configuration (`ServerConfig`)
+# Validate with:
+#   db-mcp-server verify-config --config config/db-mcp.example.toml
+#   npm run verify-config
+
+server_name = "db-mcp"
+server_version = "0.1.0"
+default_mode = "ReadOnly"
+active_profiles = ["Explore", "Query", "Diagnose", "Change", "Schema"]
+
+[http]
+bind = "127.0.0.1:8080"
+auth_token = "env:DB_MCP_AUTH_TOKEN"
+admin_token = "env:DB_MCP_ADMIN_TOKEN"
+
+[audit]
+in_memory = true
+jsonl_path = "research/traces/audit.jsonl"
+sqlite_path = "research/traces/audit.db"
+
+[changes]
+storage_path = "research/traces/changes.db"
+policy_revision = "policy_v1"
+default_ttl_seconds = 3600
+
+[[connections]]
+id = "local-sqlite"
+engine = "Sqlite"
+dsn = "sqlite://research/fixtures/sample.db"
+mode = "Development"
+read_only = false
+description = "Local SQLite development fixture database"
+default_schema = "main"
+timeout_ms = 10000
+max_rows = 500
+max_bytes = 1048576
+allow_multi_statement = false
+allow_explain_analyze = true
+restricted_tables = ["internal_secrets"]
+sensitive_tables = []
+sensitive_columns = ["password_hash", "api_key", "secret_token"]
+deny_sensitive_column_access = false
+unrestricted_sql_provenance = false
+allowed_roles = ["*"]
+allowed_principals = ["*"]
+init_sql = """
+DROP VIEW IF EXISTS active_user_orders;
+DROP INDEX IF EXISTS idx_orders_e2e_stdio;
+DROP TABLE IF EXISTS audit_logs;
+DROP TABLE IF EXISTS order_items;
+DROP TABLE IF EXISTS inventory;
+DROP TABLE IF EXISTS orders;
+DROP TABLE IF EXISTS users;
+DROP TABLE IF EXISTS internal_secrets;
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    email TEXT NOT NULL,
+    role TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE orders (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    total_cents INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE inventory (
+    sku TEXT PRIMARY KEY,
+    available_qty INTEGER NOT NULL,
+    reserved_qty INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE order_items (
+    id INTEGER PRIMARY KEY,
+    order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    sku TEXT NOT NULL REFERENCES inventory(sku),
+    quantity INTEGER NOT NULL,
+    unit_price_cents INTEGER NOT NULL
+);
+CREATE TABLE audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE internal_secrets (
+    id INTEGER PRIMARY KEY,
+    secret_key TEXT NOT NULL,
+    secret_value TEXT NOT NULL
+);
+CREATE VIEW active_user_orders AS
+    SELECT o.id AS order_id, u.id AS user_id, u.email, o.status, o.total_cents, o.created_at
+    FROM orders o
+    JOIN users u ON o.user_id = u.id
+    WHERE o.status = 'completed';
+INSERT INTO users (id, email, role, password_hash, created_at) VALUES
+    (1, 'alice@example.com', 'admin', 'hash_alice_secret', '2025-01-01T00:00:00Z'),
+    (2, 'bob@example.com', 'customer', 'hash_bob_secret', '2025-01-02T00:00:00Z');
+INSERT INTO orders (id, user_id, status, total_cents, created_at) VALUES
+    (101, 1, 'completed', 4500, '2025-01-03T10:00:00Z'),
+    (102, 2, 'pending', 1900, '2025-01-04T12:00:00Z');
+INSERT INTO inventory (sku, available_qty, reserved_qty) VALUES
+    ('SKU-PRO-1', 50, 1),
+    ('SKU-STD-2', 100, 0);
+INSERT INTO order_items (id, order_id, sku, quantity, unit_price_cents) VALUES
+    (1001, 101, 'SKU-PRO-1', 1, 4500),
+    (1002, 102, 'SKU-STD-2', 1, 1900);
+INSERT INTO audit_logs (id, order_id, event_type, created_at) VALUES
+    (1, 101, 'ORDER_CHECKED_OUT', '2025-01-03T10:01:00Z');
+CREATE OR REPLACE PROCEDURE record_order_audit(order_id INTEGER, event_type TEXT)
+BEGIN
+    INSERT INTO audit_logs (order_id, event_type, created_at)
+    SELECT o.id, event_type, o.created_at
+    FROM orders o
+    WHERE o.id = order_id;
+END;
+CREATE OR REPLACE PROCEDURE reserve_inventory(order_id INTEGER)
+BEGIN
+    UPDATE inventory
+    SET reserved_qty = reserved_qty + 1
+    WHERE sku IN (
+        SELECT oi.sku
+        FROM order_items oi
+        WHERE oi.order_id = order_id
+    );
+    CALL record_order_audit(order_id, 'INVENTORY_RESERVED');
+END;
+CREATE OR REPLACE FUNCTION calculate_order_discount(order_id INTEGER)
+RETURNS NUMERIC
+BEGIN
+    SELECT o.total_cents * 0.10
+    FROM orders o
+    JOIN users u ON u.id = o.user_id
+    WHERE o.id = order_id;
+END;
+CREATE OR REPLACE PROCEDURE checkout_order(order_id INTEGER)
+BEGIN
+    PERFORM calculate_order_discount(order_id);
+    UPDATE orders
+    SET status = 'completed'
+    WHERE id = order_id
+      AND user_id IN (
+          SELECT u.id
+          FROM users u
+          WHERE u.role = 'customer'
+      );
+    SELECT o.id, u.email
+    FROM orders o
+    JOIN users u ON u.id = o.user_id
+    WHERE o.id = order_id;
+    CALL reserve_inventory(order_id);
+    CALL record_order_audit(order_id, 'ORDER_CHECKED_OUT');
+END;
+"""
+
+[[connections]]
+id = "prod-postgres"
+engine = "Postgres"
+dsn = "postgres://localhost:5432/app_prod"
+mode = "GovernedProduction"
+read_only = false
+description = "Governed production PostgreSQL database"
+default_schema = "public"
+timeout_ms = 10000
+max_rows = 500
+max_bytes = 1048576
+allow_multi_statement = false
+allow_explain_analyze = false
+has_pg_stat_statements = true
+has_hypopg = true
+restricted_tables = ["internal_secrets"]
+sensitive_tables = ["users"]
+sensitive_columns = ["password_hash", "api_key", "secret_token"]
+deny_sensitive_column_access = false
+unrestricted_sql_provenance = false
+allowed_roles = ["agent", "developer", "dba", "admin"]
+allowed_principals = ["*"]
+init_sql = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY,
+    email TEXT NOT NULL,
+    role TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    total_cents INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS inventory (
+    sku TEXT PRIMARY KEY,
+    available_qty INTEGER NOT NULL,
+    reserved_qty INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS order_items (
+    id INTEGER PRIMARY KEY,
+    order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    sku TEXT NOT NULL REFERENCES inventory(sku),
+    quantity INTEGER NOT NULL,
+    unit_price_cents INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS internal_secrets (
+    id INTEGER PRIMARY KEY,
+    secret_key TEXT NOT NULL,
+    secret_value TEXT NOT NULL
+);
+CREATE VIEW IF NOT EXISTS active_user_orders AS
+    SELECT o.id AS order_id, u.id AS user_id, u.email, o.status, o.total_cents, o.created_at
+    FROM orders o
+    JOIN users u ON o.user_id = u.id
+    WHERE o.status = 'completed';
+INSERT OR IGNORE INTO users (id, email, role, password_hash, created_at) VALUES
+    (1, 'alice@example.com', 'admin', 'hash_alice_secret', '2025-01-01T00:00:00Z'),
+    (2, 'bob@example.com', 'customer', 'hash_bob_secret', '2025-01-02T00:00:00Z');
+INSERT OR IGNORE INTO orders (id, user_id, status, total_cents, created_at) VALUES
+    (101, 1, 'completed', 4500, '2025-01-03T10:00:00Z'),
+    (102, 2, 'pending', 1900, '2025-01-04T12:00:00Z');
+INSERT OR IGNORE INTO inventory (sku, available_qty, reserved_qty) VALUES
+    ('SKU-PRO-1', 50, 1),
+    ('SKU-STD-2', 100, 0);
+INSERT OR IGNORE INTO order_items (id, order_id, sku, quantity, unit_price_cents) VALUES
+    (1001, 101, 'SKU-PRO-1', 1, 4500),
+    (1002, 102, 'SKU-STD-2', 1, 1900);
+INSERT OR IGNORE INTO audit_logs (id, order_id, event_type, created_at) VALUES
+    (1, 101, 'ORDER_CHECKED_OUT', '2025-01-03T10:01:00Z');
+CREATE OR REPLACE PROCEDURE record_order_audit(order_id INTEGER, event_type TEXT)
+BEGIN
+    INSERT INTO audit_logs (order_id, event_type, created_at)
+    SELECT o.id, event_type, o.created_at
+    FROM orders o
+    WHERE o.id = order_id;
+END;
+CREATE OR REPLACE PROCEDURE reserve_inventory(order_id INTEGER)
+BEGIN
+    UPDATE inventory
+    SET reserved_qty = reserved_qty + 1
+    WHERE sku IN (
+        SELECT oi.sku
+        FROM order_items oi
+        WHERE oi.order_id = order_id
+    );
+    CALL record_order_audit(order_id, 'INVENTORY_RESERVED');
+END;
+CREATE OR REPLACE FUNCTION calculate_order_discount(order_id INTEGER)
+RETURNS NUMERIC
+BEGIN
+    SELECT o.total_cents * 0.10
+    FROM orders o
+    JOIN users u ON u.id = o.user_id
+    WHERE o.id = order_id;
+END;
+CREATE OR REPLACE PROCEDURE checkout_order(order_id INTEGER)
+BEGIN
+    PERFORM calculate_order_discount(order_id);
+    UPDATE orders
+    SET status = 'completed'
+    WHERE id = order_id
+      AND user_id IN (
+          SELECT u.id
+          FROM users u
+          WHERE u.role = 'customer'
+      );
+    SELECT o.id, u.email
+    FROM orders o
+    JOIN users u ON u.id = o.user_id
+    WHERE o.id = order_id;
+    CALL reserve_inventory(order_id);
+    CALL record_order_audit(order_id, 'ORDER_CHECKED_OUT');
+END;
+"""
+
+[[connections]]
+id = "analytics-mysql"
+engine = "MySql"
+dsn = "mysql://localhost:3306/analytics"
+mode = "ReadOnly"
+read_only = true
+description = "Read-only MySQL analytics replica"
+default_schema = "analytics"
+timeout_ms = 15000
+max_rows = 1000
+max_bytes = 1048576
+allow_multi_statement = false
+allow_explain_analyze = false
+restricted_tables = []
+sensitive_tables = []
+sensitive_columns = ["password_hash", "api_key", "secret_token"]
+deny_sensitive_column_access = false
+unrestricted_sql_provenance = false
+allowed_roles = ["*"]
+allowed_principals = ["*"]
+init_sql = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY,
+    email TEXT NOT NULL,
+    role TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    total_cents INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS inventory (
+    sku TEXT PRIMARY KEY,
+    available_qty INTEGER NOT NULL,
+    reserved_qty INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS order_items (
+    id INTEGER PRIMARY KEY,
+    order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    sku TEXT NOT NULL REFERENCES inventory(sku),
+    quantity INTEGER NOT NULL,
+    unit_price_cents INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS internal_secrets (
+    id INTEGER PRIMARY KEY,
+    secret_key TEXT NOT NULL,
+    secret_value TEXT NOT NULL
+);
+CREATE VIEW IF NOT EXISTS active_user_orders AS
+    SELECT o.id AS order_id, u.id AS user_id, u.email, o.status, o.total_cents, o.created_at
+    FROM orders o
+    JOIN users u ON o.user_id = u.id
+    WHERE o.status = 'completed';
+INSERT OR IGNORE INTO users (id, email, role, password_hash, created_at) VALUES
+    (1, 'alice@example.com', 'admin', 'hash_alice_secret', '2025-01-01T00:00:00Z'),
+    (2, 'bob@example.com', 'customer', 'hash_bob_secret', '2025-01-02T00:00:00Z');
+INSERT OR IGNORE INTO orders (id, user_id, status, total_cents, created_at) VALUES
+    (101, 1, 'completed', 4500, '2025-01-03T10:00:00Z'),
+    (102, 2, 'pending', 1900, '2025-01-04T12:00:00Z');
+INSERT OR IGNORE INTO inventory (sku, available_qty, reserved_qty) VALUES
+    ('SKU-PRO-1', 50, 1),
+    ('SKU-STD-2', 100, 0);
+INSERT OR IGNORE INTO order_items (id, order_id, sku, quantity, unit_price_cents) VALUES
+    (1001, 101, 'SKU-PRO-1', 1, 4500),
+    (1002, 102, 'SKU-STD-2', 1, 1900);
+INSERT OR IGNORE INTO audit_logs (id, order_id, event_type, created_at) VALUES
+    (1, 101, 'ORDER_CHECKED_OUT', '2025-01-03T10:01:00Z');
+"""
+
+[[named_tools]]
+name = "get_user_by_id"
+description = "Retrieve a single user record by numeric user ID using bound parameters."
+connection = "local-sqlite"
+statement = "SELECT id, email, role, created_at FROM users WHERE id = ?1"
+read_only = true
+max_rows = 1
+timeout_ms = 5000
+allowed_roles = ["agent", "developer", "dba", "admin"]
+
+[[named_tools.parameters]]
+name = "user_id"
+param_type = "integer"
+description = "Unique numeric user identifier"
+required = true
+
+[[named_tools]]
+name = "list_orders_by_status"
+description = "List orders filtered by status with an optional minimum total in cents."
+connection = "local-sqlite"
+statement = "SELECT id, user_id, status, total_cents, created_at FROM orders WHERE status = ?1 AND total_cents >= ?2 ORDER BY id ASC"
+read_only = true
+max_rows = 100
+timeout_ms = 5000
+allowed_roles = ["agent", "developer", "dba", "admin"]
+
+[[named_tools.parameters]]
+name = "status"
+param_type = "string"
+description = "Order lifecycle status (e.g. completed, pending, cancelled)"
+required = true
+
+[[named_tools.parameters]]
+name = "min_total_cents"
+param_type = "integer"
+description = "Minimum order total in cents"
+required = false
+default_value = 0

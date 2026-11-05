@@ -1,0 +1,21 @@
+[package]
+name = "db-mcp-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+db-mcp-core.workspace = true
+db-mcp-sql.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+db-mcp-sqlite.workspace = true
+tokio.workspace = true

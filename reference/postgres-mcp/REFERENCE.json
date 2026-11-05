@@ -1,0 +1,14 @@
+{
+  "name": "crystaldba/postgres-mcp",
+  "pinned_commit": "a3f91d8c4b2e70619f54e821c0d39a7b6e124501",
+  "version": "0.3.0",
+  "repository": "https://github.com/crystaldba/postgres-mcp",
+  "license": "Apache-2.0",
+  "language": "Python",
+  "studied_capabilities": [
+    "database_health (buffer cache hit ratio, connection saturation, dead tuples/bloat, invalid indexes, long-running queries, sequence exhaustion)",
+    "explain_query (EXPLAIN FORMAT JSON plan parsing, cost/row estimation extraction, execution-based EXPLAIN ANALYZE permission separation)",
+    "analyze_workload (pg_stat_statements top queries by total_exec_time, mean_exec_time, calls, shared_blks_read)",
+    "recommend_indexes (AST predicate/join/order extraction, heuristic B-Tree composite candidate generation, HypoPG virtual index evaluation)"
+  ]
+}
