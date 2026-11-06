@@ -1,0 +1,11 @@
+target/
+node_modules/
+dist/
+.git/
+.github/
+.db-mcp/
+reference/
+research/traces/
+research/fixtures/*.db
+*.tgz
+npm-debug.log*

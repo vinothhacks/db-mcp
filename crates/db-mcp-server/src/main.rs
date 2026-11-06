@@ -93,16 +93,19 @@ fn load_server_config(path: Option<&PathBuf>) -> anyhow::Result<ServerConfig> {
     }
 }
 
-fn resolve_optional_token(raw: Option<&str>) -> Option<String> {
-    let token_ref = raw?.trim();
-    if token_ref.is_empty() {
-        return None;
-    }
+fn resolve_optional_token(raw: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(token_ref) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
     let secrets = CompositeSecretProvider::with_static_and_env(StaticSecretProvider::new());
-    match secrets.resolve_dsn(token_ref) {
-        Ok(sec) => Some(sec.expose_secret().to_string()),
-        Err(_) => None,
-    }
+    // Fail closed: a configured token reference that cannot be resolved must never
+    // silently disable authentication.
+    let sec = secrets.resolve_dsn(token_ref).map_err(|e| {
+        anyhow::anyhow!(
+            "HTTP token reference '{token_ref}' could not be resolved ({e}); set the variable or remove the setting"
+        )
+    })?;
+    Ok(Some(sec.expose_secret().to_string()))
 }
 
 fn check_bearer(headers: &HeaderMap, expected: Option<&str>) -> bool {
@@ -345,8 +348,8 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         } => {
             let cfg = load_server_config(config.as_ref())?;
             let bind_addr = bind.unwrap_or_else(|| cfg.http.bind.clone());
-            let expected_auth_token = resolve_optional_token(cfg.http.auth_token.as_deref());
-            let expected_admin_token = resolve_optional_token(cfg.http.admin_token.as_deref());
+            let auth_token_ref = cfg.http.auth_token.clone();
+            let admin_token_ref = cfg.http.admin_token.clone();
             let handler = McpProtocolHandler::from_config(cfg)?;
 
             match transport.trim().to_ascii_lowercase().as_str() {
@@ -355,6 +358,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     run_stdio_loop(handler, caller).await
                 }
                 "http" => {
+                    let expected_auth_token = resolve_optional_token(auth_token_ref.as_deref())?;
+                    let expected_admin_token = resolve_optional_token(admin_token_ref.as_deref())?;
+                    if expected_auth_token.is_none() {
+                        eprintln!("[db-mcp] WARNING: no http.auth_token configured; POST /mcp is unauthenticated");
+                    }
                     let state = HttpAppState {
                         handler,
                         default_caller: CallerIdentity::new(principal, role, vec!["*".to_string()], "http"),

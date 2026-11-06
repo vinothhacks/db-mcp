@@ -529,8 +529,14 @@ impl DbMcpRuntime {
                 if let Some(bytes) = args.get("max_bytes").and_then(|v| v.as_u64()) {
                     gov_req = gov_req.with_max_bytes(bytes as usize);
                 }
-                if let Some(chg) = args.get("change_id").and_then(|v| v.as_str()) {
-                    gov_req = gov_req.with_approved_change(chg);
+                if args.get("change_id").is_some() {
+                    // Approved changes must be executed through apply_change, which verifies the
+                    // approval hash, TTL, schema fingerprint and performs the atomic claim.
+                    return Err(DbMcpError::PolicyDenied {
+                        code: "USE_APPLY_CHANGE".to_string(),
+                        message: "execute_query does not accept change_id; approved proposals are executed via apply_change".to_string(),
+                        next_action: Some("apply_change".to_string()),
+                    });
                 }
                 let result = self.executor.execute_governed(adapter.as_ref(), gov_req).await?;
                 self.pg_insights.record_query_execution(

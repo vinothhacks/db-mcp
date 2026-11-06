@@ -231,6 +231,12 @@ impl ChangeManager {
 
         let now = Utc::now();
         let ttl = request.ttl_seconds.unwrap_or(self.default_ttl_seconds);
+        const MAX_TTL_SECONDS: i64 = 30 * 24 * 3600;
+        if !(1..=MAX_TTL_SECONDS).contains(&ttl) {
+            return Err(DbMcpError::InvalidArgument(format!(
+                "ttl_seconds must be between 1 and {MAX_TTL_SECONDS} (got {ttl})"
+            )));
+        }
         let expires_at = request
             .expires_at
             .unwrap_or_else(|| now + Duration::seconds(ttl));
@@ -1457,7 +1463,7 @@ mod tests {
         let agent = CallerIdentity::local_agent("agent:cursor");
         let admin = CallerIdentity::admin("admin:dba-alice");
 
-        // Create proposal that is already expired (-10 seconds TTL)
+        // Create proposal with the minimum TTL, then wait for it to expire
         let proposed = mgr
             .propose_change_with_adapter(
                 &agent,
@@ -1465,10 +1471,11 @@ mod tests {
                 "CREATE INDEX idx_users_role ON public.users (role)",
                 Vec::new(),
                 None,
-                Some(-10),
+                Some(1),
             )
             .await
             .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
 
         let approve_err = mgr
             .approve_change(&proposed.change_id, &admin, None)
