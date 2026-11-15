@@ -26,6 +26,7 @@ jobs:
         with:
           node-version: 20
       - name: Check formatting (advisory)
+        shell: bash
         run: cargo fmt --all -- --check || echo "::warning::rustfmt differences found"
       - name: Build release binary
         run: cargo build --release -p db-mcp-server
