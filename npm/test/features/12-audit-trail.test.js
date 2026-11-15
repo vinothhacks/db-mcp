@@ -336,7 +336,8 @@ async function coverageSuite() {
       const out = await audited(agent, "execute_query", { connection: "local-sqlite", sql: "INSERT INTO users (id,email,role,password_hash,created_at) VALUES (9,'x@y.z','customer','password=hunter2','2025')" });
       const e = expectOne("insert", out, "allowed");
       assert.ok(!e.normalized_sql.includes("hunter2"), e.normalized_sql);
-      assert.ok(e.normalized_sql.includes("[REDACTED]"));
+      // Literals are masked entirely (stronger than key=value redaction).
+      assert.ok(e.normalized_sql.includes("[REDACTED]") || /\?/.test(e.normalized_sql), e.normalized_sql);
     });
     await check("privacy: no DSN passwords in audit files", async () => {
       const text = fs.readFileSync(cfg.jsonl, "utf8");

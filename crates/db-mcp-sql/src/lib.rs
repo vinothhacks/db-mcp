@@ -152,11 +152,47 @@ pub struct SqlAnalysis {
 
 /// Deterministically normalize SQL by collapsing whitespace, stripping comments, and trimming trailing semicolons.
 pub fn normalize_sql(sql: &str) -> String {
+    normalize_sql_tokens(sql, false)
+}
+
+/// Literal-free SQL fingerprint for audit records and workload statistics.
+///
+/// Like [`normalize_sql`] but every string, number and byte literal is replaced with `?`, so PII
+/// and secrets embedded in SQL text are never persisted. Do NOT use it for approval hashes:
+/// two statements differing only in literals share a fingerprint.
+pub fn fingerprint_sql(sql: &str) -> String {
+    normalize_sql_tokens(sql, true)
+}
+
+fn is_literal_token(token: &Token) -> bool {
+    matches!(
+        token,
+        Token::Number(_, _)
+            | Token::SingleQuotedString(_)
+            | Token::NationalStringLiteral(_)
+            | Token::EscapedStringLiteral(_)
+            | Token::HexStringLiteral(_)
+            | Token::DollarQuotedString(_)
+            | Token::SingleQuotedByteStringLiteral(_)
+            | Token::DoubleQuotedByteStringLiteral(_)
+            | Token::TripleSingleQuotedString(_)
+            | Token::UnicodeStringLiteral(_)
+            | Token::SingleQuotedRawStringLiteral(_)
+            | Token::DoubleQuotedRawStringLiteral(_)
+    )
+}
+
+fn normalize_sql_tokens(sql: &str, mask_literals: bool) -> String {
     let dialect = PostgreSqlDialect {};
     if let Ok(tokens) = Tokenizer::new(&dialect, sql).tokenize() {
         let mut out = String::new();
         let mut prev_was_word_or_num = false;
         for token in tokens {
+            let token = if mask_literals && is_literal_token(&token) {
+                Token::Placeholder("?".to_string())
+            } else {
+                token
+            };
             match token {
                 Token::Whitespace(_) => continue,
                 Token::SemiColon => {
@@ -194,6 +230,11 @@ pub fn normalize_sql(sql: &str) -> String {
         if !trimmed.is_empty() {
             return trimmed;
         }
+    }
+
+    if mask_literals {
+        // Tokenizer failed: never fall back to raw text that may contain literals.
+        return format!("<unparsed sql, {} bytes>", sql.len());
     }
 
     // Fallback whitespace collapse if tokenizer fails on dialect-specific literal

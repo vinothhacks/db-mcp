@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 "use strict";
+const EXPECTED_TOOL_COUNT = Number(process.env.DB_MCP_EXPECTED_TOOLS || 16);
 /**
  * F01 - MCP protocol conformance and transports (stdio + Streamable HTTP).
  *
@@ -207,7 +208,7 @@ async function stdioSuite(configPath) {
     const r = await s.ask({ jsonrpc: "2.0", id: 3, method: "tools/list" });
     const tools = r.result.tools;
     assert.ok(Array.isArray(tools));
-    assert.equal(tools.length, 16);
+    assert.equal(tools.length, EXPECTED_TOOL_COUNT);
     assert.deepEqual(tools.map((t) => t.name).sort(), [...EXPECTED_TOOLS].sort());
     assert.equal(new Set(tools.map((t) => t.name)).size, 16, "duplicate tool names");
     for (const t of tools) {
@@ -485,64 +486,56 @@ async function stdioSuite(configPath) {
 // ---------------------------------------------------------------------------------------------------------------
 async function httpSuite() {
   // ---- Server A: example config verbatim, DB_MCP_AUTH_TOKEN / DB_MCP_ADMIN_TOKEN NOT set in the environment ----
+  // F01-B1 (fixed): an unresolvable env: token reference must stop startup instead of disabling auth.
   const A = await httpServer();
-  info(`http startup -> /health 200: ${A.startupMs} ms`);
-  await check("http: server starts and /health returns 200 JSON {status:'ok', tools:16, connections, server_name, server_version}", async () => {
-    assert.ok(A.up, `server not up: ${A.stderr.join("")}`);
-    const r = await fetch(`${A.base}/health`);
+  await check("http: auth_token='env:DB_MCP_AUTH_TOKEN' with env var unset fails closed (server refuses to start)", async () => {
+    assert.ok(!A.up, "server started although its configured auth token could not be resolved");
+    assert.match(A.stderr.join(""), /DB_MCP_AUTH_TOKEN|could not be resolved/i);
+  });
+
+  // The rest of the HTTP checks run against a server with tokens configured.
+  const B = await httpServer({ env: { DB_MCP_AUTH_TOKEN: "agent-tok", DB_MCP_ADMIN_TOKEN: "admin-tok" } });
+  info(`http startup -> /health 200: ${B.startupMs} ms`);
+  await check("http: server starts and /health returns 200 JSON {status:'ok', tools, connections, server_name, server_version}", async () => {
+    assert.ok(B.up, `server not up: ${B.stderr.join("")}`);
+    const r = await fetch(`${B.base}/health`);
     assert.equal(r.status, 200);
     assert.match(r.headers.get("content-type") || "", /application\/json/);
     const b = await r.json();
     assert.equal(b.status, "ok");
-    assert.equal(b.tools, 16);
+    assert.equal(b.tools, EXPECTED_TOOL_COUNT);
     assert.equal(typeof b.connections, "number");
     assert.equal(typeof b.server_name, "string");
     assert.equal(typeof b.server_version, "string");
   });
 
   await check("http: /metrics returns 200 JSON with numeric counters", async () => {
-    const r = await fetch(`${A.base}/metrics`);
+    const r = await fetch(`${B.base}/metrics`);
     assert.equal(r.status, 200);
     const b = await r.json();
     assert.equal(b.status, "ok");
     assert.equal(typeof b.audit_events_total, "number");
-    assert.equal(b.registered_tools, 16);
+    assert.equal(b.registered_tools, EXPECTED_TOOL_COUNT);
     assert.equal(typeof b.configured_connections, "number");
   });
 
-  let openWhenEnvUnset = null;
-  await check("http: auth_token='env:DB_MCP_AUTH_TOKEN' with env var unset must NOT serve POST /mcp unauthenticated (fail closed)", async () => { // KNOWN-BUG: F01-B1
-    const r = await post(A.base, { jsonrpc: "2.0", id: 1, method: "tools/list" });
-    openWhenEnvUnset = r.status === 200;
-    assert.notEqual(r.status, 200, "unauthenticated tools/list succeeded although the config references an auth token");
-  });
-  if (openWhenEnvUnset) {
-    const r = await post(A.base, { jsonrpc: "2.0", id: 2, method: "tools/call", params: callParams("SELECT COUNT(*) FROM users") }, { "x-mcp-principal": "anyone", "x-mcp-role": "admin" });
-    const b = await r.json();
-    info(`F01-B1: unauthenticated POST /mcp with x-mcp-role:admin executed a query -> status=${b.result && b.result.structuredContent.status}; stderr warnings printed at startup: ${JSON.stringify(A.stderr.join(""))}`);
-  }
-
-  await check("http: admin_token='env:DB_MCP_ADMIN_TOKEN' with env var unset must NOT accept unauthenticated POST /admin/approve", async () => { // KNOWN-BUG: F01-B1
-    const r = await post(A.base, { change_id: "chg_does_not_exist", approver: "mallory" }, {}, "/admin/approve");
-    // 401/403 expected. 400 "not found" means the approval was actually attempted without any credential.
+  await check("http: /admin/approve without credentials is rejected (401)", async () => {
+    const r = await post(B.base, { change_id: "chg_does_not_exist", approver: "mallory" }, {}, "/admin/approve");
     assert.ok([401, 403].includes(r.status), `expected 401/403, got ${r.status}: ${(await r.text()).slice(0, 200)}`);
   });
 
   await check("http: GET /mcp -> 405 (no SSE stream offered), DELETE /mcp -> 405, PUT /mcp -> 405", async () => {
-    assert.equal((await fetch(`${A.base}/mcp`)).status, 405);
-    assert.equal((await fetch(`${A.base}/mcp`, { headers: { accept: "text/event-stream" } })).status, 405);
-    assert.equal((await fetch(`${A.base}/mcp`, { method: "DELETE" })).status, 405);
-    assert.equal((await fetch(`${A.base}/mcp`, { method: "PUT", headers: { "content-type": "application/json" }, body: "{}" })).status, 405);
+    assert.equal((await fetch(`${B.base}/mcp`)).status, 405);
+    assert.equal((await fetch(`${B.base}/mcp`, { headers: { accept: "text/event-stream" } })).status, 405);
+    assert.equal((await fetch(`${B.base}/mcp`, { method: "DELETE" })).status, 405);
+    assert.equal((await fetch(`${B.base}/mcp`, { method: "PUT", headers: { "content-type": "application/json" }, body: "{}" })).status, 405);
   });
 
   await check("http: unknown paths -> 404", async () => {
-    assert.equal((await fetch(`${A.base}/nope`)).status, 404);
-    assert.equal((await fetch(`${A.base}/`)).status, 404);
-    assert.equal((await post(A.base, {}, {}, "/mcp/extra")).status, 404);
+    assert.equal((await fetch(`${B.base}/nope`)).status, 404);
+    assert.equal((await fetch(`${B.base}/`)).status, 404);
+    assert.equal((await post(B.base, {}, {}, "/mcp/extra")).status, 404);
   });
-
-  // The rest of the HTTP checks run against a server with tokens configured so they do not depend on F01-B1.
-  const B = await httpServer({ env: { DB_MCP_AUTH_TOKEN: "agent-tok", DB_MCP_ADMIN_TOKEN: "admin-tok" } });
   const AUTH = { authorization: "Bearer agent-tok" };
   await check("http: server with env tokens starts; /health and /metrics stay unauthenticated", async () => {
     assert.ok(B.up, B.stderr.join(""));
@@ -579,7 +572,7 @@ async function httpSuite() {
     assert.match(r.headers.get("content-type") || "", /application\/json/);
     const b = await r.json();
     assert.equal(b.id, 1);
-    assert.equal(b.result.tools.length, 16);
+    assert.equal(b.result.tools.length, EXPECTED_TOOL_COUNT);
   });
 
   await check("http: bearer scheme is case-insensitive per RFC 7235 (Bearer / bearer)", async () => {

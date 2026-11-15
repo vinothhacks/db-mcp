@@ -694,9 +694,9 @@ async function sectionModes(c) {
     okEnvelope(p);
     assert.deepEqual(p.rows, [[1, "admin"], [2, "customer"]]);
   });
-  await check("6.14 ReadOnly: change_id does not unlock writes", async () => {
+  await check("6.14 ReadOnly: change_id does not unlock writes (execute_query rejects change_id)", async () => {
     const { payload: p } = await eq(c, { connection: M, sql: "INSERT INTO users (id, email, role, password_hash, created_at) VALUES (9,'x','y','z','w')", change_id: "bogus-change" });
-    denied(p, "MUTATION_NOT_ALLOWED_IN_READ_ONLY");
+    denied(p, ["MUTATION_NOT_ALLOWED_IN_READ_ONLY", "USE_APPLY_CHANGE"]);
   });
   await check("6.15 ReadOnly/Governed: unparseable SQL fails closed (UNKNOWN_SQL_IN_GOVERNED_MODE)", async () => {
     denied((await eq(c, { connection: M, sql: "SELEC 1" })).payload, "UNKNOWN_SQL_IN_GOVERNED_MODE");
@@ -715,8 +715,10 @@ async function sectionModes(c) {
       assert.equal(p.next_action, "propose_change", sql);
     }
   });
-  await check("6.17 Governed: SELECT with a change_id argument is harmless", async () => {
-    okEnvelope((await eq(c, { connection: P, sql: "SELECT 1 AS x", change_id: "bogus-change" })).payload);
+  await check("6.17 Governed: change_id on execute_query is refused with next_action apply_change", async () => {
+    const { payload: p } = await eq(c, { connection: P, sql: "SELECT 1 AS x", change_id: "bogus-change" });
+    denied(p, "USE_APPLY_CHANGE");
+    assert.equal(p.next_action, "apply_change");
   });
   // KNOWN-BUG: F05-B1 - execute_query(change_id) sets is_approved_change without consulting the change store.
   await check("6.18 Governed: UPDATE with an unverified change_id is denied", async () => {

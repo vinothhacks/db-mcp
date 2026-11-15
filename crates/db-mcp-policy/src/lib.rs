@@ -235,6 +235,34 @@ impl ConnectionPolicyConfig {
         true
     }
 
+    /// Remove catalog objects that would disclose restricted tables.
+    ///
+    /// Drops restricted tables/views, indexes and triggers defined on them, and foreign keys that
+    /// reference them from otherwise visible tables. Apply before pagination, hashing or graph
+    /// construction so counts, fingerprints and edges never reveal a restricted name.
+    pub fn retain_allowed_objects(&self, objects: &mut Vec<db_mcp_core::CatalogObject>) -> usize {
+        if self.restricted_tables.is_empty() {
+            return 0;
+        }
+        let before = objects.len();
+        objects.retain(|obj| {
+            if self.is_restricted_table(&obj.name) || self.is_restricted_table(&obj.qualified_name()) {
+                return false;
+            }
+            !obj.indexes.iter().any(|idx| {
+                matches!(
+                    obj.object_type,
+                    db_mcp_core::CatalogObjectType::Index | db_mcp_core::CatalogObjectType::Trigger
+                ) && self.is_restricted_table(&idx.table_name)
+            })
+        });
+        for obj in objects.iter_mut() {
+            obj.foreign_keys
+                .retain(|fk| !self.is_restricted_table(&fk.referenced_table));
+        }
+        before - objects.len()
+    }
+
     /// Returns true if a table name (`schema.table` or `table`) matches `restricted_tables`.
     pub fn is_restricted_table(&self, table: &str) -> bool {
         identifier_matches_list(table, &self.restricted_tables)

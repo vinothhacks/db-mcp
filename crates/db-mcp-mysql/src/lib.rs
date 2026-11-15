@@ -1239,6 +1239,12 @@ impl DatabaseAdapter for MySqlAdapter {
         &self.config.connection_id
     }
 
+    fn is_simulated(&self) -> bool {
+        // No wire-protocol client is implemented: statements always run on the embedded engine,
+        // even when the configured host answers a TCP probe.
+        true
+    }
+
     fn capabilities(&self) -> DatabaseCapabilities {
         DatabaseCapabilities::for_mysql()
     }

@@ -12,19 +12,19 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
-use db_mcp_audit::{
-    create_audit_event, AuditFilter, AuditSink, CompositeAuditStore, InMemoryAuditStore,
-    JsonlAuditStore, SqliteAuditStore,
-};
+use std::collections::HashSet;
+use std::sync::Mutex;
+
+use db_mcp_audit::{build_audit_sink, create_audit_event, AuditFilter, AuditSink};
 use db_mcp_catalog::{
-    build_procedure_call_graph_via_adapter, capture_schema_via_adapter, describe_object,
-    diff_schema, trace_table_dependencies_via_adapter,
+    build_procedure_call_graph, capture_schema, compute_schema_version, describe_object,
+    diff_schema, filter_and_paginate_objects, trace_table_dependencies,
 };
 use db_mcp_changes::ChangeManager;
 use db_mcp_core::{
-    AuditDecision, AuditEvent, CallerIdentity, CatalogDetailLevel, CatalogObjectType,
+    AuditDecision, AuditEvent, CallerIdentity, CatalogDetailLevel, CatalogObject, CatalogObjectType,
     CatalogRequest, ChangeProposal, ConnectionSummary, DatabaseAdapter, DatabaseEngine,
-    DbMcpError, DbMcpResult, ExplainFormat, ExplainRequest, McpDeniedResponse, McpSuccessResponse,
+    DbMcpError, DbMcpResult, ExplainFormat, ExplainRequest, McpSuccessResponse,
     PostgresHealthProvider, PostgresIndexAdvisor, SchemaSnapshot, SqlStatementClass,
 };
 use db_mcp_executor::{BoundedExecutor, GovernedQueryRequest};
@@ -44,6 +44,113 @@ fn to_json<T: Serialize>(val: T) -> DbMcpResult<Value> {
     serde_json::to_value(val).map_err(|e| DbMcpError::InvalidArgument(e.to_string()))
 }
 
+/// Audit sink wrapper that remembers which request ids already produced an audit event, so the
+/// runtime can guarantee exactly-once auditing of every tool call (allowed, denied or failed)
+/// without double-recording calls whose executor or arm already audited them.
+struct TrackingAuditSink {
+    inner: Arc<dyn AuditSink>,
+    seen: Mutex<HashSet<String>>,
+}
+
+impl TrackingAuditSink {
+    fn new(inner: Arc<dyn AuditSink>) -> Self {
+        Self {
+            inner,
+            seen: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Returns true (and forgets the id) when an event for `request_id` was recorded.
+    fn take_seen(&self, request_id: &str) -> bool {
+        self.seen
+            .lock()
+            .map(|mut set| set.remove(request_id))
+            .unwrap_or(false)
+    }
+}
+
+impl AuditSink for TrackingAuditSink {
+    fn record(&self, event: AuditEvent) -> DbMcpResult<()> {
+        if let Ok(mut set) = self.seen.lock() {
+            set.insert(event.request_id.clone());
+        }
+        self.inner.record(event)
+    }
+
+    fn list_events(&self, filter: &AuditFilter) -> DbMcpResult<Vec<AuditEvent>> {
+        self.inner.list_events(filter)
+    }
+
+    fn get_by_request_id(&self, request_id: &str) -> DbMcpResult<Vec<AuditEvent>> {
+        self.inner.get_by_request_id(request_id)
+    }
+
+    fn verify_chain(&self) -> DbMcpResult<bool> {
+        self.inner.verify_chain()
+    }
+}
+
+fn audit_decision_for_error(err: &DbMcpError) -> AuditDecision {
+    match err {
+        DbMcpError::ApprovalRequired(_) => AuditDecision::RequiresApproval,
+        DbMcpError::ExecutionCancelled(..) => AuditDecision::Cancelled,
+        DbMcpError::AdapterError(_)
+        | DbMcpError::StorageError(_)
+        | DbMcpError::InternalError(_)
+        | DbMcpError::ExecutionTimeout { .. } => AuditDecision::Failed,
+        _ => AuditDecision::Denied,
+    }
+}
+
+/// Split free text into identifier-like tokens (`schema.table` kept together) for restricted checks.
+fn mentions_restricted(text: &str, cfg: &db_mcp_policy::ConnectionPolicyConfig) -> bool {
+    if cfg.restricted_tables.is_empty() {
+        return false;
+    }
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '"' || c == '`'))
+        .map(|t| t.trim_matches(|c| c == '"' || c == '`' || c == '.'))
+        .filter(|t| !t.is_empty())
+        .any(|t| cfg.is_restricted_table(t) || t.rsplit('.').next().map(|b| cfg.is_restricted_table(b)).unwrap_or(false))
+}
+
+fn element_mentions_restricted(value: &Value, cfg: &db_mcp_policy::ConnectionPolicyConfig) -> bool {
+    match value {
+        Value::String(s) => mentions_restricted(s, cfg),
+        Value::Object(map) => map.values().any(|v| match v {
+            Value::String(s) => mentions_restricted(s, cfg),
+            _ => false,
+        }),
+        Value::Array(items) => items.iter().any(|v| match v {
+            Value::String(s) => mentions_restricted(s, cfg),
+            _ => false,
+        }),
+        _ => false,
+    }
+}
+
+/// Remove every array element (finding, recommendation, workload row, evidence string) that
+/// would disclose a restricted table. Used for diagnostics computed outside the catalog filter.
+fn scrub_restricted(value: &mut Value, cfg: &db_mcp_policy::ConnectionPolicyConfig) -> usize {
+    let mut removed = 0;
+    match value {
+        Value::Array(items) => {
+            let before = items.len();
+            items.retain(|item| !element_mentions_restricted(item, cfg));
+            removed += before - items.len();
+            for item in items.iter_mut() {
+                removed += scrub_restricted(item, cfg);
+            }
+        }
+        Value::Object(map) => {
+            for v in map.values_mut() {
+                removed += scrub_restricted(v, cfg);
+            }
+        }
+        _ => {}
+    }
+    removed
+}
+
 /// Core governed runtime coordinating adapters, policy, executor, audit, named tools, and changes.
 pub struct DbMcpRuntime {
     config: ServerConfig,
@@ -51,6 +158,7 @@ pub struct DbMcpRuntime {
     summaries: BTreeMap<String, ConnectionSummary>,
     policy: Arc<PolicyEngine>,
     audit: Arc<dyn AuditSink>,
+    audit_tracker: Arc<TrackingAuditSink>,
     executor: BoundedExecutor,
     named_tools: NamedToolRegistry,
     pg_insights: PgInsightsEngine,
@@ -131,30 +239,13 @@ impl DbMcpRuntime {
             adapters.insert(conn.id.clone(), adapter);
         }
 
-        let mut sinks: Vec<Arc<dyn AuditSink>> = Vec::new();
-        if config.audit.in_memory {
-            sinks.push(Arc::new(InMemoryAuditStore::new()));
-        }
-        if let Some(jsonl_path) = &config.audit.jsonl_path {
-            if let Some(parent) = Path::new(jsonl_path).parent() {
-                if !parent.as_os_str().is_empty() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-            }
-            sinks.push(Arc::new(JsonlAuditStore::new(jsonl_path)?));
-        }
-        if let Some(sqlite_path) = &config.audit.sqlite_path {
-            if let Some(parent) = Path::new(sqlite_path).parent() {
-                if !parent.as_os_str().is_empty() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-            }
-            sinks.push(Arc::new(SqliteAuditStore::open(sqlite_path)?));
-        }
-        if sinks.is_empty() {
-            sinks.push(Arc::new(InMemoryAuditStore::new()));
-        }
-        let audit: Arc<dyn AuditSink> = Arc::new(CompositeAuditStore::new(sinks));
+        let base_sink = build_audit_sink(
+            config.audit.in_memory,
+            config.audit.jsonl_path.as_deref(),
+            config.audit.sqlite_path.as_deref(),
+        )?;
+        let audit_tracker = Arc::new(TrackingAuditSink::new(base_sink));
+        let audit: Arc<dyn AuditSink> = audit_tracker.clone();
         let policy = Arc::new(PolicyEngine::with_configs(config.default_mode, policy_configs));
         let executor = BoundedExecutor::with_governance(policy.clone(), audit.clone());
         let named_tools = NamedToolRegistry::from_specs(config.named_tools.clone())?;
@@ -180,6 +271,7 @@ impl DbMcpRuntime {
             summaries,
             policy,
             audit,
+            audit_tracker,
             executor,
             named_tools,
             pg_insights,
@@ -205,7 +297,134 @@ impl DbMcpRuntime {
         approver: &CallerIdentity,
         comment: Option<String>,
     ) -> DbMcpResult<ChangeProposal> {
-        self.changes.approve_change(change_id, approver, comment)
+        let req_id = format!("req_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let started = Instant::now();
+        let outcome = self.changes.approve_change(change_id, approver, comment);
+        let (conn, decision, code, err_msg) = match &outcome {
+            Ok(p) => (p.connection.clone(), AuditDecision::Allowed, None, None),
+            Err(e) => (
+                "server".to_string(),
+                AuditDecision::Denied,
+                Some(e.code().to_string()),
+                Some(e.to_string()),
+            ),
+        };
+        let mode = self.policy.effective_config(&conn).mode;
+        let _ = self.audit.record(create_audit_event(
+            &req_id,
+            approver,
+            &conn,
+            mode,
+            "approve_change",
+            None,
+            None,
+            None,
+            decision,
+            code,
+            Some(change_id.to_string()),
+            None,
+            None,
+            Some(started.elapsed().as_millis() as u64),
+            None,
+            err_msg,
+        ));
+        outcome
+    }
+
+    /// True when the connection's adapter serves results from an embedded simulation.
+    pub fn is_simulated(&self, connection: &str) -> bool {
+        self.adapters
+            .get(connection)
+            .map(|a| a.is_simulated())
+            .unwrap_or(false)
+    }
+
+    /// Discover the full catalog of a connection with restricted objects removed.
+    async fn discover_allowed(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        connection: &str,
+        schema_pattern: Option<String>,
+    ) -> DbMcpResult<(Vec<CatalogObject>, usize)> {
+        let catalog = adapter
+            .discover(CatalogRequest {
+                connection: connection.to_string(),
+                schema_pattern,
+                name_pattern: None,
+                object_types: Vec::new(),
+                detail_level: CatalogDetailLevel::Full,
+                limit: 10_000,
+                offset: 0,
+            })
+            .await?;
+        let mut objects = catalog.objects;
+        let hidden = self
+            .policy
+            .effective_config(connection)
+            .retain_allowed_objects(&mut objects);
+        Ok((objects, hidden))
+    }
+
+    /// Capture a schema snapshot over the policy-visible catalog only.
+    async fn capture_allowed(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        connection: &str,
+        schema_pattern: Option<String>,
+    ) -> DbMcpResult<SchemaSnapshot> {
+        let (objects, _) = self.discover_allowed(adapter, connection, schema_pattern).await?;
+        Ok(capture_schema(connection, adapter.capabilities().engine, objects))
+    }
+
+    /// Post-process every successful tool response: envelope counts and simulation disclosure.
+    fn finalize_response(&self, val: &mut Value, args: &Value) {
+        let Some(obj) = val.as_object_mut() else { return };
+        let rows_empty = obj.get("rows").and_then(|r| r.as_array()).map(|r| r.is_empty()).unwrap_or(true);
+        let returned_zero = obj.get("returned_rows").and_then(|r| r.as_u64()) == Some(0);
+        if rows_empty && returned_zero {
+            if let Some(data) = obj.get("data").filter(|d| !d.is_null()) {
+                let count = if let Some(arr) = data.as_array() {
+                    arr.len()
+                } else if let Some(arr) = data.get("objects").and_then(|o| o.as_array()) {
+                    arr.len()
+                } else {
+                    1
+                };
+                obj.insert("returned_rows".to_string(), json!(count));
+            }
+        }
+        let mut conns: Vec<String> = Vec::new();
+        for key in ["connection", "base_connection", "target_connection"] {
+            if let Some(c) = args.get(key).and_then(|v| v.as_str()) {
+                conns.push(c.to_string());
+            }
+        }
+        if let Some(c) = obj.get("connection").and_then(|v| v.as_str()) {
+            conns.push(c.to_string());
+        }
+        conns.sort();
+        conns.dedup();
+        let mut notes = Vec::new();
+        for c in conns {
+            if let Some(adapter) = self.adapters.get(&c) {
+                if adapter.is_simulated() {
+                    notes.push(format!(
+                        "connection '{c}' is served by the embedded simulated {} engine (no external server is queried; results are illustrative)",
+                        adapter.capabilities().engine.as_str()
+                    ));
+                }
+            }
+        }
+        if !notes.is_empty() {
+            let warnings = obj.entry("warnings").or_insert_with(|| json!([]));
+            if let Some(arr) = warnings.as_array_mut() {
+                for n in notes {
+                    if !arr.iter().any(|w| w.as_str() == Some(n.as_str())) {
+                        arr.push(Value::String(n));
+                    }
+                }
+            }
+        }
     }
 
     pub fn audit_events(&self) -> DbMcpResult<Vec<AuditEvent>> {
@@ -280,27 +499,97 @@ impl DbMcpRuntime {
         caller: &CallerIdentity,
     ) -> Value {
         let req_id = format!("req_{}", &Uuid::new_v4().simple().to_string()[..12]);
-        if !self.list_tools().iter().any(|t| t.name == tool_name) {
-            return serde_json::to_value(McpDeniedResponse::new(
-                "TOOL_NOT_ENABLED",
-                format!("Tool '{tool_name}' is not enabled in active profiles"),
-                Some("Enable the required tool profile in ServerConfig".to_string()),
-            ))
-            .unwrap_or_else(|_| json!({"status": "denied"}));
-        }
-
+        let started = Instant::now();
         let conn_hint = arguments
             .get("connection")
             .and_then(|v| v.as_str())
             .map(ToOwned::to_owned);
 
-        match self.dispatch_tool(&req_id, tool_name, &arguments, caller).await {
-            Ok(val) => val,
+        if !self.list_tools().iter().any(|t| t.name == tool_name) {
+            let err = DbMcpError::PolicyDenied {
+                code: "TOOL_NOT_ENABLED".to_string(),
+                message: format!("Tool '{tool_name}' is not enabled in active profiles"),
+                next_action: Some("Enable the required tool profile in ServerConfig".to_string()),
+            };
+            self.audit_call_outcome(&req_id, tool_name, caller, conn_hint.as_deref(), Err(&err), started);
+            let denied = err.to_denied_response(Some(req_id), conn_hint);
+            return serde_json::to_value(denied).unwrap_or_else(|_| json!({"status": "denied"}));
+        }
+
+        let outcome = self.dispatch_tool(&req_id, tool_name, &arguments, caller).await;
+        let already_audited = self.audit_tracker.take_seen(&req_id);
+        match outcome {
+            Ok(mut val) => {
+                self.finalize_response(&mut val, &arguments);
+                if !already_audited {
+                    self.audit_call_outcome(&req_id, tool_name, caller, conn_hint.as_deref(), Ok(&val), started);
+                    self.audit_tracker.take_seen(&req_id);
+                }
+                val
+            }
             Err(err) => {
+                if !already_audited {
+                    self.audit_call_outcome(&req_id, tool_name, caller, conn_hint.as_deref(), Err(&err), started);
+                    self.audit_tracker.take_seen(&req_id);
+                }
                 let denied = err.to_denied_response(Some(req_id), conn_hint);
                 serde_json::to_value(denied).unwrap_or_else(|_| json!({"status": "denied"}))
             }
         }
+    }
+
+    /// Record exactly one audit event for a tool call that no deeper layer audited.
+    fn audit_call_outcome(
+        &self,
+        req_id: &str,
+        tool_name: &str,
+        caller: &CallerIdentity,
+        conn_hint: Option<&str>,
+        outcome: Result<&Value, &DbMcpError>,
+        started: Instant,
+    ) {
+        let elapsed = Some(started.elapsed().as_millis() as u64);
+        let (connection, decision, code, err_msg, rows, schema_version) = match outcome {
+            Ok(val) => (
+                val.get("connection")
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned)
+                    .or_else(|| conn_hint.map(ToOwned::to_owned))
+                    .unwrap_or_else(|| "server".to_string()),
+                AuditDecision::Allowed,
+                None,
+                None,
+                val.get("returned_rows").and_then(|v| v.as_u64()).map(|r| r as usize),
+                val.get("schema_version").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+            ),
+            Err(err) => (
+                conn_hint.map(ToOwned::to_owned).unwrap_or_else(|| "server".to_string()),
+                audit_decision_for_error(err),
+                Some(err.code().to_string()),
+                Some(err.to_string()),
+                None,
+                None,
+            ),
+        };
+        let mode = self.policy.effective_config(&connection).mode;
+        let _ = self.audit.record(create_audit_event(
+            req_id,
+            caller,
+            &connection,
+            mode,
+            tool_name,
+            None,
+            None,
+            None,
+            decision,
+            code,
+            None,
+            rows,
+            None,
+            elapsed,
+            schema_version,
+            err_msg,
+        ));
     }
 
     async fn dispatch_tool(
@@ -340,19 +629,20 @@ impl DbMcpRuntime {
                 let cfg = self.policy.effective_config(&conn);
                 let detail_level = parse_detail_level(args.get("detail_level"), CatalogDetailLevel::Summary);
                 let object_types = parse_object_types(args.get("object_types"));
-                let mut catalog = adapter
-                    .discover(CatalogRequest {
-                        connection: conn.clone(),
-                        schema_pattern: args.get("schema_pattern").and_then(|v| v.as_str()).map(ToOwned::to_owned),
-                        name_pattern: args.get("name_pattern").and_then(|v| v.as_str()).map(ToOwned::to_owned),
-                        object_types,
-                        detail_level,
-                        limit: args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize,
-                        offset: args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-                    })
-                    .await?;
-                catalog.objects.retain(|o| !cfg.is_restricted_table(&o.name));
-                catalog.returned_count = catalog.objects.len();
+                let _ = &cfg;
+                // Restricted objects are removed BEFORE filtering/pagination so totals never leak them.
+                let (visible, _hidden) = self.discover_allowed(adapter.as_ref(), &conn, None).await?;
+                let request = CatalogRequest {
+                    connection: conn.clone(),
+                    schema_pattern: args.get("schema_pattern").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+                    name_pattern: args.get("name_pattern").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+                    object_types,
+                    detail_level,
+                    limit: args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize,
+                    offset: args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                };
+                let mut catalog = filter_and_paginate_objects(&visible, &request);
+                catalog.schema_version = Some(compute_schema_version(&visible));
                 let sv = catalog.schema_version.clone().unwrap_or_else(|| "snapshot_catalog".to_string());
                 to_json(McpSuccessResponse::with_data(
                     req_id,
@@ -376,19 +666,11 @@ impl DbMcpRuntime {
                 }
                 let detail_level = parse_detail_level(args.get("detail_level"), CatalogDetailLevel::Full);
                 let schema = args.get("schema").and_then(|v| v.as_str());
-                let catalog = adapter
-                    .discover(CatalogRequest {
-                        connection: conn.clone(),
-                        schema_pattern: schema.map(ToOwned::to_owned),
-                        name_pattern: None,
-                        object_types: Vec::new(),
-                        detail_level: CatalogDetailLevel::Full,
-                        limit: 10_000,
-                        offset: 0,
-                    })
+                let (visible, _) = self
+                    .discover_allowed(adapter.as_ref(), &conn, schema.map(ToOwned::to_owned))
                     .await?;
-                let described = describe_object(&catalog.objects, schema, &object_name, detail_level)?;
-                let sv = catalog.schema_version.unwrap_or_else(|| "snapshot_catalog".to_string());
+                let described = describe_object(&visible, schema, &object_name, detail_level)?;
+                let sv = compute_schema_version(&visible);
                 to_json(McpSuccessResponse::with_data(
                     req_id,
                     &conn,
@@ -429,14 +711,15 @@ impl DbMcpRuntime {
                     .get("max_depth")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(3) as usize;
-                let report = trace_table_dependencies_via_adapter(
-                    adapter.as_ref(),
+                let (visible, _) = self.discover_allowed(adapter.as_ref(), &conn, None).await?;
+                let report = trace_table_dependencies(
+                    &visible,
+                    adapter.capabilities().engine,
                     &conn,
                     &table_name,
                     target_table.as_deref(),
                     max_depth,
-                )
-                .await?;
+                )?;
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 let schema_version = "snapshot_lineage".to_string();
                 self.log_audit(
@@ -477,14 +760,15 @@ impl DbMcpRuntime {
                     .get("max_depth")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(5) as usize;
-                let report = build_procedure_call_graph_via_adapter(
-                    adapter.as_ref(),
+                let (visible, _) = self.discover_allowed(adapter.as_ref(), &conn, None).await?;
+                let report = build_procedure_call_graph(
+                    &visible,
+                    adapter.capabilities().engine,
                     &conn,
                     procedure_name.as_deref(),
                     &direction,
                     max_depth,
-                )
-                .await?;
+                )?;
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 let schema_version = "snapshot_call_graph".to_string();
                 self.log_audit(
@@ -621,22 +905,26 @@ impl DbMcpRuntime {
                 let conn = req_str("connection")?;
                 let _adapter = self.get_authorized_adapter(caller, &conn)?;
                 let report = self.pg_insights.database_health(&conn).await?;
-                to_json(PgInsightsEngine::health_report_to_response(
+                let mut val = to_json(PgInsightsEngine::health_report_to_response(
                     req_id,
                     "snapshot_health",
                     &report,
-                ))
+                ))?;
+                scrub_restricted(&mut val, &self.policy.effective_config(&conn));
+                Ok(val)
             }
             "analyze_workload" => {
                 let conn = req_str("connection")?;
                 let _adapter = self.get_authorized_adapter(caller, &conn)?;
                 let top_n = args.get("top_n").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
                 let workload = self.pg_insights.analyze_workload(&conn, top_n).await?;
-                to_json(PgInsightsEngine::workload_to_response(
+                let mut val = to_json(PgInsightsEngine::workload_to_response(
                     req_id,
                     "snapshot_workload",
                     &workload,
-                ))
+                ))?;
+                scrub_restricted(&mut val, &self.policy.effective_config(&conn));
+                Ok(val)
             }
             "recommend_indexes" => {
                 let conn = req_str("connection")?;
@@ -647,13 +935,30 @@ impl DbMcpRuntime {
                     .map(|arr| arr.iter().filter_map(|v| v.as_str().map(ToOwned::to_owned)).collect())
                     .unwrap_or_default();
                 let max_recs = args.get("max_recommendations").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+                let cfg = self.policy.effective_config(&conn);
+                if let Some(q) = queries.iter().find(|q| mentions_restricted(q, &cfg)) {
+                    return Err(DbMcpError::PolicyDenied {
+                        code: "RESTRICTED_TABLE".to_string(),
+                        message: format!(
+                            "Query references a table restricted by connection policy: {}",
+                            db_mcp_sql::fingerprint_sql(q)
+                        ),
+                        next_action: Some("Remove restricted tables from the workload".to_string()),
+                    });
+                }
                 let recs = self.pg_insights.recommend_indexes(&conn, queries, max_recs).await?;
-                to_json(PgInsightsEngine::recommendations_to_response(
+                let mut val = to_json(PgInsightsEngine::recommendations_to_response(
                     req_id,
                     &conn,
                     "snapshot_indexes",
                     recs,
-                ))
+                ))?;
+                if scrub_restricted(&mut val, &cfg) > 0 {
+                    if let Some(rows) = val.get("rows").and_then(|r| r.as_array()).map(|r| r.len()) {
+                        val["returned_rows"] = json!(rows);
+                    }
+                }
+                Ok(val)
             }
             "propose_change" => {
                 let conn = req_str("connection")?;
@@ -726,7 +1031,7 @@ impl DbMcpRuntime {
                 let conn = req_str("connection")?;
                 let adapter = self.get_authorized_adapter(caller, &conn)?;
                 let schema_pattern = args.get("schema_pattern").and_then(|v| v.as_str()).map(ToOwned::to_owned);
-                let snapshot = capture_schema_via_adapter(adapter.as_ref(), &conn, schema_pattern).await?;
+                let snapshot = self.capture_allowed(adapter.as_ref(), &conn, schema_pattern).await?;
                 to_json(McpSuccessResponse::with_data(
                     req_id,
                     &conn,
@@ -743,7 +1048,7 @@ impl DbMcpRuntime {
                 } else {
                     let conn = req_str("base_connection")?;
                     let adapter = self.get_authorized_adapter(caller, &conn)?;
-                    capture_schema_via_adapter(adapter.as_ref(), &conn, schema_pattern.clone()).await?
+                    self.capture_allowed(adapter.as_ref(), &conn, schema_pattern.clone()).await?
                 };
                 let target: SchemaSnapshot = if let Some(t) = args.get("target_snapshot") {
                     serde_json::from_value(t.clone())
@@ -751,7 +1056,7 @@ impl DbMcpRuntime {
                 } else {
                     let conn = req_str("target_connection")?;
                     let adapter = self.get_authorized_adapter(caller, &conn)?;
-                    capture_schema_via_adapter(adapter.as_ref(), &conn, schema_pattern).await?
+                    self.capture_allowed(adapter.as_ref(), &conn, schema_pattern).await?
                 };
                 let diff = diff_schema(&base, &target);
                 to_json(McpSuccessResponse::with_data(

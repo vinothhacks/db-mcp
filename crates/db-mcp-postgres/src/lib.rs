@@ -1393,6 +1393,12 @@ impl DatabaseAdapter for PostgresAdapter {
         &self.config.connection_id
     }
 
+    fn is_simulated(&self) -> bool {
+        // No wire-protocol client is implemented: statements always run on the embedded engine,
+        // even when the configured host answers a TCP probe.
+        true
+    }
+
     fn capabilities(&self) -> DatabaseCapabilities {
         DatabaseCapabilities::for_postgres(
             self.config.has_pg_stat_statements,

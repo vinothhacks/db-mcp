@@ -333,6 +333,7 @@ dependencies = [
  "chrono",
  "db-mcp-core",
  "db-mcp-secrets",
+ "db-mcp-sql",
  "hex",
  "rusqlite",
  "serde",
@@ -466,6 +467,25 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "db-mcp-ontology"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "db-mcp-catalog",
+ "db-mcp-core",
+ "db-mcp-sql",
+ "db-mcp-sqlite",
+ "hex",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
  "uuid",
 ]
 

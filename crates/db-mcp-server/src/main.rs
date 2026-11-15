@@ -122,6 +122,77 @@ fn check_bearer(headers: &HeaderMap, expected: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// Guard for `/admin/*` endpoints: they fail closed when no admin token is configured.
+fn admin_guard(
+    headers: &HeaderMap,
+    expected: Option<&str>,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    if expected.is_none() {
+        return Some((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "status": "denied",
+                "code": "ADMIN_TOKEN_NOT_CONFIGURED",
+                "message": "Admin endpoints are disabled until http.admin_token is configured",
+                "next_action": "Set http.admin_token (e.g. env:DB_MCP_ADMIN_TOKEN) or use the db-mcp CLI"
+            })),
+        ));
+    }
+    if !check_bearer(headers, expected) {
+        return Some((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "status": "denied", "code": "UNAUTHORIZED", "message": "Invalid admin token" })),
+        ));
+    }
+    None
+}
+
+/// Record an out-of-band admin action (CLI) in the configured audit trail.
+#[allow(clippy::too_many_arguments)]
+fn audit_admin_action(
+    cfg: &ServerConfig,
+    caller: &CallerIdentity,
+    connection: &str,
+    tool_name: &str,
+    subject_id: Option<String>,
+    outcome: Result<(), &db_mcp_core::DbMcpError>,
+) {
+    let Ok(sink) = db_mcp_audit::build_audit_sink(
+        false,
+        cfg.audit.jsonl_path.as_deref(),
+        cfg.audit.sqlite_path.as_deref(),
+    ) else {
+        return;
+    };
+    let (decision, code, msg) = match outcome {
+        Ok(()) => (db_mcp_core::AuditDecision::Allowed, None, None),
+        Err(e) => (
+            db_mcp_core::AuditDecision::Denied,
+            Some(e.code().to_string()),
+            Some(e.to_string()),
+        ),
+    };
+    let req_id = format!("req_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+    let _ = sink.record(db_mcp_audit::create_audit_event(
+        req_id,
+        caller,
+        connection,
+        cfg.default_mode,
+        tool_name,
+        None,
+        None,
+        None,
+        decision,
+        code,
+        subject_id,
+        None,
+        None,
+        None,
+        None,
+        msg,
+    ));
+}
+
 fn extract_http_caller(headers: &HeaderMap, default_caller: &CallerIdentity) -> CallerIdentity {
     let principal = headers
         .get("x-mcp-principal")
@@ -200,11 +271,8 @@ async fn handle_admin_approve(
     headers: HeaderMap,
     Json(payload): Json<AdminApprovePayload>,
 ) -> impl IntoResponse {
-    if !check_bearer(&headers, state.expected_admin_token.as_deref()) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "status": "denied", "code": "UNAUTHORIZED", "message": "Invalid admin token" })),
-        );
+    if let Some(rejection) = admin_guard(&headers, state.expected_admin_token.as_deref()) {
+        return rejection;
     }
     let approver = CallerIdentity::new(&payload.approver, &payload.role, vec!["*".to_string()], "http-admin");
     match state
@@ -326,7 +394,17 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             .with_policy_revision(&cfg.changes.policy_revision)
             .with_default_ttl_seconds(cfg.changes.default_ttl_seconds);
             let caller = CallerIdentity::new(approver, role, vec!["*".to_string()], "cli");
-            let proposal = changes.approve_change(&change_id, &caller, comment)?;
+            let outcome = changes.approve_change(&change_id, &caller, comment);
+            let conn = outcome.as_ref().map(|p| p.connection.clone()).unwrap_or_else(|_| "server".to_string());
+            audit_admin_action(
+                &cfg,
+                &caller,
+                &conn,
+                "approve_change",
+                Some(change_id.clone()),
+                outcome.as_ref().map(|_| ()),
+            );
+            let proposal = outcome?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({

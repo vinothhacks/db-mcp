@@ -35,7 +35,14 @@ pub fn sanitize_audit_event(mut event: AuditEvent) -> AuditEvent {
     event.principal = redact_sensitive_text(&event.principal);
     event.connection = redact_sensitive_text(&event.connection);
     if let Some(sql) = event.normalized_sql.take() {
-        event.normalized_sql = Some(redact_sensitive_text(&sql));
+        // Persist a literal-free fingerprint: string/number literals (PII, secrets) become `?`.
+        // `sql_hash` is recomputed over the same fingerprint so it cannot be used to confirm
+        // guessed literal values offline.
+        let fingerprint = redact_sensitive_text(&db_mcp_sql::fingerprint_sql(&sql));
+        let mut hasher = Sha256::new();
+        hasher.update(fingerprint.as_bytes());
+        event.sql_hash = Some(hex::encode(hasher.finalize()));
+        event.normalized_sql = Some(fingerprint);
     }
     if let Some(err) = event.error_message.take() {
         event.error_message = Some(redact_sensitive_text(&err));
@@ -440,6 +447,53 @@ impl JsonlAuditStore {
         Ok(records)
     }
 
+    /// Return the `chain_hash` of the last JSONL record by reading only the file tail.
+    ///
+    /// Returns `Ok(Some(GENESIS))` for an empty file and `Ok(None)` when the tail is not a
+    /// chained record (legacy line), in which case the caller falls back to a full scan.
+    fn read_last_record_chain_hash(&self) -> DbMcpResult<Option<String>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = match File::open(&self.path) {
+            Ok(f) => f,
+            Err(_) => return Ok(Some(GENESIS_CHAIN_HASH.to_string())),
+        };
+        let len = file
+            .metadata()
+            .map_err(|e| DbMcpError::StorageError(format!("Failed to stat JSONL audit file: {e}")))?
+            .len();
+        if len == 0 {
+            return Ok(Some(GENESIS_CHAIN_HASH.to_string()));
+        }
+        let mut chunk: u64 = 64 * 1024;
+        loop {
+            let start = len.saturating_sub(chunk);
+            file.seek(SeekFrom::Start(start))
+                .map_err(|e| DbMcpError::StorageError(format!("Failed to seek JSONL audit file: {e}")))?;
+            let mut buf = Vec::with_capacity((len - start) as usize);
+            file.read_to_end(&mut buf)
+                .map_err(|e| DbMcpError::StorageError(format!("Failed to read JSONL audit file: {e}")))?;
+            let text = String::from_utf8_lossy(&buf);
+            let trimmed = text.trim_end();
+            if trimmed.is_empty() {
+                return Ok(Some(GENESIS_CHAIN_HASH.to_string()));
+            }
+            match trimmed.rfind('\n') {
+                Some(pos) => {
+                    let last = trimmed[pos + 1..].trim();
+                    return Ok(serde_json::from_str::<JsonlAuditRecord>(last)
+                        .ok()
+                        .map(|r| r.chain_hash));
+                }
+                None if start == 0 => {
+                    return Ok(serde_json::from_str::<JsonlAuditRecord>(trimmed)
+                        .ok()
+                        .map(|r| r.chain_hash));
+                }
+                None => chunk = chunk.saturating_mul(4),
+            }
+        }
+    }
+
     /// Read all persisted `AuditEvent`s from the JSONL file.
     pub fn read_all(&self) -> DbMcpResult<Vec<AuditEvent>> {
         let _guard = self
@@ -457,11 +511,14 @@ impl JsonlAuditStore {
             .lock()
             .map_err(|e| DbMcpError::StorageError(format!("JsonlAuditStore lock poisoned: {e}")))?;
 
-        let existing = self.read_records_locked()?;
-        let prev_hash = existing
-            .last()
-            .map(|r| r.chain_hash.clone())
-            .unwrap_or_else(|| GENESIS_CHAIN_HASH.to_string());
+        let prev_hash = match self.read_last_record_chain_hash()? {
+            Some(hash) => hash,
+            None => self
+                .read_records_locked()?
+                .last()
+                .map(|r| r.chain_hash.clone())
+                .unwrap_or_else(|| GENESIS_CHAIN_HASH.to_string()),
+        };
         let chain_hash = compute_event_chain_hash(&prev_hash, &sanitized);
 
         let record = JsonlAuditRecord {
@@ -1048,6 +1105,41 @@ impl AuditSink for CompositeAuditStore {
     fn verify_chain(&self) -> DbMcpResult<bool> {
         CompositeAuditStore::verify_chain(self)
     }
+}
+
+/// Build the configured audit sink fan-out (memory, JSONL, SQLite).
+///
+/// Shared by the MCP runtime and the out-of-band admin CLI so that every entry point writes to
+/// the same audit trail. Falls back to an in-memory store only when nothing is configured.
+pub fn build_audit_sink(
+    in_memory: bool,
+    jsonl_path: Option<&str>,
+    sqlite_path: Option<&str>,
+) -> DbMcpResult<Arc<dyn AuditSink>> {
+    let mut sinks: Vec<Arc<dyn AuditSink>> = Vec::new();
+    if in_memory {
+        sinks.push(Arc::new(InMemoryAuditStore::new()));
+    }
+    if let Some(path) = jsonl_path.map(str::trim).filter(|p| !p.is_empty()) {
+        if Path::new(path).is_dir() {
+            return Err(DbMcpError::StorageError(format!(
+                "audit.jsonl_path '{path}' is a directory"
+            )));
+        }
+        sinks.push(Arc::new(JsonlAuditStore::new(path)?));
+    }
+    if let Some(path) = sqlite_path.map(str::trim).filter(|p| !p.is_empty()) {
+        if let Some(parent) = Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = fs::create_dir_all(parent);
+            }
+        }
+        sinks.push(Arc::new(SqliteAuditStore::open(path)?));
+    }
+    if sinks.is_empty() {
+        sinks.push(Arc::new(InMemoryAuditStore::new()));
+    }
+    Ok(Arc::new(CompositeAuditStore::new(sinks)))
 }
 
 /// Helper to build a sample `AuditEvent` with explicit timestamp.

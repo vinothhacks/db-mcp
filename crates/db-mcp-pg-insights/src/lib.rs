@@ -190,7 +190,7 @@ impl PgInsightsEngine {
             .get_adapter(connection)
             .map(|a| a.capabilities().engine)
             .unwrap_or(DatabaseEngine::Postgres);
-        let normalized = normalize_sql(trimmed);
+        let normalized = db_mcp_sql::fingerprint_sql(trimmed);
         let qid = format!("q_{}", &hash_sql(&normalized)[..12]);
         let tables_referenced = parse_and_analyze_sql(engine, trimmed)
             .map(|a| a.referenced_tables)

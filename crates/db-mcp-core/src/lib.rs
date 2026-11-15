@@ -1596,6 +1596,14 @@ pub trait DatabaseAdapter: Send + Sync {
     /// Unique connection identifier configured for this adapter.
     fn connection_id(&self) -> &str;
 
+    /// True when results come from an embedded simulation rather than a live database server.
+    ///
+    /// The runtime discloses this on every response so agents never mistake simulated output
+    /// for production data.
+    fn is_simulated(&self) -> bool {
+        false
+    }
+
     /// Advertised capabilities and unavailable-feature explanations for this connection.
     fn capabilities(&self) -> DatabaseCapabilities;
 

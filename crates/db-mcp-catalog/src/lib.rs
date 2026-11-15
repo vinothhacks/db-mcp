@@ -91,7 +91,13 @@ pub fn canonicalize_objects(objects: &[CatalogObject]) -> Vec<CatalogObject> {
 /// Compute both `(schema_version, full_sha256_hash)` for a catalog object set.
 /// `schema_version` has the deterministic format `snapshot_<12_char_hex>`.
 pub fn compute_schema_hashes(objects: &[CatalogObject]) -> (String, String) {
-    let canonical = canonicalize_objects(objects);
+    let mut canonical = canonicalize_objects(objects);
+    // Row statistics are data, not schema: inserting rows must never change the fingerprint
+    // (it would otherwise trigger false schema-drift denials and ontology staleness).
+    for obj in &mut canonical {
+        obj.estimated_rows = None;
+        obj.size_bytes = None;
+    }
     let mut hasher = Sha256::new();
     let serialized = serde_json::to_vec(&canonical).unwrap_or_default();
     hasher.update(&serialized);

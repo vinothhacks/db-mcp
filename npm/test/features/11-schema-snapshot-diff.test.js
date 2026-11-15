@@ -270,10 +270,11 @@ async function main() {
     assert.equal(a0.rows.length, 1);
   }, "F11-07"); // KNOWN-BUG: F11-07 with_data() always emits columns=[] rows=[] returned_rows=0 (core lib.rs with_data)
 
-  await check("snapshot content: object inventory of the fixture (6 tables, 1 view, 3 procedures, 1 function) all grouped under schema 'main' in canonical order", () => {
+  await check("snapshot content: object inventory of the fixture (5 visible tables, restricted internal_secrets excluded, 1 view, 3 procedures, 1 function) all grouped under schema 'main' in canonical order", () => {
     const objs = a0.data.objects;
     const count = (t) => objs.filter((o) => o.object_type === t).length;
-    assert.equal(count("table"), 6, `tables: ${objs.filter((o) => o.object_type === "table").map((o) => o.name)}`);
+    assert.equal(count("table"), 5, `tables: ${objs.filter((o) => o.object_type === "table").map((o) => o.name)}`);
+    assert.ok(!objs.some((o) => o.name === "internal_secrets"), "restricted table must not appear in snapshots");
     assert.equal(count("view"), 1);
     assert.equal(count("procedure"), 3);
     assert.equal(count("function"), 1);
@@ -451,7 +452,7 @@ async function main() {
     const empty = { connection: "x", engine: "sqlite", schema_version: "snapshot_000000000000", full_hash: "0".repeat(64), captured_at: "2020-01-01T00:00:00Z", objects: [] };
     const r = await diff({ base_snapshot: empty, target_connection: "local-sqlite" });
     assert.equal(r.status, "ok");
-    assert.equal(kinds(r.data).filter((k) => k === "add_table").length, 6);
+    assert.equal(kinds(r.data).filter((k) => k === "add_table").length, 5);
     assert.equal(kinds(r.data).filter((k) => k === "add_view").length, 1);
     assert.equal(r.data.has_destructive_changes, false);
     assertDiffInvariants(r.data, "empty base");
@@ -817,7 +818,7 @@ async function main() {
       const ms = Date.now() - t0;
       assertSuccessEnvelope(s1, "large capture");
       const tables = s1.data.objects.filter((o) => o.object_type === "table").length;
-      assert.ok(tables >= 206, `expected >= 206 tables, got ${tables}`);
+      assert.ok(tables >= 205, `expected >= 205 visible tables, got ${tables}`);
       const bytes = Buffer.byteLength(JSON.stringify(s1.data));
       note(`large snapshot: ${s1.data.objects.length} objects, ${bytes} bytes, ${ms} ms; connection max_bytes=2048 -> truncated=${s1.truncated}, warnings=${JSON.stringify(s1.warnings)} (max_bytes is not applied to snapshot payloads)`);
       assert.ok(ms < 10000, `capture took ${ms} ms`);

@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 db-mcp-core.workspace = true
 db-mcp-secrets.workspace = true
+db-mcp-sql.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
