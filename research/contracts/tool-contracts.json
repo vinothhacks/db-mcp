@@ -1,6 +1,6 @@
 {
-  "schema_version": "1.1.0",
-  "description": "DB-MCP canonical tool contracts covering all 16 MCP tools across Explore, Query, Diagnose, Change, and Schema profiles, including success envelopes, denial envelopes, audit events, and adversarial security cases.",
+  "schema_version": "1.2.0",
+  "description": "DB-MCP canonical tool contracts covering all 24 MCP tools across Explore, Query, Diagnose, Change, Schema and Ontology profiles, including success envelopes, denial envelopes, audit events, and adversarial security cases. Ontology tool contracts: research/contracts/ontology-tools.json.",
   "envelopes": {
     "success": {
       "required_fields": [
@@ -68,6 +68,16 @@
     "schema": [
       "capture_schema",
       "diff_schema"
+    ],
+    "ontology": [
+      "ontology_status",
+      "discover_ontology",
+      "search_terms",
+      "describe_term",
+      "trace_semantic_relationships",
+      "propose_semantic_definition",
+      "plan_semantic_query",
+      "ask_semantic_question"
     ]
   },
   "contracts": [
@@ -258,8 +268,18 @@
           "total_cents"
         ],
         "rows": [
-          [101, 1, "completed", 14900],
-          [102, 2, "completed", 4900]
+          [
+            101,
+            1,
+            "completed",
+            14900
+          ],
+          [
+            102,
+            2,
+            "completed",
+            4900
+          ]
         ],
         "returned_rows": 2,
         "truncated": false,

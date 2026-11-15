@@ -1,0 +1,23 @@
+[package]
+name = "db-mcp-ontology"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Governed semantic layer for DB-MCP: versioned ontology store, deterministic discovery, certification, lexical retrieval and certified NL-to-SQL planning"
+
+[dependencies]
+db-mcp-core.workspace = true
+db-mcp-sql.workspace = true
+db-mcp-catalog.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+hex.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+db-mcp-sqlite.workspace = true
+tokio.workspace = true

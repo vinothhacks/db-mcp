@@ -188,11 +188,10 @@ async function main() {
   // -------------------------------------------------------------------------------------------
   // 7. CLI UX (cheap, first)
   // -------------------------------------------------------------------------------------------
-  await check("cli: --version prints 0.1.0 matching package.json", () => {
+  await check("cli: --version prints the package.json version", () => {
     const r = runBin(["--version"]);
     assert.equal(r.status, 0);
-    assert.match(r.stdout.trim(), /^db-mcp-server 0\.1\.0$/);
-    assert.equal(PKG.version, "0.1.0");
+    assert.equal(r.stdout.trim(), `db-mcp-server ${PKG.version}`);
   });
   await check("cli: --help lists serve/approve/verify-config", () => {
     const r = runBin(["--help"]);
@@ -236,7 +235,7 @@ async function main() {
     assert.equal(j.connections, 3);
     assert.equal(j.named_tools, 2);
     assert.equal(j.default_mode, "read_only");
-    assert.deepEqual(j.active_profiles, ["explore", "query", "diagnose", "change", "schema"]);
+    assert.deepEqual(j.active_profiles, ["explore", "query", "diagnose", "change", "schema", "ontology"]);
     for (const k of ["config_path", "server_name", "server_version"]) assert.ok(k in j, k);
   });
   await check("verify: shipped starter config (db-mcp init template) validates", () => {
@@ -645,9 +644,9 @@ async function main() {
       assert.deepEqual(names, ["execute_query", "explain_query", "run_named_tool"]);
     });
   });
-  await check("profiles: all five profiles expose 16 tools", async () => {
+  await check("profiles: all six profiles expose 24 tools", async () => {
     const { configPath } = makeIsolatedConfig({ dir: path.join(TMP, "prof-all") });
-    await withServer({ config: configPath }, async (s) => assert.equal((await s.rpc("tools/list", {})).result.tools.length, 16));
+    await withServer({ config: configPath }, async (s) => assert.equal((await s.rpc("tools/list", {})).result.tools.length, 24));
   });
 
   // -------------------------------------------------------------------------------------------
@@ -703,7 +702,7 @@ async function main() {
   // -------------------------------------------------------------------------------------------
   // 6. Default demo config (no --config)
   // -------------------------------------------------------------------------------------------
-  await check("demo: serve without --config exposes 3 in-memory demo connections, 16 tools, ReadOnly default, writable sqlite", async () => {
+  await check("demo: serve without --config exposes 3 in-memory demo connections, 24 tools, ReadOnly default, writable sqlite", async () => {
     const cwd = path.join(TMP, "demo-cwd");
     fs.mkdirSync(cwd, { recursive: true });
     await withServer({ config: null, cwd }, async (s) => {
@@ -713,7 +712,7 @@ async function main() {
       assert.equal(byId["local-sqlite"].mode, "development");
       assert.equal(byId["prod-postgres"].mode, "governed_production");
       assert.equal(byId["analytics-mysql"].mode, "read_only");
-      assert.equal((await s.rpc("tools/list", {})).result.tools.length, 16);
+      assert.equal((await s.rpc("tools/list", {})).result.tools.length, 24);
       assert.equal(rows(await s.call("execute_query", { connection: "local-sqlite", sql: "SELECT count(*) AS n FROM users" }))[0][0], 2);
       assert.equal((await s.call("execute_query", { connection: "local-sqlite", sql: INSERT_USER })).status, "ok");
       assert.equal((await s.call("execute_query", { connection: "prod-postgres", sql: "UPDATE orders SET status='x'" })).code, "APPROVAL_REQUIRED");

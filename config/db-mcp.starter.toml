@@ -5,9 +5,9 @@
 # in tool output, errors or audit logs.
 
 server_name = "db-mcp"
-server_version = "0.1.0"
+server_version = "0.2.0"
 default_mode = "ReadOnly"                 # Development | ReadOnly | GovernedProduction
-active_profiles = ["Explore", "Query", "Diagnose", "Change", "Schema"]
+active_profiles = ["Explore", "Query", "Diagnose", "Change", "Schema", "Ontology"]
 
 [http]
 bind = "127.0.0.1:8080"
@@ -27,6 +27,19 @@ default_ttl_seconds = 3600
 # ---------------------------------------------------------------------------
 # Local SQLite database (works out of the box; file is created if missing)
 # ---------------------------------------------------------------------------
+[ontology]
+# Governed semantic layer. Dedicated metadata store (never business tables).
+# Review/publish happens only out of band: `db-mcp ontology review|publish --config <this file>`
+# or POST /admin/ontology/review|publish with the admin token.
+storage_path = ".db-mcp/ontology.db"
+tenant_id = "default"
+# Optional HMAC key signing certifications (startup fails if set but unresolvable):
+# review_key = "env:DB_MCP_ONTOLOGY_REVIEW_KEY"
+certification_ttl_days = 180
+max_discovery_objects = 2000
+default_max_rows = 200
+infer_joins = true
+
 [[connections]]
 id = "local-sqlite"
 engine = "Sqlite"

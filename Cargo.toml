@@ -14,12 +14,13 @@ members = [
     "crates/db-mcp-mysql",
     "crates/db-mcp-pg-insights",
     "crates/db-mcp-changes",
+    "crates/db-mcp-ontology",
     "crates/db-mcp-mcp",
     "crates/db-mcp-server",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["DB-MCP Contributors"]
@@ -64,4 +65,5 @@ db-mcp-postgres = { path = "crates/db-mcp-postgres" }
 db-mcp-mysql = { path = "crates/db-mcp-mysql" }
 db-mcp-pg-insights = { path = "crates/db-mcp-pg-insights" }
 db-mcp-changes = { path = "crates/db-mcp-changes" }
+db-mcp-ontology = { path = "crates/db-mcp-ontology" }
 db-mcp-mcp = { path = "crates/db-mcp-mcp" }

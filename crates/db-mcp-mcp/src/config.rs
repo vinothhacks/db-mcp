@@ -16,7 +16,7 @@ fn default_server_name() -> String {
 }
 
 fn default_server_version() -> String {
-    "0.1.0".to_string()
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 fn default_bind() -> String {
@@ -82,6 +82,7 @@ fn parse_profile_str(raw: &str) -> Result<ToolProfile, String> {
         "diagnose" => Ok(ToolProfile::Diagnose),
         "change" => Ok(ToolProfile::Change),
         "schema" => Ok(ToolProfile::Schema),
+        "ontology" => Ok(ToolProfile::Ontology),
         other => Err(format!("Unsupported tool profile '{other}'")),
     }
 }
@@ -267,6 +268,56 @@ impl Default for ChangeStoreConfig {
     }
 }
 
+/// Governed ontology (semantic layer) configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OntologyConfig {
+    /// Dedicated metadata database (SQLite file). `None` keeps an in-memory store (demo only):
+    /// out-of-band review via the CLI requires a persistent path.
+    #[serde(default)]
+    pub storage_path: Option<String>,
+    /// Namespace isolating ontology content of different tenants in a shared store.
+    #[serde(default = "default_tenant_id")]
+    pub tenant_id: String,
+    /// Optional HMAC key reference (`env:VAR`, `file:/path` or literal) signing certifications.
+    #[serde(default)]
+    pub review_key: Option<String>,
+    #[serde(default = "default_certification_ttl_days")]
+    pub certification_ttl_days: i64,
+    #[serde(default = "default_max_discovery_objects")]
+    pub max_discovery_objects: usize,
+    #[serde(default = "default_ontology_max_rows")]
+    pub default_max_rows: usize,
+    /// Propose `<x>_id` joins without declared FKs (always as unverified candidates).
+    #[serde(default = "default_true")]
+    pub infer_joins: bool,
+}
+
+fn default_tenant_id() -> String {
+    "default".to_string()
+}
+fn default_certification_ttl_days() -> i64 {
+    180
+}
+fn default_max_discovery_objects() -> usize {
+    2000
+}
+fn default_ontology_max_rows() -> usize {
+    200
+}
+impl Default for OntologyConfig {
+    fn default() -> Self {
+        Self {
+            storage_path: None,
+            tenant_id: default_tenant_id(),
+            review_key: None,
+            certification_ttl_days: default_certification_ttl_days(),
+            max_discovery_objects: default_max_discovery_objects(),
+            default_max_rows: default_ontology_max_rows(),
+            infer_joins: true,
+        }
+    }
+}
+
 /// Top-level `db-mcp` server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -287,6 +338,8 @@ pub struct ServerConfig {
     pub audit: AuditConfig,
     #[serde(default)]
     pub changes: ChangeStoreConfig,
+    #[serde(default)]
+    pub ontology: OntologyConfig,
     #[serde(default)]
     pub connections: Vec<ConnectionConfig>,
     #[serde(default)]
@@ -408,6 +461,7 @@ impl ServerConfig {
             http: HttpServerConfig::default(),
             audit: AuditConfig::default(),
             changes: ChangeStoreConfig::default(),
+            ontology: OntologyConfig::default(),
             connections: vec![
                 ConnectionConfig {
                     id: "local-sqlite".to_string(),
@@ -641,6 +695,19 @@ impl ServerConfig {
                     tool.name, tool.connection
                 )));
             }
+        }
+        if self.ontology.tenant_id.trim().is_empty() {
+            return Err(DbMcpError::ConfigurationError("ontology.tenant_id must not be empty".to_string()));
+        }
+        if self.ontology.certification_ttl_days < 1 || self.ontology.certification_ttl_days > 3650 {
+            return Err(DbMcpError::ConfigurationError(
+                "ontology.certification_ttl_days must be between 1 and 3650".to_string(),
+            ));
+        }
+        if self.ontology.max_discovery_objects == 0 || self.ontology.default_max_rows == 0 {
+            return Err(DbMcpError::ConfigurationError(
+                "ontology.max_discovery_objects and ontology.default_max_rows must be greater than zero".to_string(),
+            ));
         }
         Ok(())
     }

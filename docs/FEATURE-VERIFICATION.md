@@ -24,6 +24,21 @@ Baseline: `cargo test --workspace` 75/75, `npm test` 3/3 suites, `npm run verify
 | F14 | Install and packaging | not completed | | launcher unit tests pass (`launcher.test.js`) |
 | F15 | Adapters and live fallback | not completed | | see "simulation disclosure" below |
 
+## v0.2.0 update (2026-11-15)
+
+Fixed before adding the ontology (they were prerequisites for it):
+
+- Audit coverage: every tool call, denial and admin action (CLI and HTTP approvals, ontology review and publish) now produces exactly one audit event (F12-01/02/03, F02-08, F07 NT-03, F10-06).
+- Audit privacy: persisted SQL is a literal-free fingerprint and `sql_hash` is computed over it (F12-04, F08-05, F10-08). JSONL appends read only the file tail.
+- Restricted tables are removed before pagination, lineage, snapshots, diffs and diagnostics output (F02-02, F03-2, F11-02, F08-06, F09-20).
+- PostgreSQL/MySQL responses carry an explicit simulated-backend warning (F02-05, F08-03, F09-01).
+- `returned_rows` reflects data payloads (F02-01, F11-07); schema fingerprints ignore row counts (F11-01).
+- `/admin/*` endpoints return 403 when no admin token is configured.
+
+New feature F16, governed ontology: `npm/test/features/16-ontology.test.js` 15/15, Rust `crates/db-mcp-server/tests/ontology_golden.rs` (golden gates 8/8), e2e suite 4/4, smoke 53/53. REA evidence: `research/findings/ontology-rea-verification.md`.
+
+Still open from the list below: forgeable change approvals without a key (F10-03), `propose_change` policy bypass (F10-04), routine DDL splitting (F04-02/03), stdio invalid UTF-8 (F01-B2), diff coverage for triggers/routines/FKs (F11-03/04), index advisor quality and gating (F09).
+
 ## Fixed in this release
 
 - Windows stack overflow in `tools/call` (server ran tool futures on the 1 MiB main thread).

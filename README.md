@@ -13,11 +13,12 @@ It combines, in one binary:
 | PostgreSQL intelligence | `database_health`, `analyze_workload`, `recommend_indexes` (heuristic candidates + HypoPG validation when available) |
 | Governed changes | `propose_change`, `get_change`, `apply_change` with SHA-256 approval binding, separation of duties, replay prevention and schema-drift checks |
 | Schema snapshots | `capture_schema`, `diff_schema` with deterministic `snapshot_<hash>` versions |
-| Audit | Structured JSONL + SQLite audit trail for every tool call, with secret redaction |
+| Governed ontology (v0.2) | `ontology_status`, `discover_ontology`, `search_terms`, `describe_term`, `trace_semantic_relationships`, `propose_semantic_definition`, `plan_semantic_query`, `ask_semantic_question`: certified business terms, metrics and relationships, and natural-language questions compiled into validated SQL only from human-certified definitions |
+| Audit | Structured JSONL + SQLite audit trail for every tool call, denial and admin action, with literal-free SQL fingerprints and secret redaction |
 
-Engines: **PostgreSQL**, **MySQL/MariaDB**, **SQLite**. When a PostgreSQL or MySQL DSN is unreachable the adapter falls back to a deterministic embedded simulation so the full tool surface can be exercised offline (useful for CI and demos; see `research/findings/capability-matrix.md`).
+Engines: **SQLite** (native). **PostgreSQL** and **MySQL/MariaDB** connections currently run on a deterministic embedded simulation (no wire-protocol client yet). Every response from those connections carries a warning saying so, so an agent never mistakes simulated output for production data. See `research/findings/capability-matrix.md`.
 
-Transports: **stdio** (local agents) and **Streamable HTTP** JSON-RPC (`POST /mcp`, Bearer auth, `/health`, `/metrics`, `/admin/approve`).
+Transports: **stdio** (local agents) and **Streamable HTTP** JSON-RPC (`POST /mcp`, Bearer auth, `/health`, `/metrics`, `/admin/approve`, `/admin/ontology/review`, `/admin/ontology/publish`).
 
 ---
 
@@ -56,7 +57,7 @@ curl -s http://127.0.0.1:8080/health
 git clone https://github.com/vinothhacks/db-mcp && cd db-mcp
 npm run build                        # cargo build --release -p db-mcp-server
 npm test                             # stdio + HTTP + CLI approval end-to-end
-npm run verify:features              # exercises all 16 tools and prints a feature matrix
+npm run verify:features              # exercises all 24 tools and prints a feature matrix
 ```
 
 ---
@@ -157,6 +158,42 @@ agent: apply_change    ->  executes once, re-verifies hash + schema fingerprint,
 
 ---
 
+## Governed ontology (semantic layer)
+
+The ontology turns schema objects into **certified** business definitions and answers questions only
+from them. It never lets a model write free-form SQL.
+
+```text
+agent:    discover_ontology            -> unverified candidates (entities, attributes, FK relationships, metrics)
+agent:    propose_semantic_definition  -> typed drafts ("order value" = SUM(orders.total_cents), filters, joins)
+reviewer: db-mcp ontology review ...   -> certify one exact version (reviewer != proposer, admin/dba role)
+reviewer: db-mcp ontology publish ...  -> immutable revision pinned to the schema fingerprint
+agent:    plan_semantic_query          -> answerable | not_answerable | ambiguous | stale, with SQL + provenance
+agent:    ask_semantic_question        -> runs the validated plan through the governed executor
+```
+
+- Definitions are versioned and immutable; only their lifecycle status changes (`discovered -> proposed -> certified -> published -> stale/deprecated`, or `rejected`).
+- Certifications bind the definition content hash, schema fingerprint, reviewer and expiry (optionally HMAC-signed with `ontology.review_key`).
+- Plans refuse instead of guessing: no certified metric, ambiguous metric names, unknown dimensions, sensitive columns and one-to-many joins that would double count all return `not_answerable` or `ambiguous`.
+- Schema drift (dropped or retyped columns) marks dependent definitions `stale`; they stop generating SQL until re-certified, and pinned `plan_hash` values stop matching.
+- Restricted tables never enter the ontology; sensitive columns can be described but never used as filters, metrics or grouping keys.
+- Store: a dedicated SQLite metadata database (`[ontology] storage_path`), never the business database.
+
+Admin channel (never exposed to agents):
+
+```bash
+db-mcp ontology list    --connection local-sqlite --status discovered --config db-mcp.toml
+db-mcp ontology review  --connection local-sqlite --def-id metric:order_value --version 1 --action approve --reviewer alice --config db-mcp.toml
+db-mcp ontology publish --connection local-sqlite --reviewer alice --config db-mcp.toml
+db-mcp ontology eval    --connection local-sqlite --cases research/ontology/golden-local-sqlite.json --config db-mcp.toml
+# or over HTTP with the admin token: POST /admin/ontology/review, POST /admin/ontology/publish
+```
+
+Design, security model and contracts: [docs/ontology/architecture.md](docs/ontology/architecture.md),
+[docs/ontology/security.md](docs/ontology/security.md), [docs/ontology/contract.md](docs/ontology/contract.md).
+
+---
+
 ## Tool reference
 
 - Explore: `list_connections`, `search_objects`, `describe_object`, `trace_table_dependencies`, `get_procedure_call_graph`
@@ -164,6 +201,7 @@ agent: apply_change    ->  executes once, re-verifies hash + schema fingerprint,
 - Diagnose: `database_health`, `analyze_workload`, `recommend_indexes`
 - Change: `propose_change`, `get_change`, `apply_change`
 - Schema: `capture_schema`, `diff_schema`
+- Ontology: `ontology_status`, `discover_ontology`, `search_terms`, `describe_term`, `trace_semantic_relationships`, `propose_semantic_definition`, `plan_semantic_query`, `ask_semantic_question`
 
 Every success response carries the same envelope: `request_id`, `connection`, `status`, `columns`, `rows`,
 `returned_rows`, `truncated`, `warnings`, `schema_version`, plus `_meta.provenance.untrusted_content = true` so
@@ -182,8 +220,8 @@ node scripts/mcp-call.js --raw tools/list
 ## Repository layout
 
 ```text
-crates/            15 Rust crates (core, secrets, sql, catalog, policy, audit, executor, tools,
-                   sqlite, postgres, mysql, pg-insights, changes, mcp, server)
+crates/            16 Rust crates (core, secrets, sql, catalog, policy, audit, executor, tools,
+                   sqlite, postgres, mysql, pg-insights, changes, ontology, mcp, server)
 npm/bin/db-mcp.js  npx launcher: resolves, downloads or builds the native binary
 npm/test/          Node end-to-end suite (stdio, HTTP, CLI approval)
 scripts/           mcp-call.js (ad-hoc client), feature-smoke.js (all-feature verification)

@@ -1,7 +1,7 @@
 //! Workspace Integration, Contract, and Adversarial Security Tests for DB-MCP.
 //!
 //! Exercises:
-//! 1. Canonical MCP tool contract envelopes across all 16 tools (`research/contracts/tool-contracts.json`).
+//! 1. Canonical MCP tool contract envelopes across all 24 tools (`research/contracts/tool-contracts.json`).
 //! 2. Adversarial SQL & governance defenses (multi-statement, mutating CTE, privileged functions,
 //!    self-approval rejection, approval replay prevention, schema drift, proposal tampering, and redaction).
 
@@ -69,7 +69,7 @@ fn assert_denied_envelope(resp: &Value, expected_code: &str) {
 }
 
 #[tokio::test]
-async fn contract_suite_exercises_all_16_tools_and_matches_contract_schema() {
+async fn contract_suite_exercises_all_24_tools_and_matches_contract_schema() {
     // Verify canonical contract definition file exists and lists the required envelope fields
     let contracts_path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../research/contracts/tool-contracts.json");
@@ -88,7 +88,7 @@ async fn contract_suite_exercises_all_16_tools_and_matches_contract_schema() {
     let admin = CallerIdentity::admin("dba:release-approver");
 
     let tools = runtime.list_tools();
-    assert_eq!(tools.len(), 16, "All 16 MCP tools must be registered");
+    assert_eq!(tools.len(), 24, "All 24 MCP tools must be registered");
 
     // 1. list_connections
     let r_list = runtime.call_tool("list_connections", json!({}), &agent).await;

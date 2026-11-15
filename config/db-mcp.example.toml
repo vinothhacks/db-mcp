@@ -4,9 +4,9 @@
 #   npm run verify-config
 
 server_name = "db-mcp"
-server_version = "0.1.0"
+server_version = "0.2.0"
 default_mode = "ReadOnly"
-active_profiles = ["Explore", "Query", "Diagnose", "Change", "Schema"]
+active_profiles = ["Explore", "Query", "Diagnose", "Change", "Schema", "Ontology"]
 
 [http]
 bind = "127.0.0.1:8080"
@@ -22,6 +22,19 @@ sqlite_path = "research/traces/audit.db"
 storage_path = "research/traces/changes.db"
 policy_revision = "policy_v1"
 default_ttl_seconds = 3600
+
+[ontology]
+# Governed semantic layer. Dedicated metadata store (never business tables).
+# Review/publish happens only out of band: `db-mcp ontology review|publish --config <this file>`
+# or POST /admin/ontology/review|publish with the admin token.
+storage_path = "research/traces/ontology.db"
+tenant_id = "default"
+# Optional HMAC key signing certifications (startup fails if set but unresolvable):
+# review_key = "env:DB_MCP_ONTOLOGY_REVIEW_KEY"
+certification_ttl_days = 180
+max_discovery_objects = 2000
+default_max_rows = 200
+infer_joins = true
 
 [[connections]]
 id = "local-sqlite"

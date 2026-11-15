@@ -41,7 +41,7 @@ function assertSuccessEnvelope(payload, label) {
 }
 
 async function testVerifyConfigCli() {
-  console.log("[E2E 1/3] Testing CLI verify-config...");
+  console.log("[E2E 1/4] Testing CLI verify-config...");
   const res = spawnSync(
     process.execPath,
     [BIN_WRAPPER, "verify-config", "--config", EXAMPLE_CONFIG],
@@ -56,7 +56,7 @@ async function testVerifyConfigCli() {
 }
 
 async function testStdioMcpAndCliApproval() {
-  console.log("[E2E 2/3] Testing Local Stdio MCP Server + Out-of-Band CLI Approval...");
+  console.log("[E2E 2/4] Testing Local Stdio MCP Server + Out-of-Band CLI Approval...");
   const child = spawn(
     process.execPath,
     [BIN_WRAPPER, "serve", "--transport", "stdio", "--config", EXAMPLE_CONFIG],
@@ -109,7 +109,7 @@ async function testStdioMcpAndCliApproval() {
     assert.deepEqual(pingResp.result, {});
 
     const toolsResp = await rpc("tools/list", {});
-    assert.equal(toolsResp.result.tools.length, 16, "Expected 16 MCP tools");
+    assert.equal(toolsResp.result.tools.length, 24, "Expected 24 MCP tools");
 
     assertSuccessEnvelope(await callTool("list_connections"), "list_connections");
     assertSuccessEnvelope(
@@ -236,7 +236,7 @@ async function testStdioMcpAndCliApproval() {
     });
     assertSuccessEnvelope(diffRes, "diff_schema");
     assert.equal(diffRes.data.is_identical, false);
-    console.log("  -> PASS: Stdio MCP exercised all 16 tools + out-of-band CLI approval");
+    console.log("  -> PASS: Stdio MCP exercised all 24 tools + out-of-band CLI approval");
   } finally {
     rl.close();
     child.kill();
@@ -244,7 +244,7 @@ async function testStdioMcpAndCliApproval() {
 }
 
 async function testStreamableHttpE2E() {
-  console.log("[E2E 3/3] Testing Self-Hosted Streamable HTTP Server + Bearer Auth + Admin Approval...");
+  console.log("[E2E 3/4] Testing Self-Hosted Streamable HTTP Server + Bearer Auth + Admin Approval...");
   const port = await getFreePort();
   const bindAddr = `127.0.0.1:${port}`;
   const tempConfigRel = "research/traces/e2e-http.temp.toml";
@@ -272,7 +272,7 @@ async function testStreamableHttpE2E() {
         if (res.status === 200) {
           const body = await res.json();
           assert.equal(body.status, "ok");
-          assert.equal(body.tools, 16);
+          assert.equal(body.tools, 24);
           healthy = true;
           break;
         }
@@ -306,7 +306,7 @@ async function testStreamableHttpE2E() {
     });
     assert.equal(listRes.status, 200);
     const listBody = await listRes.json();
-    assert.equal(listBody.result.tools.length, 16);
+    assert.equal(listBody.result.tools.length, 24);
 
     // 2b. Authenticated trace_table_dependencies & get_procedure_call_graph over HTTP
     const httpTraceRes = await fetch(`${baseUrl}/mcp`, {
@@ -439,11 +439,70 @@ async function testStreamableHttpE2E() {
   }
 }
 
+async function testOntologyFlow() {
+  console.log("[E2E 4/4] Testing governed ontology: discover -> propose -> CLI review/publish -> plan -> ask...");
+  const { makeIsolatedConfig } = require(path.join(REPO_ROOT, "scripts", "make-isolated-config.js"));
+  const { createClient } = require(path.join(REPO_ROOT, "scripts", "mcp-call.js"));
+  const { configPath, dir } = makeIsolatedConfig();
+  const client = createClient({ config: configPath, principal: "e2e-agent", role: "agent", timeoutMs: 30000 });
+  const call = async (name, args) => (await client.rpc("tools/call", { name, arguments: args })).result.structuredContent;
+  const cli = (...args) => {
+    const r = spawnSync(process.execPath, [BIN_WRAPPER, "ontology", ...args, "--config", configPath], { cwd: REPO_ROOT, encoding: "utf8" });
+    assert.equal(r.status, 0, `ontology ${args[0]} failed: ${r.stderr}`);
+    return JSON.parse(r.stdout);
+  };
+  try {
+    await client.rpc("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "e2e-ontology", version: "1" } });
+    const status0 = await call("ontology_status", { connection: "local-sqlite" });
+    assertSuccessEnvelope(status0, "ontology_status");
+    assert.equal(status0.data.readiness, "not_ready");
+    const disc = await call("discover_ontology", { connection: "local-sqlite" });
+    assertSuccessEnvelope(disc, "discover_ontology");
+    const prop = await call("propose_semantic_definition", {
+      connection: "local-sqlite",
+      definition: { name: "order value", synonyms: ["order total"], body: { type: "metric", base_table: "orders", aggregation: "sum", column: "total_cents", unit: "cents" } },
+    });
+    assertSuccessEnvelope(prop, "propose_semantic_definition");
+    const reviewIds = [
+      [prop.data.definition.def_id, prop.data.definition.version],
+      ["attribute:main.users.role", 1],
+      ["relationship:main.orders(user_id)->main.users", 1],
+    ];
+    // Self-review through the CLI is refused.
+    const self = spawnSync(
+      process.execPath,
+      [BIN_WRAPPER, "ontology", "review", "--connection", "local-sqlite", "--def-id", reviewIds[0][0], "--version", String(reviewIds[0][1]), "--action", "approve", "--reviewer", "e2e-agent", "--config", configPath],
+      { cwd: REPO_ROOT, encoding: "utf8" }
+    );
+    assert.notEqual(self.status, 0, "self-review must fail");
+    assert.match(self.stderr + self.stdout, /cannot review|Self-approval/i);
+    for (const [id, v] of reviewIds) {
+      const r = cli("review", "--connection", "local-sqlite", "--def-id", id, "--version", String(v), "--action", "approve", "--reviewer", "e2e-reviewer");
+      assert.equal(r.state, "certified");
+    }
+    const pub = cli("publish", "--connection", "local-sqlite", "--reviewer", "e2e-reviewer");
+    assert.ok(pub.revision.revision_id.startsWith("rev_"));
+    const plan = await call("plan_semantic_query", { connection: "local-sqlite", question: "total order value by user role" });
+    assertSuccessEnvelope(plan, "plan_semantic_query");
+    assert.equal(plan.data.status, "answerable", JSON.stringify(plan.data.missing));
+    const ans = await call("ask_semantic_question", { connection: "local-sqlite", question: "total order value by user role", plan_hash: plan.data.plan_hash });
+    assertSuccessEnvelope(ans, "ask_semantic_question");
+    assert.equal(ans.returned_rows, 2);
+    const refuse = await call("ask_semantic_question", { connection: "local-sqlite", question: "how many late arrivals per service" });
+    assert.equal(refuse.data.answered, false);
+    console.log("  -> PASS: ontology discover/propose/review/publish/plan/ask with separation of duties");
+  } finally {
+    client.close();
+    setTimeout(() => fs.rmSync(dir, { recursive: true, force: true }), 500);
+  }
+}
+
 async function main() {
   await testVerifyConfigCli();
   await testStdioMcpAndCliApproval();
   await testStreamableHttpE2E();
-  console.log("\nALL DB-MCP E2E TESTS PASSED (3/3 suites).");
+  await testOntologyFlow();
+  console.log("\nALL DB-MCP E2E TESTS PASSED (4/4 suites).");
 }
 
 main().catch((err) => {

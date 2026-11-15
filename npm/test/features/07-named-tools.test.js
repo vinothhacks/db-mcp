@@ -537,10 +537,10 @@ async function main() {
     });
 
     // ---------------- 6c. discovery --------------------------------------------------------
-    await check("07.36", "tools/list exposes exactly 16 MCP tools; named tools are not separate MCP tools", async () => {
+    await check("07.36", "tools/list exposes exactly 24 MCP tools; named tools are not separate MCP tools", async () => {
       const resp = await S.rpc("tools/list", {});
       const names = resp.result.tools.map((t) => t.name);
-      assert.equal(names.length, 16, names.join(","));
+      assert.equal(names.length, 24, names.join(","));
       assert.ok(names.includes("run_named_tool"));
       for (const n of ["get_user_by_id", "list_orders_by_status", "t_max1"]) assert.ok(!names.includes(n), `${n} leaked into tools/list`);
       const def = resp.result.tools.find((t) => t.name === "run_named_tool");

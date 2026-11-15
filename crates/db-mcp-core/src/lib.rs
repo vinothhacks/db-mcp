@@ -252,6 +252,8 @@ pub enum ToolProfile {
     Diagnose,
     Change,
     Schema,
+    /// Governed semantic layer: certified terms, metrics, relationships and NL planning.
+    Ontology,
 }
 
 impl ToolProfile {
@@ -262,6 +264,7 @@ impl ToolProfile {
             Self::Diagnose,
             Self::Change,
             Self::Schema,
+            Self::Ontology,
         ]
     }
 
@@ -278,6 +281,16 @@ impl ToolProfile {
             Self::Diagnose => &["database_health", "analyze_workload", "recommend_indexes"],
             Self::Change => &["propose_change", "get_change", "apply_change"],
             Self::Schema => &["capture_schema", "diff_schema"],
+            Self::Ontology => &[
+                "ontology_status",
+                "discover_ontology",
+                "search_terms",
+                "describe_term",
+                "trace_semantic_relationships",
+                "propose_semantic_definition",
+                "plan_semantic_query",
+                "ask_semantic_question",
+            ],
         }
     }
 }

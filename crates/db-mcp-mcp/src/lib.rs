@@ -3,7 +3,7 @@
 pub mod config;
 pub mod schemas;
 
-pub use config::{AuditConfig, ChangeStoreConfig, ConnectionConfig, HttpServerConfig, ServerConfig};
+pub use config::{AuditConfig, ChangeStoreConfig, ConnectionConfig, HttpServerConfig, OntologyConfig, ServerConfig};
 pub use schemas::{build_tool_definitions, JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpToolDefinition};
 
 use std::collections::BTreeMap;
@@ -21,6 +21,11 @@ use db_mcp_catalog::{
     diff_schema, filter_and_paginate_objects, trace_table_dependencies,
 };
 use db_mcp_changes::ChangeManager;
+use db_mcp_ontology::{
+    Certification, Definition, DefinitionBody, DefinitionKind, DefinitionStatus, GovernanceOptions,
+    OntologyRevision, OntologyService, OntologyStore, PlanRequest, ProposalInput, QuestionEvidence,
+    ReviewAction, SemanticPlan,
+};
 use db_mcp_core::{
     AuditDecision, AuditEvent, CallerIdentity, CatalogDetailLevel, CatalogObject, CatalogObjectType,
     CatalogRequest, ChangeProposal, ConnectionSummary, DatabaseAdapter, DatabaseEngine,
@@ -163,6 +168,64 @@ pub struct DbMcpRuntime {
     named_tools: NamedToolRegistry,
     pg_insights: PgInsightsEngine,
     changes: ChangeManager,
+    ontology: OntologyService,
+}
+
+/// Build the ontology service from configuration (shared by the runtime and the admin CLI).
+///
+/// A configured `review_key` that cannot be resolved is a startup error (fail closed).
+pub fn build_ontology_service(config: &ServerConfig) -> DbMcpResult<OntologyService> {
+    let store = match config.ontology.storage_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        Some(path) => OntologyStore::open(path)?,
+        None => OntologyStore::new_in_memory()?,
+    };
+    let review_key = match config.ontology.review_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+        Some(reference) => {
+            let secrets = CompositeSecretProvider::with_static_and_env(StaticSecretProvider::new());
+            let secret = secrets.resolve_dsn(reference).map_err(|e| {
+                DbMcpError::ConfigurationError(format!("ontology.review_key could not be resolved: {e}"))
+            })?;
+            Some(secret.expose_secret().as_bytes().to_vec())
+        }
+        None => None,
+    };
+    Ok(OntologyService::new(
+        store,
+        GovernanceOptions {
+            tenant_id: config.ontology.tenant_id.clone(),
+            review_key,
+            certification_ttl_days: config.ontology.certification_ttl_days,
+        },
+    ))
+}
+
+fn arg_u64(args: &Value, key: &str) -> DbMcpResult<Option<u64>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| DbMcpError::InvalidArgument(format!("'{key}' must be a non-negative integer"))),
+    }
+}
+
+fn definition_touches_restricted(def: &Definition, cfg: &db_mcp_policy::ConnectionPolicyConfig) -> bool {
+    def.body.tables().iter().any(|t| cfg.is_restricted_table(t))
+}
+
+fn definition_summary(def: &Definition) -> Value {
+    json!({
+        "def_id": def.def_id,
+        "version": def.version,
+        "kind": def.kind,
+        "name": def.name,
+        "synonyms": def.synonyms,
+        "status": def.status,
+        "strength": def.strength,
+        "flags": def.flags,
+        "tables": def.body.tables(),
+        "proposed_by": def.proposed_by,
+    })
 }
 
 impl DbMcpRuntime {
@@ -264,6 +327,7 @@ impl DbMcpRuntime {
         }
         .with_policy_revision(&config.changes.policy_revision)
         .with_default_ttl_seconds(config.changes.default_ttl_seconds);
+        let ontology = build_ontology_service(&config)?;
 
         Ok(Self {
             config,
@@ -276,6 +340,7 @@ impl DbMcpRuntime {
             named_tools,
             pg_insights,
             changes,
+            ontology,
         })
     }
 
@@ -425,6 +490,179 @@ impl DbMcpRuntime {
                 }
             }
         }
+    }
+
+    /// Ontology governance service (admin channel and tests).
+    pub fn ontology(&self) -> &OntologyService {
+        &self.ontology
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn audit_ontology_admin(
+        &self,
+        caller: &CallerIdentity,
+        connection: &str,
+        tool: &str,
+        subject: Option<String>,
+        outcome: Result<Option<String>, &DbMcpError>,
+        started: Instant,
+    ) {
+        let req_id = format!("req_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let (decision, code, msg, schema_version) = match outcome {
+            Ok(sv) => (AuditDecision::Allowed, None, None, sv),
+            Err(e) => (AuditDecision::Denied, Some(e.code().to_string()), Some(e.to_string()), None),
+        };
+        let mode = self.policy.effective_config(connection).mode;
+        let _ = self.audit.record(create_audit_event(
+            req_id,
+            caller,
+            connection,
+            mode,
+            tool,
+            None,
+            None,
+            None,
+            decision,
+            code,
+            subject,
+            None,
+            None,
+            Some(started.elapsed().as_millis() as u64),
+            schema_version,
+            msg,
+        ));
+    }
+
+    /// Admin channel: certify, reject or deprecate one definition version (audited).
+    pub fn review_ontology(
+        &self,
+        reviewer: &CallerIdentity,
+        connection: &str,
+        def_id: &str,
+        version: u32,
+        action: ReviewAction,
+        reason: Option<String>,
+    ) -> DbMcpResult<(Definition, Certification)> {
+        let started = Instant::now();
+        let outcome = if self.adapters.contains_key(connection) {
+            self.ontology.review(reviewer, connection, def_id, version, action, reason)
+        } else {
+            Err(DbMcpError::ConnectionNotFound(format!("Unknown connection '{connection}'")))
+        };
+        self.audit_ontology_admin(
+            reviewer,
+            connection,
+            &format!("ontology_review:{}", action.as_str()),
+            Some(format!("{def_id}@{version}")),
+            outcome.as_ref().map(|_| None),
+            started,
+        );
+        outcome
+    }
+
+    /// Admin channel: publish all certified definitions as a new revision bound to the live
+    /// schema fingerprint (audited).
+    pub async fn publish_ontology(
+        &self,
+        reviewer: &CallerIdentity,
+        connection: &str,
+    ) -> DbMcpResult<OntologyRevision> {
+        let started = Instant::now();
+        let outcome = async {
+            let adapter = self.adapters.get(connection).cloned().ok_or_else(|| {
+                DbMcpError::ConnectionNotFound(format!("Unknown connection '{connection}'"))
+            })?;
+            let (objects, _) = self.discover_allowed(adapter.as_ref(), connection, None).await?;
+            let drift = self.ontology.check_drift(connection, &objects)?;
+            if !drift.newly_stale.is_empty() {
+                return Err(DbMcpError::SchemaDriftDetected(format!(
+                    "{} certified definition(s) became stale against the live schema; re-certify before publishing",
+                    drift.newly_stale.len()
+                )));
+            }
+            let fingerprint = compute_schema_version(&objects);
+            self.ontology.publish(reviewer, connection, Some(&fingerprint))
+        }
+        .await;
+        self.audit_ontology_admin(
+            reviewer,
+            connection,
+            "ontology_publish",
+            outcome.as_ref().ok().map(|r| r.revision_id.clone()),
+            outcome.as_ref().map(|r| Some(r.revision_id.clone())),
+            started,
+        );
+        outcome
+    }
+
+    /// Plan a question against the published ontology (used by MCP tools and golden eval).
+    pub async fn plan_question(
+        &self,
+        caller: &CallerIdentity,
+        connection: &str,
+        question: &str,
+        max_rows: Option<usize>,
+    ) -> DbMcpResult<SemanticPlan> {
+        let question = question.trim();
+        if question.is_empty() || question.len() > 1000 {
+            return Err(DbMcpError::InvalidArgument("question must be 1-1000 characters".to_string()));
+        }
+        let adapter = self.get_authorized_adapter(caller, connection)?;
+        let cfg = self.policy.effective_config(connection);
+        let (objects, _) = self.discover_allowed(adapter.as_ref(), connection, None).await?;
+        let fingerprint = compute_schema_version(&objects);
+        self.ontology.check_drift(connection, &objects)?;
+        let (revision, live, stale) = self.ontology.published_set(connection)?;
+        let live: Vec<Definition> = live.into_iter().filter(|d| !definition_touches_restricted(d, &cfg)).collect();
+        let row_cap = max_rows
+            .unwrap_or(self.config.ontology.default_max_rows)
+            .min(self.config.ontology.default_max_rows.max(1))
+            .min(cfg.limits.max_rows.max(1));
+        let plan = db_mcp_ontology::plan(&PlanRequest {
+            question,
+            engine: adapter.capabilities().engine,
+            max_rows: row_cap,
+            revision: revision.as_ref(),
+            published: &live,
+            stale: &stale,
+            schema_fingerprint: &fingerprint,
+        });
+        // Fail closed: every definition the plan relies on must still carry a valid certification.
+        if plan.is_answerable() {
+            for used in plan.all_used() {
+                let def = live
+                    .iter()
+                    .find(|d| d.def_id == used.def_id && d.version == used.version)
+                    .ok_or_else(|| DbMcpError::InternalError(format!("plan references unknown definition {}", used.def_id)))?;
+                self.ontology.verify_certification(def)?;
+            }
+        }
+        let evidence = QuestionEvidence {
+            evidence_id: format!("qev_{}", Uuid::new_v4().simple()),
+            tenant_id: self.config.ontology.tenant_id.clone(),
+            connection: connection.to_string(),
+            question_hash: plan.question_hash.clone(),
+            revision_id: plan.revision_id.clone(),
+            def_refs: plan
+                .all_used()
+                .iter()
+                .map(|u| db_mcp_ontology::DefinitionRef {
+                    def_id: u.def_id.clone(),
+                    version: u.version,
+                    content_hash: u.content_hash.clone(),
+                })
+                .collect(),
+            sql_hash: plan.sql.as_ref().map(|s| hash_sql(s)),
+            decision: serde_json::to_value(plan.status)
+                .ok()
+                .and_then(|v| v.as_str().map(ToOwned::to_owned))
+                .unwrap_or_default(),
+            returned_rows: None,
+            principal: caller.principal.clone(),
+            at: chrono::Utc::now(),
+        };
+        let _ = self.ontology.store.insert_question_evidence(&evidence);
+        Ok(plan)
     }
 
     pub fn audit_events(&self) -> DbMcpResult<Vec<AuditEvent>> {
@@ -1067,6 +1305,412 @@ impl DbMcpRuntime {
                     diff,
                 ))
             }
+            "ontology_status" => {
+                let conn = req_str("connection")?;
+                let adapter = self.get_authorized_adapter(caller, &conn)?;
+                let cfg = self.policy.effective_config(&conn);
+                let (objects, hidden) = self.discover_allowed(adapter.as_ref(), &conn, None).await?;
+                let fingerprint = compute_schema_version(&objects);
+                let drift = self.ontology.check_drift(&conn, &objects)?;
+                let tenant = self.config.ontology.tenant_id.clone();
+                let counts = self.ontology.store.stats(&tenant, &conn)?;
+                let (revision, live, stale) = self.ontology.published_set(&conn)?;
+                let live: Vec<Definition> = live.into_iter().filter(|d| !definition_touches_restricted(d, &cfg)).collect();
+                let tables_total = objects
+                    .iter()
+                    .filter(|o| matches!(o.object_type, CatalogObjectType::Table | CatalogObjectType::View))
+                    .count();
+                let covered: std::collections::BTreeSet<String> = live
+                    .iter()
+                    .filter(|d| d.kind == DefinitionKind::Entity)
+                    .flat_map(|d| d.body.tables())
+                    .map(|t| t.to_ascii_lowercase())
+                    .collect();
+                let metrics = live.iter().filter(|d| d.kind == DefinitionKind::Metric).count();
+                let mut reasons = Vec::new();
+                let readiness = match &revision {
+                    None => {
+                        reasons.push("no published revision: run discover_ontology, propose_semantic_definition, then ask a reviewer to certify and publish".to_string());
+                        "not_ready"
+                    }
+                    Some(rev) => {
+                        if !stale.is_empty() {
+                            reasons.push(format!("{} published definition(s) are stale after schema drift and are excluded until re-certified", stale.len()));
+                        }
+                        if metrics == 0 {
+                            reasons.push("published revision contains no metrics; questions cannot be answered".to_string());
+                        }
+                        if rev.schema_fingerprint != fingerprint {
+                            reasons.push(format!("schema changed since publication ({} -> {}); dependencies are re-verified on every plan", rev.schema_fingerprint, fingerprint));
+                        }
+                        if !stale.is_empty() || metrics == 0 { "degraded" } else { "ready" }
+                    }
+                };
+                let data = json!({
+                    "connection": conn,
+                    "tenant_id": tenant,
+                    "readiness": readiness,
+                    "reasons": reasons,
+                    "schema_fingerprint": fingerprint,
+                    "revision": revision.as_ref().map(|r| json!({
+                        "revision_id": r.revision_id,
+                        "seq": r.seq,
+                        "published_by": r.published_by,
+                        "published_at": r.published_at,
+                        "schema_fingerprint": r.schema_fingerprint,
+                        "definitions": r.def_refs.len(),
+                    })),
+                    "counts_by_kind_and_status": counts,
+                    "published_definitions": live.len(),
+                    "stale_definitions": stale.iter().map(|d| json!({"def_id": d.def_id, "version": d.version, "name": d.name})).collect::<Vec<_>>(),
+                    "coverage": {
+                        "tables_visible": tables_total,
+                        "tables_with_published_entity": covered.len(),
+                        "published_metrics": metrics,
+                        "restricted_objects_hidden": hidden,
+                    },
+                    "drift": drift,
+                    "store": { "persistent": self.ontology.store.is_persistent() },
+                });
+                let sv = revision.as_ref().map(|r| r.revision_id.clone()).unwrap_or_else(|| "ontology_unpublished".to_string());
+                to_json(McpSuccessResponse::with_data(req_id, &conn, sv, "ontology_status", data))
+            }
+            "discover_ontology" => {
+                let started = Instant::now();
+                let conn = req_str("connection")?;
+                let adapter = self.get_authorized_adapter(caller, &conn)?;
+                let cfg = self.policy.effective_config(&conn);
+                let (mut objects, hidden) = self.discover_allowed(adapter.as_ref(), &conn, None).await?;
+                let fingerprint = compute_schema_version(&objects);
+                let mut warnings = Vec::new();
+                if hidden > 0 {
+                    warnings.push(format!("{hidden} restricted object(s) were excluded from discovery"));
+                }
+                let cap = self.config.ontology.max_discovery_objects;
+                if objects.len() > cap {
+                    warnings.push(format!("catalog has {} objects; discovery limited to the first {cap}", objects.len()));
+                    objects.truncate(cap);
+                }
+                let infer = match args.get("infer_joins") {
+                    None | Some(Value::Null) => self.config.ontology.infer_joins,
+                    Some(v) => v.as_bool().ok_or_else(|| DbMcpError::InvalidArgument("'infer_joins' must be a boolean".to_string()))?,
+                };
+                let scope = db_mcp_ontology::DiscoveryScope {
+                    tenant_id: self.config.ontology.tenant_id.clone(),
+                    connection: conn.clone(),
+                    engine: adapter.capabilities().engine,
+                    schema_fingerprint: fingerprint.clone(),
+                    principal: caller.principal.clone(),
+                    sensitive_columns: cfg.sensitive_columns.clone(),
+                    include_inferred_joins: infer,
+                };
+                let (candidates, report) = db_mcp_ontology::discover(&objects, &scope);
+                let merge = self.ontology.merge_discovered(candidates)?;
+                warnings.extend(report.warnings.iter().cloned());
+                let mut resp = McpSuccessResponse::with_data(
+                    req_id,
+                    &conn,
+                    fingerprint.clone(),
+                    "ontology_discovery",
+                    json!({
+                        "connection": conn,
+                        "schema_fingerprint": fingerprint,
+                        "candidates": report.candidates,
+                        "by_kind": report.by_kind,
+                        "merge": merge,
+                        "note": "Candidates are unverified (status=discovered). They cannot generate SQL until a reviewer certifies and publishes them (db-mcp ontology review / publish).",
+                    }),
+                );
+                resp.warnings = warnings;
+                resp.execution_time_ms = Some(started.elapsed().as_millis() as u64);
+                to_json(resp)
+            }
+            "search_terms" => {
+                let conn = req_str("connection")?;
+                let query = req_str("query")?;
+                self.authorize_conn(caller, &conn)?;
+                if !self.adapters.contains_key(&conn) {
+                    return Err(DbMcpError::ConnectionNotFound(format!("Unknown connection '{conn}'")));
+                }
+                let cfg = self.policy.effective_config(&conn);
+                let kinds: Vec<DefinitionKind> = match args.get("kinds").and_then(|v| v.as_array()) {
+                    Some(arr) => arr
+                        .iter()
+                        .map(|v| v.as_str().and_then(DefinitionKind::parse).ok_or_else(|| DbMcpError::InvalidArgument(format!("unknown kind {v}"))))
+                        .collect::<DbMcpResult<_>>()?,
+                    None => Vec::new(),
+                };
+                let statuses: Vec<DefinitionStatus> = match args.get("statuses").and_then(|v| v.as_array()) {
+                    Some(arr) => arr
+                        .iter()
+                        .map(|v| v.as_str().and_then(DefinitionStatus::parse).ok_or_else(|| DbMcpError::InvalidArgument(format!("unknown status {v}"))))
+                        .collect::<DbMcpResult<_>>()?,
+                    None => Vec::new(),
+                };
+                let limit = arg_u64(args, "limit")?.unwrap_or(20).clamp(1, 100) as usize;
+                let pool: Vec<Definition> = self
+                    .ontology
+                    .store
+                    .latest_all(&self.config.ontology.tenant_id, &conn)?
+                    .into_iter()
+                    .filter(|d| !definition_touches_restricted(d, &cfg))
+                    .filter(|d| kinds.is_empty() || kinds.contains(&d.kind))
+                    .filter(|d| {
+                        if statuses.is_empty() {
+                            !matches!(d.status, DefinitionStatus::Rejected | DefinitionStatus::Deprecated)
+                        } else {
+                            statuses.contains(&d.status)
+                        }
+                    })
+                    .collect();
+                let results: Vec<Value> = db_mcp_ontology::rank(&query, &pool)
+                    .into_iter()
+                    .take(limit)
+                    .map(|r| {
+                        let mut v = definition_summary(&r.definition);
+                        v["score"] = json!(r.score);
+                        v["matched_terms"] = json!(r.matched_terms);
+                        v["usable_for_sql"] = json!(r.definition.status == DefinitionStatus::Published);
+                        v
+                    })
+                    .collect();
+                to_json(McpSuccessResponse::with_data(req_id, &conn, "ontology_search", "ontology_terms", results))
+            }
+            "describe_term" => {
+                let conn = req_str("connection")?;
+                self.authorize_conn(caller, &conn)?;
+                if !self.adapters.contains_key(&conn) {
+                    return Err(DbMcpError::ConnectionNotFound(format!("Unknown connection '{conn}'")));
+                }
+                let cfg = self.policy.effective_config(&conn);
+                let tenant = self.config.ontology.tenant_id.clone();
+                let def_id = match (args.get("def_id").and_then(|v| v.as_str()), args.get("name").and_then(|v| v.as_str())) {
+                    (Some(id), _) if !id.trim().is_empty() => id.trim().to_string(),
+                    (_, Some(name)) if !name.trim().is_empty() => self
+                        .ontology
+                        .store
+                        .latest_all(&tenant, &conn)?
+                        .into_iter()
+                        .find(|d| d.name.eq_ignore_ascii_case(name.trim()))
+                        .map(|d| d.def_id)
+                        .ok_or_else(|| DbMcpError::PolicyDenied {
+                            code: "ONTOLOGY_UNKNOWN_OBJECT".to_string(),
+                            message: format!("No definition named '{}'", name.trim()),
+                            next_action: Some("search_terms".to_string()),
+                        })?,
+                    _ => return Err(DbMcpError::InvalidArgument("Provide 'def_id' or 'name'".to_string())),
+                };
+                let versions = self.ontology.store.versions(&tenant, &conn, &def_id)?;
+                let Some(latest) = versions.last().cloned() else {
+                    return Err(DbMcpError::PolicyDenied {
+                        code: "ONTOLOGY_UNKNOWN_OBJECT".to_string(),
+                        message: format!("Definition '{def_id}' does not exist on '{conn}'"),
+                        next_action: Some("search_terms".to_string()),
+                    });
+                };
+                if definition_touches_restricted(&latest, &cfg) {
+                    return Err(DbMcpError::PolicyDenied {
+                        code: "RESTRICTED_TABLE".to_string(),
+                        message: format!("Definition '{def_id}' references a restricted table"),
+                        next_action: None,
+                    });
+                }
+                let certifications = self.ontology.store.certifications(&tenant, &conn, &def_id)?;
+                let revision = self.ontology.store.latest_revision(&tenant, &conn)?;
+                let in_revision = revision.as_ref().map(|r| versions.iter().any(|v| r.contains(v))).unwrap_or(false);
+                let data = json!({
+                    "definition": latest,
+                    "versions": versions.iter().map(|v| json!({
+                        "version": v.version,
+                        "status": v.status,
+                        "content_hash": v.content_hash,
+                        "proposed_by": v.proposed_by,
+                        "created_at": v.created_at,
+                        "schema_fingerprint": v.schema_fingerprint,
+                    })).collect::<Vec<_>>(),
+                    "certifications": certifications.iter().map(|c| json!({
+                        "version": c.version,
+                        "action": c.action,
+                        "reviewer": c.reviewer,
+                        "reviewer_role": c.reviewer_role,
+                        "at": c.at,
+                        "expires_at": c.expires_at,
+                        "reason": c.reason,
+                        "signed": c.hmac.is_some(),
+                    })).collect::<Vec<_>>(),
+                    "in_published_revision": in_revision,
+                    "revision_id": revision.map(|r| r.revision_id),
+                });
+                to_json(McpSuccessResponse::with_data(req_id, &conn, latest.content_hash.clone(), "ontology_definition", data))
+            }
+            "trace_semantic_relationships" => {
+                let conn = req_str("connection")?;
+                self.authorize_conn(caller, &conn)?;
+                if !self.adapters.contains_key(&conn) {
+                    return Err(DbMcpError::ConnectionNotFound(format!("Unknown connection '{conn}'")));
+                }
+                let cfg = self.policy.effective_config(&conn);
+                let certified_only = args.get("certified_only").and_then(|v| v.as_bool()).unwrap_or(false);
+                let max_depth = arg_u64(args, "max_depth")?.unwrap_or(3).clamp(1, 10) as usize;
+                let rels: Vec<Definition> = self
+                    .ontology
+                    .store
+                    .latest_all(&self.config.ontology.tenant_id, &conn)?
+                    .into_iter()
+                    .filter(|d| d.kind == DefinitionKind::Relationship)
+                    .filter(|d| !definition_touches_restricted(d, &cfg))
+                    .filter(|d| !matches!(d.status, DefinitionStatus::Rejected | DefinitionStatus::Deprecated))
+                    .filter(|d| !certified_only || matches!(d.status, DefinitionStatus::Published | DefinitionStatus::Certified))
+                    .collect();
+                let key = |t: &str| t.to_ascii_lowercase();
+                let mut keep: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+                if let Some(entity) = args.get("entity").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                    let start: Vec<String> = rels
+                        .iter()
+                        .flat_map(|d| d.body.tables())
+                        .filter(|t| key(t) == key(entity) || db_mcp_ontology::base_table_name(t) == key(entity))
+                        .map(|t| key(&t))
+                        .collect();
+                    let Some(first) = start.first().cloned() else {
+                        return Err(DbMcpError::PolicyDenied {
+                            code: "ONTOLOGY_UNKNOWN_OBJECT".to_string(),
+                            message: format!("No relationship touches '{entity}'"),
+                            next_action: Some("discover_ontology".to_string()),
+                        });
+                    };
+                    let mut frontier = vec![first.clone()];
+                    keep.insert(first);
+                    for _ in 0..max_depth {
+                        let mut next = Vec::new();
+                        for d in &rels {
+                            let ts: Vec<String> = d.body.tables().iter().map(|t| key(t)).collect();
+                            if ts.iter().any(|t| frontier.contains(t)) {
+                                for t in ts {
+                                    if keep.insert(t.clone()) {
+                                        next.push(t);
+                                    }
+                                }
+                            }
+                        }
+                        frontier = next;
+                    }
+                }
+                let edges: Vec<Value> = rels
+                    .iter()
+                    .filter(|d| keep.is_empty() || d.body.tables().iter().all(|t| keep.contains(&key(t))))
+                    .filter_map(|d| match &d.body {
+                        DefinitionBody::Relationship { from_table, to_table, column_pairs, cardinality, source } => Some(json!({
+                            "def_id": d.def_id,
+                            "version": d.version,
+                            "name": d.name,
+                            "from": from_table,
+                            "to": to_table,
+                            "column_pairs": column_pairs,
+                            "cardinality": cardinality,
+                            "source": source,
+                            "status": d.status,
+                            "strength": d.strength,
+                            "usable_for_sql": d.status == DefinitionStatus::Published,
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                let mut mermaid = String::from("flowchart LR\n");
+                for e in &edges {
+                    let id = |t: &str| db_mcp_ontology::slug(t);
+                    let from = e["from"].as_str().unwrap_or_default();
+                    let to = e["to"].as_str().unwrap_or_default();
+                    let arrow = if e["usable_for_sql"].as_bool() == Some(true) { "-->" } else { "-.->" };
+                    mermaid.push_str(&format!(
+                        "    {}[\"{}\"] {}|{}| {}[\"{}\"]\n",
+                        id(from), from, arrow, e["status"].as_str().unwrap_or_default(), id(to), to
+                    ));
+                }
+                to_json(McpSuccessResponse::with_data(
+                    req_id,
+                    &conn,
+                    "ontology_relationships",
+                    "ontology_relationships",
+                    json!({ "edges": edges, "mermaid_diagram": mermaid, "legend": "solid = published (usable for SQL), dashed = candidate/certified-not-published" }),
+                ))
+            }
+            "propose_semantic_definition" => {
+                let conn = req_str("connection")?;
+                let adapter = self.get_authorized_adapter(caller, &conn)?;
+                let cfg = self.policy.effective_config(&conn);
+                let draft = args
+                    .get("definition")
+                    .cloned()
+                    .ok_or_else(|| DbMcpError::InvalidArgument("Missing required parameter 'definition'".to_string()))?;
+                let mut input: ProposalInput = serde_json::from_value(draft)
+                    .map_err(|e| DbMcpError::InvalidArgument(format!("invalid definition: {e}")))?;
+                if let Some(id) = args.get("def_id").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()) {
+                    input.def_id = Some(id.trim().to_string());
+                }
+                if let Some(v) = arg_u64(args, "expected_version")? {
+                    input.expected_version = Some(v as u32);
+                }
+                let (objects, _) = self.discover_allowed(adapter.as_ref(), &conn, None).await?;
+                let fingerprint = compute_schema_version(&objects);
+                let def = self.ontology.propose(caller, &conn, input, &objects, &cfg.sensitive_columns, &fingerprint)?;
+                let next = format!(
+                    "A reviewer (admin/dba, not '{}') must certify it: db-mcp ontology review --connection {} --def-id {} --version {} --action approve --reviewer <name> --config <file>; then publish.",
+                    def.proposed_by, conn, def.def_id, def.version
+                );
+                let mut resp = McpSuccessResponse::with_data(req_id, &conn, def.content_hash.clone(), "ontology_proposal", json!({ "definition": def, "next_action": next }));
+                resp.warnings.push("Proposals are drafts: they are not used for SQL until certified and published.".to_string());
+                to_json(resp)
+            }
+            "plan_semantic_query" => {
+                let started = Instant::now();
+                let conn = req_str("connection")?;
+                let question = req_str("question")?;
+                let max_rows = arg_u64(args, "max_rows")?.map(|v| v as usize);
+                let plan = self.plan_question(caller, &conn, &question, max_rows).await?;
+                let sv = plan.revision_id.clone().unwrap_or_else(|| "ontology_unpublished".to_string());
+                let mut resp = McpSuccessResponse::with_data(req_id, &conn, sv, "ontology_plan", &plan);
+                resp.warnings = plan.limitations.clone();
+                if !plan.is_answerable() {
+                    resp.warnings.extend(plan.missing.iter().cloned());
+                }
+                resp.execution_time_ms = Some(started.elapsed().as_millis() as u64);
+                to_json(resp)
+            }
+            "ask_semantic_question" => {
+                let started = Instant::now();
+                let conn = req_str("connection")?;
+                let question = req_str("question")?;
+                let max_rows = arg_u64(args, "max_rows")?.map(|v| v as usize);
+                let adapter = self.get_authorized_adapter(caller, &conn)?;
+                let plan = self.plan_question(caller, &conn, &question, max_rows).await?;
+                if let Some(pinned) = args.get("plan_hash").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()) {
+                    if plan.plan_hash.as_deref() != Some(pinned.trim()) {
+                        return Err(DbMcpError::PolicyDenied {
+                            code: "ONTOLOGY_PLAN_MISMATCH".to_string(),
+                            message: "The recomputed plan differs from the pinned plan_hash (schema, ontology revision or question changed)".to_string(),
+                            next_action: Some("Call plan_semantic_query again and review the new plan".to_string()),
+                        });
+                    }
+                }
+                let sv = plan.revision_id.clone().unwrap_or_else(|| "ontology_unpublished".to_string());
+                if !plan.is_answerable() {
+                    let mut resp = McpSuccessResponse::with_data(req_id, &conn, sv, "ontology_answer", json!({ "answered": false, "plan": plan }));
+                    resp.warnings = plan.missing.clone();
+                    resp.execution_time_ms = Some(started.elapsed().as_millis() as u64);
+                    return to_json(resp);
+                }
+                let sql = plan.sql.clone().unwrap_or_default();
+                let metric_id = plan.metric.as_ref().map(|m| m.def_id.clone()).unwrap_or_default();
+                let gov_req = GovernedQueryRequest::new(req_id, &conn, caller.clone(), sql)
+                    .with_tool_name(format!("ask_semantic_question:{metric_id}"))
+                    .with_params(plan.params.clone())
+                    .with_max_rows(max_rows.unwrap_or(self.config.ontology.default_max_rows).min(self.config.ontology.default_max_rows.max(1)));
+                let result = self.executor.execute_governed(adapter.as_ref(), gov_req).await?;
+                let mut resp = McpSuccessResponse::from_query_result(req_id, &conn, result, Some(sv));
+                resp.warnings.extend(plan.limitations.iter().cloned());
+                resp.data = Some(json!({ "answered": true, "plan": plan }));
+                to_json(resp)
+            }
             other => Err(DbMcpError::InvalidArgument(format!("Unknown tool '{other}'"))),
         }
     }
@@ -1216,7 +1860,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_returns_all_16_tools_in_demo() {
+    async fn tools_list_returns_all_24_tools_in_demo() {
         let handler = McpProtocolHandler::default_demo().expect("demo handler");
         let caller = CallerIdentity::local_agent("local-agent");
         let resp = handler
@@ -1231,7 +1875,7 @@ mod tests {
             )
             .await;
         let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 24);
 
         let dep = handler
             .call_tool(

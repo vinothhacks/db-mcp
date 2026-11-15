@@ -1,0 +1,236 @@
+{
+  "schema_version": "1.0.0",
+  "description": "Contracts for the governed ontology (semantic layer). Agent tools never certify or publish; review happens only via `db-mcp ontology review|publish` or POST /admin/ontology/{review,publish} with the admin token.",
+  "lifecycle": {
+    "statuses": [
+      "discovered",
+      "proposed",
+      "in_review",
+      "certified",
+      "published",
+      "stale",
+      "deprecated",
+      "rejected"
+    ],
+    "transitions": {
+      "discovered": [
+        "proposed",
+        "in_review",
+        "certified",
+        "rejected",
+        "stale"
+      ],
+      "proposed": [
+        "in_review",
+        "certified",
+        "rejected",
+        "stale"
+      ],
+      "in_review": [
+        "certified",
+        "rejected",
+        "stale"
+      ],
+      "certified": [
+        "published",
+        "rejected",
+        "stale",
+        "deprecated"
+      ],
+      "published": [
+        "stale",
+        "deprecated"
+      ],
+      "stale": [
+        "deprecated"
+      ]
+    },
+    "sql_eligibility": "Only definitions of the latest published revision with a valid certification (hash, optional HMAC, expiry, reviewer != proposer) are used by plan_semantic_query / ask_semantic_question."
+  },
+  "plan_statuses": [
+    "answerable",
+    "not_answerable",
+    "ambiguous",
+    "stale"
+  ],
+  "denial_codes": {
+    "ONTOLOGY_VERSION_CONFLICT": "expected_version mismatch, duplicate definition id, or concurrent publish",
+    "ONTOLOGY_UNKNOWN_OBJECT": "table/column/definition does not exist or is restricted",
+    "ONTOLOGY_SENSITIVE_COLUMN": "sensitive column used as filter, metric or join key",
+    "ONTOLOGY_INVALID_DEFINITION": "malformed typed body",
+    "ONTOLOGY_INVALID_TRANSITION": "lifecycle transition not allowed",
+    "ONTOLOGY_CERTIFICATION_INVALID": "certification missing, altered, expired, or HMAC mismatch",
+    "ONTOLOGY_NOTHING_TO_PUBLISH": "no certified definitions",
+    "ONTOLOGY_PLAN_MISMATCH": "pinned plan_hash differs from the recomputed plan",
+    "SELF_APPROVAL_FORBIDDEN": "reviewer is the proposer, an agent, or lacks admin/dba role",
+    "SCHEMA_DRIFT_DETECTED": "publish refused because certified definitions became stale",
+    "ADMIN_TOKEN_NOT_CONFIGURED": "admin HTTP endpoints are disabled without http.admin_token"
+  },
+  "tools": {
+    "ontology_status": {
+      "required": [
+        "connection"
+      ],
+      "data": [
+        "readiness",
+        "reasons",
+        "schema_fingerprint",
+        "revision",
+        "counts_by_kind_and_status",
+        "published_definitions",
+        "stale_definitions",
+        "coverage",
+        "drift",
+        "store"
+      ],
+      "side_effects": "marks drifted certified/published definitions stale"
+    },
+    "discover_ontology": {
+      "required": [
+        "connection"
+      ],
+      "optional": [
+        "infer_joins"
+      ],
+      "data": [
+        "schema_fingerprint",
+        "candidates",
+        "by_kind",
+        "merge"
+      ],
+      "side_effects": "writes discovered candidates only"
+    },
+    "search_terms": {
+      "required": [
+        "connection",
+        "query"
+      ],
+      "optional": [
+        "kinds",
+        "statuses",
+        "limit"
+      ],
+      "data": "array of {def_id, version, kind, name, synonyms, status, strength, flags, tables, score, matched_terms, usable_for_sql}"
+    },
+    "describe_term": {
+      "required": [
+        "connection"
+      ],
+      "one_of": [
+        "def_id",
+        "name"
+      ],
+      "data": [
+        "definition",
+        "versions",
+        "certifications",
+        "in_published_revision",
+        "revision_id"
+      ]
+    },
+    "trace_semantic_relationships": {
+      "required": [
+        "connection"
+      ],
+      "optional": [
+        "entity",
+        "max_depth",
+        "certified_only"
+      ],
+      "data": [
+        "edges",
+        "mermaid_diagram",
+        "legend"
+      ]
+    },
+    "propose_semantic_definition": {
+      "required": [
+        "connection",
+        "definition"
+      ],
+      "optional": [
+        "def_id",
+        "expected_version"
+      ],
+      "data": [
+        "definition",
+        "next_action"
+      ],
+      "side_effects": "writes a proposed draft version"
+    },
+    "plan_semantic_query": {
+      "required": [
+        "connection",
+        "question"
+      ],
+      "optional": [
+        "max_rows"
+      ],
+      "data": [
+        "status",
+        "sql",
+        "params",
+        "plan_hash",
+        "metric",
+        "dimensions",
+        "filters",
+        "relationships",
+        "tables",
+        "missing",
+        "candidates",
+        "assumptions",
+        "limitations",
+        "result_kind",
+        "revision_id",
+        "schema_fingerprint"
+      ],
+      "side_effects": "records question evidence"
+    },
+    "ask_semantic_question": {
+      "required": [
+        "connection",
+        "question"
+      ],
+      "optional": [
+        "plan_hash",
+        "max_rows"
+      ],
+      "data": [
+        "answered",
+        "plan"
+      ],
+      "execution": "governed executor (policy, limits, redaction, audit as ask_semantic_question:<metric def_id>)"
+    }
+  },
+  "admin_channel": {
+    "cli": [
+      "db-mcp ontology list --connection <id> [--status s] [--kind k] --config <file>",
+      "db-mcp ontology show --connection <id> --def-id <id> --config <file>",
+      "db-mcp ontology review --connection <id> --def-id <id> --version <n> --action approve|reject|deprecate --reviewer <name> [--role admin] [--reason text] --config <file>",
+      "db-mcp ontology publish --connection <id> --reviewer <name> --config <file>",
+      "db-mcp ontology eval --connection <id> --cases research/ontology/golden-local-sqlite.json --config <file>"
+    ],
+    "http": {
+      "POST /admin/ontology/review": {
+        "auth": "Bearer http.admin_token",
+        "body": [
+          "connection",
+          "def_id",
+          "version",
+          "action",
+          "reviewer",
+          "role?",
+          "reason?"
+        ]
+      },
+      "POST /admin/ontology/publish": {
+        "auth": "Bearer http.admin_token",
+        "body": [
+          "connection",
+          "reviewer",
+          "role?"
+        ]
+      }
+    }
+  }
+}

@@ -145,7 +145,7 @@ async function coverageSuite() {
     return out.events[0];
   };
   try {
-    // ---- success path for all 16 tools
+    // ---- success path for the 16 core tools (ontology tools are covered by 16-ontology.test.js)
     await check("coverage: list_connections emits an audit event", async () => expectOne("list_connections", await audited(agent, "list_connections", {}), "allowed"), "F12-01");
     await check("coverage: search_objects emits an audit event", async () => expectOne("search_objects", await audited(agent, "search_objects", { connection: "local-sqlite", limit: 3 }), "allowed"), "F12-01");
     await check("coverage: describe_object emits an audit event", async () => expectOne("describe_object", await audited(agent, "describe_object", { connection: "local-sqlite", object_name: "orders" }), "allowed"), "F12-01");

@@ -4,7 +4,7 @@
  * DB-MCP feature matrix verification.
  *
  * Exercises every shipped feature end-to-end through the real binary (via the npx launcher):
- *   - 16 MCP tools over stdio (Explore, Query, Diagnose, Change, Schema profiles)
+ *   - 24 MCP tools over stdio (Explore, Query, Diagnose, Change, Schema, Ontology profiles)
  *   - adversarial security denials (multi-statement, mutating CTE, privileged function, self-approval, replay)
  *   - sensitive-column redaction and restricted tables
  *   - Streamable HTTP transport (bearer auth, /health, /metrics, /admin/approve)
@@ -78,9 +78,9 @@ async function stdioSuite() {
       client.notify("notifications/initialized", {});
     });
     await step("protocol", "ping", async () => { const r = await client.rpc("ping", {}); assert.deepEqual(r.result, {}); });
-    await step("protocol", "tools/list exposes 16 tools with input schemas", async () => {
+    await step("protocol", "tools/list exposes 24 tools with input schemas", async () => {
       const r = await client.rpc("tools/list", {});
-      assert.equal(r.result.tools.length, 16);
+      assert.equal(r.result.tools.length, 24);
       for (const t of r.result.tools) assert.equal(t.inputSchema?.type, "object", `${t.name} schema`);
     });
     await step("protocol", "unknown method -> JSON-RPC -32601", async () => {
@@ -261,6 +261,26 @@ async function stdioSuite() {
     await step("change", "get_change unknown id -> denied", async () => {
       assert.equal((await call("get_change", { change_id: "chg_missing" })).status, "denied");
     });
+
+    // Ontology (idempotent operations only; full governed flow lives in npm/test/features/16-ontology.test.js)
+    await step("ontology", "ontology_status reports readiness and coverage", async () => {
+      const s = envelopeOk(await call("ontology_status", { connection: "local-sqlite" }), "ontology_status");
+      assert.ok(["ready", "degraded", "not_ready"].includes(s.data.readiness), s.data.readiness);
+    });
+    await step("ontology", "discover_ontology writes unverified candidates idempotently", async () => {
+      envelopeOk(await call("discover_ontology", { connection: "local-sqlite" }), "discover");
+      const again = envelopeOk(await call("discover_ontology", { connection: "local-sqlite" }), "discover2");
+      assert.equal(again.data.merge.inserted, 0);
+    });
+    await step("ontology", "search_terms ranks candidates with status; restricted table never appears", async () => {
+      const s = envelopeOk(await call("search_terms", { connection: "local-sqlite", query: "order total" }), "search_terms");
+      assert.ok(s.data.length >= 1);
+      assert.ok(!JSON.stringify(s.data).includes("internal_secrets"));
+    });
+    await step("ontology", "plan_semantic_query refuses questions without certified definitions", async () => {
+      const p = envelopeOk(await call("plan_semantic_query", { connection: "local-sqlite", question: "how many late arrivals per service" }), "plan");
+      assert.equal(p.data.status, "not_answerable");
+    });
   } finally {
     client.close();
   }
@@ -277,10 +297,10 @@ async function httpSuite() {
     for (let i = 0; i < 60 && !ready; i++) {
       try { const r = await fetch(`${base}/health`); ready = r.ok; } catch { await sleep(250); }
     }
-    await step("http", "/health reports ok with 16 tools", async () => {
+    await step("http", "/health reports ok with 24 tools", async () => {
       assert.ok(ready, `server not ready: ${errs.join("")}`);
       const b = await (await fetch(`${base}/health`)).json();
-      assert.equal(b.status, "ok"); assert.equal(b.tools, 16);
+      assert.equal(b.status, "ok"); assert.equal(b.tools, 24);
     });
     const rpc = async (body, token = env.DB_MCP_AUTH_TOKEN, headers = {}) =>
       fetch(`${base}/mcp`, { method: "POST", headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}), ...headers }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, ...body }) });
@@ -288,7 +308,7 @@ async function httpSuite() {
     await step("http", "wrong bearer -> 401", async () => { assert.equal((await rpc({ method: "tools/list", params: {} }, "bad")).status, 401); });
     await step("http", "tools/list over HTTP", async () => {
       const r = await rpc({ method: "tools/list", params: {} }); assert.equal(r.status, 200);
-      assert.equal((await r.json()).result.tools.length, 16);
+      assert.equal((await r.json()).result.tools.length, 24);
     });
     await step("http", "tools/call over HTTP with principal headers", async () => {
       const r = await rpc({ method: "tools/call", params: { name: "list_connections", arguments: {} } }, env.DB_MCP_AUTH_TOKEN, { "x-mcp-principal": "http-agent", "x-mcp-role": "developer" });

@@ -1,0 +1,57 @@
+[
+  {
+    "id": "G01-revenue-by-role",
+    "question": "total order value by user role",
+    "expect": {
+      "status": "answerable",
+      "metric": "metric:order_value",
+      "dimensions": ["attribute:main.users.role"],
+      "sql_contains": ["SUM(t0.total_cents)", "JOIN main.users t1 ON t1.id = t0.user_id", "GROUP BY t1.role"]
+    }
+  },
+  {
+    "id": "G02-count-completed",
+    "question": "count of completed orders",
+    "expect": {
+      "status": "answerable",
+      "metric": "metric:main.orders.count",
+      "filters": ["filter:completed_order"],
+      "sql_contains": ["COUNT(*)", "t0.status = ?1"]
+    }
+  },
+  {
+    "id": "G03-quantity-by-sku",
+    "question": "quantity sold by sku",
+    "expect": {
+      "status": "answerable",
+      "metric": "metric:main.order_items.quantity.sum",
+      "dimensions": ["attribute:main.order_items.sku"],
+      "sql_contains": ["SUM(t0.quantity)", "GROUP BY t0.sku"]
+    }
+  },
+  {
+    "id": "G04-fan-out-refused",
+    "question": "order total by sku",
+    "expect": { "status": "not_answerable", "reason_contains": "multiplicative join" }
+  },
+  {
+    "id": "G05-ambiguous-revenue",
+    "question": "revenue",
+    "expect": { "status": "ambiguous", "reason_contains": "several certified metrics" }
+  },
+  {
+    "id": "G06-missing-actuals",
+    "question": "how many late arrivals per service",
+    "expect": { "status": "not_answerable", "reason_contains": "no certified metric" }
+  },
+  {
+    "id": "G07-restricted-subject",
+    "question": "number of internal secrets",
+    "expect": { "status": "not_answerable", "reason_contains": "no certified metric" }
+  },
+  {
+    "id": "G08-unknown-dimension",
+    "question": "order count by warehouse region",
+    "expect": { "status": "not_answerable", "reason_contains": "no certified attribute" }
+  }
+]

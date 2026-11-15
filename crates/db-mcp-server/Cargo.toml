@@ -22,6 +22,7 @@ db-mcp-postgres.workspace = true
 db-mcp-mysql.workspace = true
 db-mcp-pg-insights.workspace = true
 db-mcp-changes.workspace = true
+db-mcp-ontology.workspace = true
 db-mcp-mcp.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

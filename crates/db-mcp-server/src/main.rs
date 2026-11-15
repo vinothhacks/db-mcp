@@ -62,6 +62,78 @@ pub enum Commands {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Out-of-band ontology governance (admin channel; never exposed to agents over MCP).
+    Ontology {
+        #[command(subcommand)]
+        command: OntologyCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OntologyCommand {
+    /// List the latest version of every definition on a connection.
+    List {
+        #[arg(long)]
+        connection: String,
+        /// Filter by status (discovered, proposed, certified, published, stale, ...).
+        #[arg(long)]
+        status: Option<String>,
+        /// Filter by kind (entity, attribute, relationship, metric, filter).
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Show every version, certification and evidence of one definition.
+    Show {
+        #[arg(long)]
+        connection: String,
+        #[arg(long)]
+        def_id: String,
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Approve (certify), reject or deprecate one exact definition version.
+    Review {
+        #[arg(long)]
+        connection: String,
+        #[arg(long)]
+        def_id: String,
+        #[arg(long)]
+        version: u32,
+        /// approve | reject | deprecate
+        #[arg(long)]
+        action: String,
+        #[arg(long)]
+        reviewer: String,
+        #[arg(long, default_value = "admin")]
+        role: String,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Publish all certified definitions of a connection as a new pinned revision.
+    Publish {
+        #[arg(long)]
+        connection: String,
+        #[arg(long)]
+        reviewer: String,
+        #[arg(long, default_value = "admin")]
+        role: String,
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Run a golden question set against the published ontology and enforce quality gates.
+    Eval {
+        #[arg(long)]
+        connection: String,
+        /// JSON array of golden cases ({id, question, expect:{status, metric?, dimensions?, ...}}).
+        #[arg(long)]
+        cases: PathBuf,
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 #[derive(Clone)]
@@ -84,6 +156,44 @@ pub struct AdminApprovePayload {
 
 fn default_admin_role() -> String {
     "admin".to_string()
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct AdminOntologyReviewPayload {
+    pub connection: String,
+    pub def_id: String,
+    pub version: u32,
+    pub action: String,
+    pub reviewer: String,
+    #[serde(default = "default_admin_role")]
+    pub role: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct AdminOntologyPublishPayload {
+    pub connection: String,
+    pub reviewer: String,
+    #[serde(default = "default_admin_role")]
+    pub role: String,
+}
+
+fn denied_json(err: &db_mcp_core::DbMcpError) -> serde_json::Value {
+    serde_json::to_value(err.to_denied_response(None, None)).unwrap_or_else(|_| json!({"status": "denied"}))
+}
+
+/// Open the ontology store for the admin CLI; review requires a persistent store.
+fn cli_ontology_service(cfg: &ServerConfig, connection: &str) -> anyhow::Result<db_mcp_ontology::OntologyService> {
+    if !cfg.connections.iter().any(|c| c.id == connection) {
+        anyhow::bail!("Unknown connection '{connection}' in configuration");
+    }
+    if cfg.ontology.storage_path.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        anyhow::bail!(
+            "ontology.storage_path is not set: the server keeps the ontology in memory, so an out-of-band review would have no effect. Configure a persistent [ontology] storage_path."
+        );
+    }
+    Ok(db_mcp_mcp::build_ontology_service(cfg)?)
 }
 
 fn load_server_config(path: Option<&PathBuf>) -> anyhow::Result<ServerConfig> {
@@ -215,6 +325,8 @@ pub fn build_http_router(state: HttpAppState) -> Router {
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
         .route("/admin/approve", post(handle_admin_approve))
+        .route("/admin/ontology/review", post(handle_admin_ontology_review))
+        .route("/admin/ontology/publish", post(handle_admin_ontology_publish))
         .with_state(Arc::new(state))
 }
 
@@ -290,6 +402,52 @@ async fn handle_admin_approve(
                 Json(serde_json::to_value(denied).unwrap_or_else(|_| json!({"status": "denied"}))),
             )
         }
+    }
+}
+
+async fn handle_admin_ontology_review(
+    State(state): State<Arc<HttpAppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<AdminOntologyReviewPayload>,
+) -> impl IntoResponse {
+    if let Some(rejection) = admin_guard(&headers, state.expected_admin_token.as_deref()) {
+        return rejection;
+    }
+    let Some(action) = db_mcp_ontology::ReviewAction::parse(&payload.action) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "denied", "code": "INVALID_ARGUMENT", "message": "action must be approve, reject or deprecate"})),
+        );
+    };
+    let reviewer = CallerIdentity::new(&payload.reviewer, &payload.role, vec!["*".to_string()], "http-admin");
+    match state.handler.review_ontology(
+        &reviewer,
+        &payload.connection,
+        &payload.def_id,
+        payload.version,
+        action,
+        payload.reason,
+    ) {
+        Ok((definition, certification)) => (
+            StatusCode::OK,
+            Json(json!({"status": "ok", "definition": definition, "certification": certification})),
+        ),
+        Err(err) => (StatusCode::BAD_REQUEST, Json(denied_json(&err))),
+    }
+}
+
+async fn handle_admin_ontology_publish(
+    State(state): State<Arc<HttpAppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<AdminOntologyPublishPayload>,
+) -> impl IntoResponse {
+    if let Some(rejection) = admin_guard(&headers, state.expected_admin_token.as_deref()) {
+        return rejection;
+    }
+    let reviewer = CallerIdentity::new(&payload.reviewer, &payload.role, vec!["*".to_string()], "http-admin");
+    match state.handler.publish_ontology(&reviewer, &payload.connection).await {
+        Ok(revision) => (StatusCode::OK, Json(json!({"status": "ok", "revision": revision}))),
+        Err(err) => (StatusCode::BAD_REQUEST, Json(denied_json(&err))),
     }
 }
 
@@ -377,6 +535,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&summary)?);
             Ok(())
         }
+        Commands::Ontology { command } => run_ontology_command(command).await,
         Commands::Approve {
             change_id,
             approver,
@@ -454,6 +613,123 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 }
                 other => anyhow::bail!("Unsupported transport '{other}' (expected 'stdio' or 'http')"),
             }
+        }
+    }
+}
+
+async fn run_ontology_command(command: OntologyCommand) -> anyhow::Result<()> {
+    use db_mcp_ontology::{DefinitionKind, DefinitionStatus, ReviewAction};
+    match command {
+        OntologyCommand::List { connection, status, kind, config } => {
+            let cfg = load_server_config(Some(&config))?;
+            let svc = cli_ontology_service(&cfg, &connection)?;
+            let status = status
+                .as_deref()
+                .map(|s| DefinitionStatus::parse(s).ok_or_else(|| anyhow::anyhow!("unknown status '{s}'")))
+                .transpose()?;
+            let kind = kind
+                .as_deref()
+                .map(|k| DefinitionKind::parse(k).ok_or_else(|| anyhow::anyhow!("unknown kind '{k}'")))
+                .transpose()?;
+            let rows: Vec<serde_json::Value> = svc
+                .store
+                .latest_all(&cfg.ontology.tenant_id, &connection)?
+                .into_iter()
+                .filter(|d| status.map(|s| d.status == s).unwrap_or(true))
+                .filter(|d| kind.map(|k| d.kind == k).unwrap_or(true))
+                .map(|d| {
+                    json!({
+                        "def_id": d.def_id,
+                        "version": d.version,
+                        "kind": d.kind,
+                        "name": d.name,
+                        "status": d.status,
+                        "strength": d.strength,
+                        "flags": d.flags,
+                        "proposed_by": d.proposed_by,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&json!({"status": "ok", "count": rows.len(), "definitions": rows}))?);
+            Ok(())
+        }
+        OntologyCommand::Show { connection, def_id, config } => {
+            let cfg = load_server_config(Some(&config))?;
+            let svc = cli_ontology_service(&cfg, &connection)?;
+            let versions = svc.store.versions(&cfg.ontology.tenant_id, &connection, &def_id)?;
+            if versions.is_empty() {
+                anyhow::bail!("Definition '{def_id}' not found on '{connection}'");
+            }
+            let certifications = svc.store.certifications(&cfg.ontology.tenant_id, &connection, &def_id)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({"status": "ok", "versions": versions, "certifications": certifications}))?
+            );
+            Ok(())
+        }
+        OntologyCommand::Review { connection, def_id, version, action, reviewer, role, reason, config } => {
+            let cfg = load_server_config(Some(&config))?;
+            let svc = cli_ontology_service(&cfg, &connection)?;
+            let action = ReviewAction::parse(&action)
+                .ok_or_else(|| anyhow::anyhow!("action must be approve, reject or deprecate"))?;
+            let caller = CallerIdentity::new(reviewer, role, vec!["*".to_string()], "cli");
+            let outcome = svc.review(&caller, &connection, &def_id, version, action, reason);
+            audit_admin_action(
+                &cfg,
+                &caller,
+                &connection,
+                &format!("ontology_review:{}", action.as_str()),
+                Some(format!("{def_id}@{version}")),
+                outcome.as_ref().map(|_| ()),
+            );
+            let (definition, certification) = outcome?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "status": "ok",
+                    "def_id": definition.def_id,
+                    "version": definition.version,
+                    "state": definition.status,
+                    "certification": certification,
+                }))?
+            );
+            Ok(())
+        }
+        OntologyCommand::Publish { connection, reviewer, role, config } => {
+            let cfg = load_server_config(Some(&config))?;
+            let svc = cli_ontology_service(&cfg, &connection)?;
+            let caller = CallerIdentity::new(reviewer, role, vec!["*".to_string()], "cli");
+            let outcome = svc.publish(&caller, &connection, None);
+            audit_admin_action(
+                &cfg,
+                &caller,
+                &connection,
+                "ontology_publish",
+                outcome.as_ref().ok().map(|r| r.revision_id.clone()),
+                outcome.as_ref().map(|_| ()),
+            );
+            let revision = outcome?;
+            println!("{}", serde_json::to_string_pretty(&json!({"status": "ok", "revision": revision}))?);
+            Ok(())
+        }
+        OntologyCommand::Eval { connection, cases, config } => {
+            let cfg = load_server_config(Some(&config))?;
+            let raw = std::fs::read_to_string(&cases)
+                .map_err(|e| anyhow::anyhow!("cannot read golden cases {}: {e}", cases.display()))?;
+            let cases: Vec<db_mcp_ontology::GoldenCase> = serde_json::from_str(&raw)?;
+            let runtime = db_mcp_mcp::DbMcpRuntime::from_config(cfg)?;
+            let evaluator = CallerIdentity::new("ontology-eval", "admin", vec!["*".to_string()], "cli");
+            let mut plans = Vec::new();
+            for case in &cases {
+                plans.push(runtime.plan_question(&evaluator, &connection, &case.question, None).await?);
+            }
+            let mut iter = plans.into_iter();
+            let report = db_mcp_ontology::evaluate(&cases, |_| iter.next().expect("one plan per case"));
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if !report.all_gates_passed() {
+                anyhow::bail!("golden evaluation gates failed");
+            }
+            Ok(())
         }
     }
 }

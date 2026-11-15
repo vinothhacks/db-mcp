@@ -1,6 +1,6 @@
 {
   "name": "@vinoth_n_3000/db-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Self-hosted Rust database MCP server combining schema exploration, bounded SQL execution, PostgreSQL intelligence, declarative named tools, and cryptographically bound change governance.",
   "license": "MIT OR Apache-2.0",
   "homepage": "https://github.com/vinothhacks/db-mcp#readme",

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 "use strict";
-const EXPECTED_TOOL_COUNT = Number(process.env.DB_MCP_EXPECTED_TOOLS || 16);
+const EXPECTED_TOOL_COUNT = Number(process.env.DB_MCP_EXPECTED_TOOLS || 24);
 /**
  * F01 - MCP protocol conformance and transports (stdio + Streamable HTTP).
  *
@@ -37,6 +37,8 @@ const EXPECTED_TOOLS = [
   "list_connections", "search_objects", "describe_object", "trace_table_dependencies", "get_procedure_call_graph",
   "execute_query", "explain_query", "run_named_tool", "database_health", "analyze_workload", "recommend_indexes",
   "propose_change", "get_change", "apply_change", "capture_schema", "diff_schema",
+  "ontology_status", "discover_ontology", "search_terms", "describe_term", "trace_semantic_relationships",
+  "propose_semantic_definition", "plan_semantic_query", "ask_semantic_question",
 ];
 const SLOW_SQL = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 4000000) SELECT COUNT(*) FROM c";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -204,13 +206,13 @@ async function stdioSuite(configPath) {
     assert.deepEqual(await s.ask({ jsonrpc: "2.0", id: 0, method: "ping", params: {} }), { jsonrpc: "2.0", id: 0, result: {} });
   });
 
-  await check("stdio: tools/list -> 16 tools with name/description/inputSchema (object schemas, required <= properties)", async () => {
+  await check("stdio: tools/list -> EXPECTED_TOOL_COUNT tools with name/description/inputSchema (object schemas, required <= properties)", async () => {
     const r = await s.ask({ jsonrpc: "2.0", id: 3, method: "tools/list" });
     const tools = r.result.tools;
     assert.ok(Array.isArray(tools));
     assert.equal(tools.length, EXPECTED_TOOL_COUNT);
     assert.deepEqual(tools.map((t) => t.name).sort(), [...EXPECTED_TOOLS].sort());
-    assert.equal(new Set(tools.map((t) => t.name)).size, 16, "duplicate tool names");
+    assert.equal(new Set(tools.map((t) => t.name)).size, EXPECTED_TOOL_COUNT, "duplicate tool names");
     for (const t of tools) {
       assert.ok(t.name && typeof t.name === "string", "tool name");
       assert.ok(t.description && typeof t.description === "string", `${t.name}: description`);
@@ -566,7 +568,7 @@ async function httpSuite() {
     assert.match(r.headers.get("www-authenticate") || "", /Bearer/i, "WWW-Authenticate header missing");
   });
 
-  await check("http: POST /mcp with correct bearer -> 200, tools/list has 16 tools, content-type application/json", async () => {
+  await check("http: POST /mcp with correct bearer -> 200, tools/list has all tools, content-type application/json", async () => {
     const r = await post(B.base, { jsonrpc: "2.0", id: 1, method: "tools/list" }, AUTH);
     assert.equal(r.status, 200);
     assert.match(r.headers.get("content-type") || "", /application\/json/);

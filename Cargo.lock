@@ -328,7 +328,7 @@ dependencies = [
 
 [[package]]
 name = "db-mcp-audit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "db-mcp-core",
@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "db-mcp-catalog"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "db-mcp-changes"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -383,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "db-mcp-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -398,7 +398,7 @@ dependencies = [
 
 [[package]]
 name = "db-mcp-executor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -419,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "db-mcp-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -431,6 +431,7 @@ dependencies = [
  "db-mcp-core",
  "db-mcp-executor",
  "db-mcp-mysql",
+ "db-mcp-ontology",
  "db-mcp-pg-insights",
  "db-mcp-policy",
  "db-mcp-postgres",
@@ -450,7 +451,7 @@ dependencies = [
 
 [[package]]
 name = "db-mcp-mysql"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -472,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "db-mcp-ontology"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "db-mcp-catalog",
@@ -491,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "db-mcp-pg-insights"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -507,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "db-mcp-policy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "db-mcp-core",
@@ -523,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "db-mcp-postgres"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -545,7 +546,7 @@ dependencies = [
 
 [[package]]
 name = "db-mcp-secrets"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "db-mcp-core",
  "regex",
@@ -557,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "db-mcp-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -571,6 +572,7 @@ dependencies = [
  "db-mcp-executor",
  "db-mcp-mcp",
  "db-mcp-mysql",
+ "db-mcp-ontology",
  "db-mcp-pg-insights",
  "db-mcp-policy",
  "db-mcp-postgres",
@@ -595,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "db-mcp-sql"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "db-mcp-core",
  "hex",
@@ -609,7 +611,7 @@ dependencies = [
 
 [[package]]
 name = "db-mcp-sqlite"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -630,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "db-mcp-tools"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "db-mcp-core",
