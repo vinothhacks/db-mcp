@@ -41,7 +41,11 @@ use url::Url;
 
 pub mod live;
 
-pub use live::{parse_mysql_dsn, MySqlDsn, CODE_CONNECTION_UNAVAILABLE};
+pub use live::{
+    bind_mysql_placeholders, build_mysql_session_setup, live_capabilities, mysql_column_type_name,
+    mysql_value_to_json, parse_mysql_dsn, summarize_grants, GrantSummary, LiveMySql, MySqlDsn,
+    CODE_CONNECTION_UNAVAILABLE, CODE_DATABASE_PERMISSION_DENIED, CODE_SERVER_READ_ONLY,
+};
 
 /// Warning emitted whenever DDL is executed on MySQL/MariaDB.
 pub const MYSQL_NON_TRANSACTIONAL_DDL_WARNING: &str =
@@ -414,6 +418,7 @@ impl MySqlAdapter {
             Some(Arc::new(live::LiveMySql::new(
                 &config.connection_id,
                 config.dsn.expose_secret(),
+                config.read_only,
             )?))
         } else {
             None
@@ -552,13 +557,45 @@ impl MySqlAdapter {
         catalog_describe_object(&all, schema, object_name, detail_level)
     }
 
-    /// A live backend is never served by the simulation: until the statement is run on the
-    /// server, every live call fails closed here.
+    /// The live backend, when this adapter talks to a real server.
+    pub fn live(&self) -> Option<&Arc<live::LiveMySql>> {
+        self.live.as_ref()
+    }
+
+    /// A live backend is never served by the simulation: live catalog and plan reads are not
+    /// part of this build yet, so they fail closed here (after the reachability check).
     async fn ensure_connectivity(&self) -> DbMcpResult<()> {
         if let Some(live) = &self.live {
-            return Err(live.not_yet_available().await);
+            live.checkout().await?;
+            return Err(DbMcpError::UnsupportedCapability(format!(
+                "live MySQL catalog discovery and EXPLAIN are not available in this build for '{}'",
+                self.config.connection_id
+            )));
         }
         Ok(())
+    }
+
+    /// Shared read-only guard (policy is enforced upstream; this is defence in depth).
+    fn guard_read_only(&self, request: &AuthorizedQuery) -> DbMcpResult<bool> {
+        let effective_read_only = self.config.read_only || request.read_only;
+        let analysis = parse_and_analyze_sql(DatabaseEngine::MySql, &request.sql)?;
+        if effective_read_only
+            && (analysis.overall_class.is_mutating()
+                || analysis.has_writes
+                || analysis.has_ddl
+                || analysis.has_cte_write
+                || analysis.has_privileged_functions)
+        {
+            return Err(DbMcpError::PolicyDenied {
+                code: "READONLY_VIOLATION".to_string(),
+                message: format!(
+                    "MySQL statement classified as '{}' is forbidden in read-only mode on '{}'",
+                    analysis.overall_class, self.config.connection_id
+                ),
+                next_action: Some("propose_change".to_string()),
+            });
+        }
+        Ok(effective_read_only)
     }
 
     async fn collect_all_catalog_objects(&self) -> DbMcpResult<Vec<CatalogObject>> {
@@ -1271,7 +1308,11 @@ impl DatabaseAdapter for MySqlAdapter {
     }
 
     fn capabilities(&self) -> DatabaseCapabilities {
-        DatabaseCapabilities::for_mysql()
+        if self.live.is_some() {
+            live::live_capabilities()
+        } else {
+            DatabaseCapabilities::for_mysql()
+        }
     }
 
     async fn discover(&self, request: CatalogRequest) -> DbMcpResult<CatalogResponse> {
@@ -1280,7 +1321,20 @@ impl DatabaseAdapter for MySqlAdapter {
     }
 
     async fn execute(&self, request: AuthorizedQuery) -> DbMcpResult<QueryResult> {
-        self.ensure_connectivity().await?;
+        if let Some(live) = &self.live {
+            let read_only = self.guard_read_only(&request)?;
+            let timeout_ms = if request.timeout_ms == 0 {
+                self.config.max_execution_time_ms
+            } else {
+                request.timeout_ms
+            };
+            if read_only {
+                if let Ok(mut log) = self.session_log.lock() {
+                    log.push(live::build_mysql_session_setup(true, timeout_ms));
+                }
+            }
+            return live.execute(&request, read_only, timeout_ms).await;
+        }
 
         let exec_id = request.execution_id.clone();
         if self.cancelled_executions.contains_key(&exec_id) {
@@ -1612,6 +1666,18 @@ impl DatabaseAdapter for MySqlAdapter {
     }
 
     async fn cancel(&self, execution: ExecutionId) -> DbMcpResult<bool> {
+        if let Some(live) = &self.live {
+            let killed = live.cancel(&execution).await?;
+            if let Some(thread_id) = killed {
+                if let Ok(mut threads) = self.killed_threads.lock() {
+                    threads.push(u64::from(thread_id));
+                }
+                if let Ok(mut log) = self.kill_query_log.lock() {
+                    log.push(build_mysql_kill_query(u64::from(thread_id)));
+                }
+            }
+            return Ok(killed.is_some());
+        }
         self.cancelled_executions
             .insert(execution.clone(), Utc::now());
         let thread_id = self

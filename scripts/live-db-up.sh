@@ -41,10 +41,10 @@ up_mysql() {
     if [ "$i" = 120 ]; then log "mysql did not become ready"; docker logs "$name" 2>&1 | tail -20 >&2; exit 1; fi
   done
   log "seeding research/fixtures/mysql-live"
-  docker exec -i -e MYSQL_PWD="$root_pw" "$name" mysql -uroot -h127.0.0.1 < research/fixtures/mysql-live/01-schema.sql >/dev/null
+  docker exec -i -e MYSQL_PWD="$root_pw" "$name" mysql -uroot -h127.0.0.1 --default-character-set=utf8mb4 < research/fixtures/mysql-live/01-schema.sql >/dev/null
   sed -e "s|__RO_PASSWORD__|${ro_pw}|" -e "s|__DIAG_PASSWORD__|${diag_pw}|" -e "s|__RW_PASSWORD__|${rw_pw}|" \
     research/fixtures/mysql-live/02-users.sql.tmpl \
-    | docker exec -i -e MYSQL_PWD="$root_pw" "$name" mysql -uroot -h127.0.0.1 >/dev/null
+    | docker exec -i -e MYSQL_PWD="$root_pw" "$name" mysql -uroot -h127.0.0.1 --default-character-set=utf8mb4 >/dev/null
   local ro_enc
   ro_enc=$(printf '%s' "$ro_pw" | sed -e 's/@/%40/g' -e 's/)/%29/g' -e 's/\$/%24/g')
   log "ready: read-only login dbmcp_ro (SELECT, SHOW VIEW on appdb)"
