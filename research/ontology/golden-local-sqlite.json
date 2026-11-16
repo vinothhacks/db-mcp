@@ -53,5 +53,67 @@
     "id": "G08-unknown-dimension",
     "question": "order count by warehouse region",
     "expect": { "status": "not_answerable", "reason_contains": "no certified attribute" }
+  },
+  {
+    "id": "G09-dimension-then-filter",
+    "question": "total order value by user role for completed orders",
+    "expect": {
+      "status": "answerable",
+      "metric": "metric:order_value",
+      "dimensions": ["attribute:main.users.role"],
+      "filters": ["filter:completed_order"],
+      "sql_contains": ["SUM(t0.total_cents)", "JOIN main.users t1 ON t1.id = t0.user_id", "WHERE t0.status = ?1", "GROUP BY t1.role"]
+    }
+  },
+  {
+    "id": "G10-filter-clause-only",
+    "question": "total order value where status is completed",
+    "expect": {
+      "status": "answerable",
+      "metric": "metric:order_value",
+      "filters": ["filter:completed_order"],
+      "sql_contains": ["SUM(t0.total_cents)", "WHERE t0.status = ?1"]
+    }
+  },
+  {
+    "id": "G11-filter-on-joined-table",
+    "question": "total quantity by sku for completed orders",
+    "expect": {
+      "status": "answerable",
+      "metric": "metric:main.order_items.quantity.sum",
+      "dimensions": ["attribute:main.order_items.sku"],
+      "filters": ["filter:completed_order"],
+      "sql_contains": ["JOIN main.orders t1 ON t1.id = t0.order_id", "WHERE t1.status = ?1", "GROUP BY t0.sku"]
+    }
+  },
+  {
+    "id": "G12-uncertified-filter-after-dimension",
+    "question": "total order value by user role for pending orders",
+    "expect": { "status": "not_answerable", "reason_contains": "'pending'" }
+  },
+  {
+    "id": "G13-uncertified-filter",
+    "question": "count of pending orders",
+    "expect": { "status": "not_answerable", "reason_contains": "no certified filter, dimension or metric covers 'pending'" }
+  },
+  {
+    "id": "G14-negated-filter",
+    "question": "count of orders that are not completed",
+    "expect": { "status": "not_answerable", "reason_contains": "'not'" }
+  },
+  {
+    "id": "G15-average-of-sum-metric",
+    "question": "average order value",
+    "expect": { "status": "not_answerable", "reason_contains": "certified metric 'order value' is a sum, not an average" }
+  },
+  {
+    "id": "G16-max-of-sum-metric",
+    "question": "max order value by user role",
+    "expect": { "status": "not_answerable", "reason_contains": "is a sum, not a maximum" }
+  },
+  {
+    "id": "G17-measure-not-named",
+    "question": "how many order items",
+    "expect": { "status": "not_answerable", "reason_contains": "does not name what certified metric" }
   }
 ]
