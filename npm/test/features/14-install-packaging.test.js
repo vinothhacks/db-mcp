@@ -855,7 +855,7 @@ async function main() {
   console.log("\n[8] README and docs/CLIENT-SETUP.md accuracy");
   await check("README: every `npm run <script>` and launcher subcommand shown exists", () => {
     for (const m of [...readme.matchAll(/npm run ([\w:.-]+)/g)]) assert.ok(PKG.scripts[m[1]], `npm run ${m[1]} does not exist`);
-    for (const m of [...readme.matchAll(/npx @vinoth_n_3000\/db-mcp (\w[\w-]*)/g)]) assert.ok(["init", "install", "where", "selftest", "serve", "approve", "verify-config"].includes(m[1]), `unknown subcommand ${m[1]}`);
+    for (const m of [...readme.matchAll(/npx @vinoth_n_3000\/db-mcp (\w[\w-]*)/g)]) assert.ok(["init", "install", "where", "selftest", "serve", "approve", "verify-config", "check-connection", "verify-audit"].includes(m[1]), `unknown subcommand ${m[1]}`);
   });
   await check("README: `cargo install --git ... db-mcp-server` names the real bin crate and repository", () => {
     const binCrate = read(path.join(REPO_ROOT, "crates", "db-mcp-server", "Cargo.toml"));

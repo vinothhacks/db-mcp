@@ -20,7 +20,7 @@ Engines:
 - **SQLite**: native.
 - **MySQL 8**: live server over plain TCP (`mysql_async`). A read-only login (`GRANT SELECT, SHOW VIEW`) is enough; every session runs `READ ONLY`.
 - **Microsoft SQL Server** (2016+ for Query Store, any version detected at connect): live server over TDS with optional encryption (`tiberius` + rustls), named instances, SQL logins. A `db_datareader` login is enough; every statement runs inside `BEGIN TRAN ... ROLLBACK`.
-- **PostgreSQL**: deterministic embedded simulation (no wire-protocol client yet). MySQL can also be simulated with `backend = "simulated"`, which the bundled example config uses. Simulated responses always carry a warning, so an agent never mistakes them for production data.
+- **PostgreSQL**: deterministic embedded simulation (no wire-protocol client yet). MySQL can also be simulated with `backend = "simulated"`, which the bundled example config uses. Simulated responses always carry a warning, so an agent never mistakes them for production data. See `research/findings/capability-matrix.md`.
 
 A live connection that cannot be reached fails with `CONNECTION_UNAVAILABLE`. It never falls back to the simulation.
 Check a connection before you point an agent at it: `npx @vinoth_n_3000/db-mcp check-connection --config db-mcp.toml --connection <id>`

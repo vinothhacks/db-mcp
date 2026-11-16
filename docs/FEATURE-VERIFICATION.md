@@ -24,6 +24,56 @@ Baseline: `cargo test --workspace` 75/75, `npm test` 3/3 suites, `npm run verify
 | F14 | Install and packaging | not completed | | launcher unit tests pass (`launcher.test.js`) |
 | F15 | Adapters and live fallback | not completed | | see "simulation disclosure" below |
 
+## v0.3.0: live MySQL 8 and SQL Server with read-only logins (2026-11-17)
+
+MySQL and SQL Server connections now talk to the real server. The embedded simulation runs only when a connection
+says `backend = "simulated"` (the bundled example config does, so suites 01-16 stay offline). A live connection that
+cannot be reached fails with `CONNECTION_UNAVAILABLE`; it never falls back to the simulation. Two tracks were built in
+parallel on separate branches and worktrees, each green on its own, then merged and re-gated.
+
+Verified against disposable containers only (`scripts/live-db-up.sh mysql|mssql`: mysql:8.0 and SQL Server 2022,
+seeded fixture, random passwords containing `@ ) $`), never against user servers.
+
+| Suite | Engine | Login | Result |
+|---|---|---|---|
+| `17-mysql-live.test.js` | MySQL 8.0 | `SELECT, SHOW VIEW` (+ diagnostics login, + writer login for server-side refusal) | 30/30 |
+| `18-sqlserver-live.test.js` | SQL Server 2022 | `db_datareader` only, and an extra-grants login | 30/30 (3 consecutive fresh containers) |
+| `cargo test -p db-mcp-mysql` (live tests gated on `DB_MCP_MYSQL_TEST_DSN`) | MySQL 8.0 | as above | 23/23 |
+| `cargo test -p db-mcp-sqlserver --test live` (gated on `DB_MCP_MSSQL_TEST_DSN`) | SQL Server 2022 | as above | 8/8 |
+| `check-connection` on both containers | both | read-only | exit 0, no password in output |
+
+All 24 tools work on both live engines: explore, `execute_query`, `run_named_tool`, `explain_query`, lineage and
+call graphs, health, workload and index advice, governed changes (apply on a read-only login fails with a permission
+error and writes nothing), schema capture and diff, and the full ontology flow (answers equal direct SQL).
+
+Read-only is enforced in layers: policy, an adapter read guard, the session (MySQL `transaction_read_only=1`;
+SQL Server runs every statement inside `BEGIN TRAN ... ROLLBACK`), and the login's own grants. Passwords never
+appear in responses, CLI output or the audit trail (checked by both suites).
+
+Grants per feature:
+
+| Feature | MySQL | SQL Server |
+|---|---|---|
+| Explore, query, FK lineage, schema capture/diff, ontology | `SELECT, SHOW VIEW` on the schema | `db_datareader` |
+| Routines, call graphs, view/trigger definitions | `SHOW_ROUTINE` (triggers need `TRIGGER`, not recommended) | `VIEW DEFINITION` |
+| `explain_query` | none | `SHOWPLAN` |
+| Workload statistics | `SELECT ON performance_schema.*` | `VIEW DATABASE STATE` (Query Store) or `VIEW SERVER STATE` (plan cache) |
+| Server health counters, all sessions | `PROCESS` | `VIEW SERVER STATE` |
+
+A missing optional grant becomes a finding that names the GRANT to request, never a failure.
+
+Fixed during the merge: MySQL `DROP INDEX` in schema-diff DDL now names the table; DB-MCP's own SQL Server catalog
+queries are tagged internal so they never appear in `analyze_workload`.
+
+Known gaps in v0.3.0:
+- MySQL: plain TCP only (no TLS); triggers are not visible to a read-only login; `EXPLAIN` is bounded by
+  `max_execution_time`, not cancelled.
+- SQL Server: `encrypt=strict` (TDS 8.0) is refused (tiberius 0.12 / rustls 0.21; 0.13 needs aws-lc-rs, which did not
+  build on the Windows dev box); `USE`, `OPTION (USE HINT ...)` and `OPTION (MAXRECURSION ...)` fail closed because the
+  SQL parser cannot represent them; only the first result set is returned; the SQL Browser path (named instance
+  without a port) is untested.
+- PostgreSQL is still served by the embedded simulation.
+
 ## v0.2.2 verification and fix pass (2026-11-16)
 
 Fourteen independent verifier agents (one per feature) re-ran every suite against the v0.2.1 release binary and
