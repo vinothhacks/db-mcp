@@ -447,6 +447,27 @@ impl JsonlAuditStore {
         Ok(records)
     }
 
+    /// Take an exclusive OS lock on `<path>.lock`, held until the returned handle is dropped.
+    fn acquire_process_lock(&self) -> DbMcpResult<File> {
+        let mut lock_path = self.path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| {
+                DbMcpError::StorageError(format!(
+                    "Failed to open JSONL audit lock file '{}': {e}",
+                    PathBuf::from(&lock_path).display()
+                ))
+            })?;
+        lock_file.lock().map_err(|e| {
+            DbMcpError::StorageError(format!("Failed to lock JSONL audit file: {e}"))
+        })?;
+        Ok(lock_file)
+    }
+
     /// Return the `chain_hash` of the last JSONL record by reading only the file tail.
     ///
     /// Returns `Ok(Some(GENESIS))` for an empty file and `Ok(None)` when the tail is not a
@@ -510,6 +531,10 @@ impl JsonlAuditStore {
             .write_lock
             .lock()
             .map_err(|e| DbMcpError::StorageError(format!("JsonlAuditStore lock poisoned: {e}")))?;
+
+        // Cross-process exclusive lock (sibling `.lock` file) so read-tail + append is atomic
+        // even when several processes share this audit file.
+        let _file_lock = self.acquire_process_lock()?;
 
         let prev_hash = match self.read_last_record_chain_hash()? {
             Some(hash) => hash,
@@ -639,6 +664,9 @@ impl SqliteAuditStore {
                 path_buf.display()
             ))
         })?;
+        conn.busy_timeout(std::time::Duration::from_secs(10)).map_err(|e| {
+            DbMcpError::StorageError(format!("Failed to set SQLite audit busy_timeout: {e}"))
+        })?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
             db_path: Some(path_buf),
@@ -717,13 +745,42 @@ impl SqliteAuditStore {
             .lock()
             .map_err(|e| DbMcpError::StorageError(format!("SQLite audit lock poisoned: {e}")))?;
 
-        let prev_hash: String = guard
-            .query_row(
-                "SELECT chain_hash FROM audit_events ORDER BY seq DESC LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or_else(|_| GENESIS_CHAIN_HASH.to_string());
+        // BEGIN IMMEDIATE takes the write lock before reading the chain tip, so a second
+        // process cannot append between our read and insert (busy_timeout makes it wait).
+        guard.execute_batch("BEGIN IMMEDIATE").map_err(|e| {
+            DbMcpError::StorageError(format!("Failed to begin audit transaction: {e}"))
+        })?;
+        let result = Self::record_in_tx(&guard, sanitized);
+        match &result {
+            Ok(()) => {
+                if let Err(e) = guard.execute_batch("COMMIT") {
+                    let _ = guard.execute_batch("ROLLBACK");
+                    return Err(DbMcpError::StorageError(format!(
+                        "Failed to commit audit transaction: {e}"
+                    )));
+                }
+            }
+            Err(_) => {
+                let _ = guard.execute_batch("ROLLBACK");
+            }
+        }
+        result
+    }
+
+    fn record_in_tx(guard: &Connection, sanitized: AuditEvent) -> DbMcpResult<()> {
+        let prev_hash: String = match guard.query_row(
+            "SELECT chain_hash FROM audit_events ORDER BY seq DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        ) {
+            Ok(h) => h,
+            Err(rusqlite::Error::QueryReturnedNoRows) => GENESIS_CHAIN_HASH.to_string(),
+            Err(e) => {
+                return Err(DbMcpError::StorageError(format!(
+                    "Failed to read audit chain tip: {e}"
+                )))
+            }
+        };
 
         let chain_hash = compute_event_chain_hash(&prev_hash, &sanitized);
         let payload_json = serde_json::to_string(&sanitized).map_err(|e| {
@@ -1301,5 +1358,42 @@ mod tests {
         let _ = fs::remove_file(&jsonl_path);
         let _ = fs::remove_file(&sqlite_path);
         let _ = fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_concurrent_writers_keep_chains_intact() {
+        let dir = std::env::temp_dir().join(format!("db_mcp_audit_conc_{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let jsonl_path = dir.join("audit.jsonl");
+        let sqlite_path = dir.join("audit.sqlite");
+        let mut handles = Vec::new();
+        for t in 0..4 {
+            let (jp, sp) = (jsonl_path.clone(), sqlite_path.clone());
+            handles.push(std::thread::spawn(move || {
+                // Separate store instances model separate processes (no shared in-process lock).
+                let jsonl = JsonlAuditStore::new(&jp).unwrap();
+                let sqlite = SqliteAuditStore::open(&sp).unwrap();
+                for i in 0..15 {
+                    let ev = sample_event_with_secrets(
+                        &format!("req_{t}_{i}"),
+                        "execute_query",
+                        AuditDecision::Allowed,
+                    );
+                    jsonl.record(ev.clone()).unwrap();
+                    sqlite.record(ev).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let jsonl = JsonlAuditStore::new(&jsonl_path).unwrap();
+        let sqlite = SqliteAuditStore::open(&sqlite_path).unwrap();
+        assert_eq!(jsonl.read_all().unwrap().len(), 60);
+        assert!(jsonl.verify_chain().unwrap());
+        assert!(sqlite.verify_chain().unwrap());
+        drop(jsonl);
+        drop(sqlite);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

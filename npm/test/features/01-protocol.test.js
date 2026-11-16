@@ -244,12 +244,12 @@ async function stdioSuite(configPath) {
     assert.equal(r.error.code, -32700);
   });
 
-  await check("stdio: valid JSON but not a Request object (missing method) -> -32600 Invalid Request", async () => { // KNOWN-BUG: F01-B4
+  await check("stdio: valid JSON but not a Request object (missing method) -> -32600 Invalid Request", async () => { 
     const r = await s.ask({ jsonrpc: "2.0", id: 6 });
     assert.equal(r.error && r.error.code, -32600, `got ${JSON.stringify(r)}`);
   });
 
-  await check("stdio: batch array -> per-item responses or single -32600 error (never 'parse error')", async () => { // KNOWN-BUG: F01-B4
+  await check("stdio: batch array -> per-item responses or single -32600 error (never 'parse error')", async () => { 
     s.send([{ jsonrpc: "2.0", id: 10, method: "ping" }, { jsonrpc: "2.0", id: 11, method: "ping" }]);
     const first = JSON.parse(await s.next());
     if (Array.isArray(first)) {
@@ -260,7 +260,7 @@ async function stdioSuite(configPath) {
     await s.drainFor(150);
   });
 
-  await check("stdio: id-less JSON-RPC notification for a non-'notifications/' method gets no reply", async () => { // KNOWN-BUG: F01-B5
+  await check("stdio: id-less JSON-RPC notification for a non-'notifications/' method gets no reply", async () => { 
     s.send({ jsonrpc: "2.0", method: "ping" });
     const r = await s.ask({ jsonrpc: "2.0", id: 7, method: "ping" });
     assert.equal(r.id, 7, `expected reply to id 7 first, got ${JSON.stringify(r)}`);
@@ -440,7 +440,7 @@ async function stdioSuite(configPath) {
     assert.notEqual(ex, "TIMEOUT");
   });
 
-  await check("stdio: a line with invalid UTF-8 -> -32700 (or ignored) and the server stays alive", async () => { // KNOWN-BUG: F01-B2
+  await check("stdio: a line with invalid UTF-8 -> -32700 (or ignored) and the server stays alive", async () => { 
     const c = stdioClient(configPath);
     await c.ask({ jsonrpc: "2.0", id: 1, method: "ping" });
     c.write(Buffer.concat([Buffer.from('{"jsonrpc":"2.0","id":2,"method":"ping","params":{"x":"'), Buffer.from([0xff, 0xfe]), Buffer.from('"}}\n')]));
@@ -562,7 +562,7 @@ async function httpSuite() {
     }
   });
 
-  await check("http: 401 carries WWW-Authenticate: Bearer (RFC 6750 / MCP auth)", async () => { // KNOWN-BUG: F01-B6
+  await check("http: 401 carries WWW-Authenticate: Bearer (RFC 6750 / MCP auth)", async () => { 
     const r = await post(B.base, { jsonrpc: "2.0", id: 1, method: "ping" });
     assert.equal(r.status, 401);
     assert.match(r.headers.get("www-authenticate") || "", /Bearer/i, "WWW-Authenticate header missing");
@@ -608,7 +608,7 @@ async function httpSuite() {
     info(`http: JSON-RPC batch array -> ${bat.status} (batching unsupported; fine for 2024-11-05 / 2025-06-18, would violate 2025-03-26 MUST)`);
   }
 
-  await check("http: POST of a notification (notifications/initialized) -> 202 Accepted with empty body", async () => { // KNOWN-BUG: F01-B3
+  await check("http: POST of a notification (notifications/initialized) -> 202 Accepted with empty body", async () => { 
     const r = await post(B.base, { jsonrpc: "2.0", method: "notifications/initialized" }, AUTH);
     const text = await r.text();
     assert.equal(r.status, 202, `got ${r.status} body=${text.slice(0, 120)}`);

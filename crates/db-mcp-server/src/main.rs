@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -59,6 +59,11 @@ pub enum Commands {
     },
     /// Validate a `ServerConfig` file (TOML, YAML, or JSON).
     VerifyConfig {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    /// Verify the hash chains of the configured JSONL and SQLite audit trails (non-zero exit on tamper).
+    VerifyAudit {
         #[arg(long)]
         config: PathBuf,
     },
@@ -363,19 +368,26 @@ async fn handle_mcp_post(
     if !check_bearer(&headers, state.expected_auth_token.as_deref()) {
         return (
             StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
             Json(json!({
                 "jsonrpc": "2.0",
                 "id": req.id,
                 "error": { "code": -32001, "message": "Unauthorized: invalid or missing Bearer token" }
             })),
-        );
+        )
+            .into_response();
     }
     let caller = extract_http_caller(&headers, &state.default_caller);
+    let is_notification = req.id.is_none();
     let resp = state.handler.handle_jsonrpc(req, &caller).await;
+    if is_notification {
+        return StatusCode::ACCEPTED.into_response();
+    }
     (
         StatusCode::OK,
         Json(serde_json::to_value(resp).unwrap_or_else(|_| json!({}))),
     )
+        .into_response()
 }
 
 async fn handle_admin_approve(
@@ -451,29 +463,67 @@ async fn handle_admin_ontology_publish(
     }
 }
 
+/// Verify the hash chain of every configured durable audit store.
+/// Returns `(all_valid, per-store JSON results)`; a missing store file counts as valid (empty).
+fn verify_audit_stores(cfg: &ServerConfig) -> (bool, Vec<Value>) {
+    let mut results = Vec::new();
+    let mut all_ok = true;
+    let mut push = |store: &str, path: &str, verdict: db_mcp_core::DbMcpResult<bool>| {
+        let (ok, err) = match verdict {
+            Ok(v) => (v, None),
+            Err(e) => (false, Some(e.to_string())),
+        };
+        all_ok &= ok;
+        results.push(json!({ "store": store, "path": path, "chain_valid": ok, "error": err }));
+    };
+    if let Some(p) = cfg.audit.jsonl_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        let v = if std::path::Path::new(p).exists() {
+            db_mcp_audit::JsonlAuditStore::new(p).and_then(|st| st.verify_chain())
+        } else {
+            Ok(true)
+        };
+        push("jsonl", p, v);
+    }
+    if let Some(p) = cfg.audit.sqlite_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+        let v = if std::path::Path::new(p).exists() {
+            db_mcp_audit::SqliteAuditStore::open(p).and_then(|st| st.verify_chain())
+        } else {
+            Ok(true)
+        };
+        push("sqlite", p, v);
+    }
+    (all_ok, results)
+}
+
 async fn run_stdio_loop(handler: McpProtocolHandler, caller: CallerIdentity) -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
-    let mut lines = BufReader::new(stdin).lines();
+    let mut reader = BufReader::new(stdin);
+    let mut buf: Vec<u8> = Vec::new();
 
-    while let Some(line) = lines.next_line().await? {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+    loop {
+        buf.clear();
+        // Read raw bytes so an invalid UTF-8 line cannot abort the loop; stop only on EOF.
+        if reader.read_until(b'\n', &mut buf).await? == 0 {
+            break;
         }
-        if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
-            let is_notification = parsed.get("id").is_none()
-                && parsed
-                    .get("method")
-                    .and_then(|m| m.as_str())
-                    .map(|m| m.starts_with("notifications/"))
-                    .unwrap_or(false);
-            if is_notification {
-                let _ = handler.handle_jsonrpc_str(trimmed, &caller).await;
-                continue;
+        let response_json = match std::str::from_utf8(&buf) {
+            Ok(line) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match handler.handle_jsonrpc_line(trimmed, &caller).await {
+                    Some(r) => r,
+                    None => continue,
+                }
             }
-        }
-        let response_json = handler.handle_jsonrpc_str(trimmed, &caller).await;
+            Err(e) => serde_json::to_string(&json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": { "code": -32700, "message": format!("Parse error: invalid UTF-8: {e}") }
+            }))?,
+        };
         stdout.write_all(response_json.as_bytes()).await?;
         stdout.write_all(b"\n").await?;
         stdout.flush().await?;
@@ -535,6 +585,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&summary)?);
             Ok(())
         }
+        Commands::VerifyAudit { config } => {
+            let parsed = ServerConfig::from_file(&config)?;
+            let (all_ok, results) = verify_audit_stores(&parsed);
+            let summary = json!({
+                "status": if all_ok { "ok" } else { "tampered" },
+                "stores": results,
+                "note": if results.is_empty() { Some("no durable audit store configured") } else { None },
+            });
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+            if !all_ok {
+                std::process::exit(2);
+            }
+            Ok(())
+        }
         Commands::Ontology { command } => run_ontology_command(command).await,
         Commands::Approve {
             change_id,
@@ -587,6 +651,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             let bind_addr = bind.unwrap_or_else(|| cfg.http.bind.clone());
             let auth_token_ref = cfg.http.auth_token.clone();
             let admin_token_ref = cfg.http.admin_token.clone();
+            let (audit_ok, audit_results) = verify_audit_stores(&cfg);
+            if !audit_ok {
+                eprintln!("[db-mcp] WARNING: audit chain integrity check FAILED (possible tampering): {}", Value::Array(audit_results));
+            }
             let handler = McpProtocolHandler::from_config(cfg)?;
 
             match transport.trim().to_ascii_lowercase().as_str() {
