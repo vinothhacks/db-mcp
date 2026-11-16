@@ -37,7 +37,7 @@ use db_mcp_mysql::{MySqlAdapter, MySqlConfig};
 use db_mcp_pg_insights::PgInsightsEngine;
 use db_mcp_policy::{PolicyEngine, PolicyEvaluation};
 use db_mcp_postgres::{PostgresAdapter, PostgresConfig};
-use db_mcp_secrets::{CompositeSecretProvider, SecretProvider, SecretString, StaticSecretProvider};
+use db_mcp_secrets::{CompositeSecretProvider, SecretProvider, StaticSecretProvider};
 use db_mcp_sql::hash_sql;
 use db_mcp_sqlite::{SqliteAdapter, SqliteConfig};
 use db_mcp_tools::NamedToolRegistry;
@@ -237,9 +237,7 @@ impl DbMcpRuntime {
         let mut policy_configs = Vec::new();
 
         for conn in &config.connections {
-            let resolved_dsn = secrets
-                .resolve_dsn(&conn.dsn)
-                .unwrap_or_else(|_| SecretString::new(conn.dsn.clone()));
+            let resolved_dsn = conn.resolve_dsn(&secrets)?;
             let adapter: Arc<dyn DatabaseAdapter> = match conn.engine {
                 DatabaseEngine::Sqlite => {
                     let mut cfg = SqliteConfig::from_dsn(&conn.id, resolved_dsn.expose_secret())

@@ -1346,6 +1346,7 @@ pub enum NamedToolParamType {
 
 /// Parameter specification for a declarative `NamedToolSpec`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NamedToolParamSpec {
     pub name: String,
     pub param_type: NamedToolParamType,
@@ -1362,6 +1363,7 @@ fn default_true() -> bool {
 
 /// Declarative parameterized named tool specification (`run_named_tool`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NamedToolSpec {
     pub name: String,
     pub description: String,

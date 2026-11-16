@@ -24,7 +24,7 @@ version = "0.2.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["DB-MCP Contributors"]
-rust-version = "1.75"
+rust-version = "1.89"
 
 [workspace.dependencies]
 tokio = { version = "1.38", features = ["full"] }

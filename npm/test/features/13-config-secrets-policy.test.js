@@ -239,7 +239,9 @@ async function main() {
     for (const k of ["config_path", "server_name", "server_version"]) assert.ok(k in j, k);
   });
   await check("verify: shipped starter config (db-mcp init template) validates", () => {
-    const r = verify(path.join(REPO, "config", "db-mcp.starter.toml"));
+    // The starter references env:DATABASE_URL / env:MYSQL_URL; unset variables are an error (F13-B2), so supply them.
+    assert.equal(verify(path.join(REPO, "config", "db-mcp.starter.toml")).status, 1, "starter must demand its env vars");
+    const r = runBin(["verify-config", "--config", path.join(REPO, "config", "db-mcp.starter.toml")], { env: { DATABASE_URL: "postgres://127.0.0.1:1/x", MYSQL_URL: "mysql://127.0.0.1:1/x" } });
     assert.equal(r.status, 0, r.stderr);
     const j = JSON.parse(r.stdout);
     assert.equal(j.connections, 3);
@@ -304,24 +306,24 @@ async function main() {
   await check("verify: named tool referencing unknown connection rejected even when connections list is empty", () => {
     const r = verify(writeCfg("ghost0.toml", `server_name = "t"\n[[named_tools]]\nname = "t1"\ndescription = "a"\nconnection = "ghost"\nstatement = "SELECT 1"\n`));
     assert.equal(r.status, 1, "verify accepted a tool bound to a connection that cannot exist");
-  }, "KNOWN-BUG: F13-B6"); // validate() only cross-checks tool connections when seen_ids is non-empty (config.rs:629)
+  });
   await check("verify: duplicate named tool names rejected", () => {
     const two = `[[named_tools]]\nname = "dup"\ndescription = "a"\nconnection = "c1"\nstatement = "SELECT 1 AS first"\n[[named_tools]]\nname = "dup"\ndescription = "b"\nconnection = "c1"\nstatement = "SELECT 2 AS second"\n`;
     const r = verify(writeCfg("duptool.toml", MIN() + two));
     assert.equal(r.status, 1, "two named tools with the same name were accepted");
-  }, "KNOWN-BUG: F13-B5"); // NamedToolRegistry::register never checks for an existing name; last definition silently wins
+  });
   await check("verify: unknown connection field (typo max_row) rejected", () => {
     const r = verify(writeCfg("typo1.toml", MIN("max_row = 5\n")));
     assert.equal(r.status, 1, "typo silently ignored");
-  }, "KNOWN-BUG: F13-B1"); // no #[serde(deny_unknown_fields)] on ConnectionConfig (config.rs:131)
+  });
   await check("verify: security-relevant typo (read_onli = true) rejected", () => {
     const r = verify(writeCfg("typo2.toml", MIN("read_onli = true\n")));
     assert.equal(r.status, 1, "read_onli silently ignored - connection stays writable");
-  }, "KNOWN-BUG: F13-B1");
+  });
   await check("verify: unknown top-level field (defualt_mode) rejected", () => {
     const r = verify(writeCfg("typo3.toml", MIN().replace("default_mode", "defualt_mode")));
     assert.equal(r.status, 1, "top-level typo silently ignored");
-  }, "KNOWN-BUG: F13-B1"); // no deny_unknown_fields on ServerConfig (config.rs:282)
+  });
   await check("verify: bad default_mode rejected naming the value", () => {
     const r = verify(writeCfg("mode.toml", MIN().replace('"ReadOnly"', '"YOLO"')));
     assert.equal(r.status, 1);
@@ -345,15 +347,15 @@ async function main() {
   await check("verify: negative changes.default_ttl_seconds rejected", () => {
     const r = verify(writeCfg("ttl.toml", MIN("", "[changes]\ndefault_ttl_seconds = -5\n")));
     assert.equal(r.status, 1, "negative TTL accepted");
-  }, "KNOWN-BUG: F13-B9"); // i64 with no range validation (config.rs:270)
+  });
   await check("verify: malformed http.bind rejected at verify time (not only at serve)", () => {
     const r = verify(writeCfg("badbind.toml", MIN("", '[http]\nbind = "not-an-addr"\n')));
     assert.equal(r.status, 1, "bad bind passes verify-config and only fails at serve");
-  }, "KNOWN-BUG: F13-B10"); // validate() never parses http.bind
+  });
   await check("verify: empty connections list rejected (server would expose no databases)", () => {
     const r = verify(writeCfg("noconn.toml", 'server_name = "t"\nconnections = []\n'));
     assert.equal(r.status, 1, "config with zero connections accepted");
-  }, "KNOWN-BUG: F13-B7");
+  });
   await check("verify: file not found -> exit 1 naming the path", () => {
     const r = verify(path.join(TMP, "does-not-exist.toml"));
     assert.equal(r.status, 1);
@@ -372,7 +374,7 @@ async function main() {
     const b = verify(writeCfg("bom.yaml", "﻿" + okYaml));
     assert.equal(a.status, 0, `json: ${a.stderr}`);
     assert.equal(b.status, 0, `yaml: ${b.stderr}`);
-  }, "KNOWN-BUG: F13-B8"); // from_file does not strip U+FEFF; serde_json/serde_yaml reject it with cryptic errors
+  });
   await check("verify: CRLF line endings accepted", () => assert.equal(verify(writeCfg("crlf.toml", MIN().replace(/\n/g, "\r\n"))).status, 0));
   await check("verify: 5 MB config parsed", () => {
     const r = verify(writeCfg("big.toml", MIN() + "# " + "x".repeat(5 * 1024 * 1024) + "\n"));
@@ -428,14 +430,13 @@ async function main() {
     const combined = v.out + r.out;
     assert.ok(combined.includes("F13_MISSING_DSN_VAR"), "neither verify-config nor serve mentions the missing variable");
     assert.ok(!combined.includes("localhost:3306"), "other DSNs must not be echoed");
-  }, "KNOWN-BUG: F13-B2"); // from_config: resolve_dsn(...).unwrap_or_else(|_| literal) (db-mcp-mcp/src/lib.rs:69-71); verify-config never resolves refs
-  await check("secrets: missing env var -> connection silently served from literal 'env:NAME' string (documents F13-B2)", async () => {
+  });
+  await check("secrets: missing env var -> serve refuses to start, error names the variable only", async () => {
     const { configPath } = makeIsolatedConfig({ dir: path.join(TMP, "sec-missing2"), transform: (t) => t.replace('dsn = "postgres://localhost:5432/app_prod"', 'dsn = "env:F13_MISSING_DSN_VAR"') });
-    await withServer({ config: configPath, unsetEnv: ["F13_MISSING_DSN_VAR"], env: { RUST_LOG: "debug" } }, async (s) => {
-      const q = await s.call("execute_query", { connection: "prod-postgres", sql: "SELECT 1 AS x" });
-      assert.equal(q.status, "ok", "server came up in simulated mode without any warning");
-      assert.equal(s.stderr.join(""), "", "no diagnostics at all are written to stderr");
-    });
+    const r = runBin(["serve", "--transport", "stdio", "--config", configPath], { unsetEnv: ["F13_MISSING_DSN_VAR"] });
+    assert.notEqual(r.status, 0, "serve started with an unresolvable env: DSN");
+    assert.match(r.stderr, /F13_MISSING_DSN_VAR/);
+    assert.ok(!r.out.includes("localhost:3306"), "other DSNs must not be echoed");
   });
   await check("secrets: file: DSN reference resolves from file (trimmed) as documented in starter config", async () => {
     const secretFile = path.join(TMP, "dsn.secret");
@@ -447,8 +448,8 @@ async function main() {
     assert.match(r.stderr, /nope\.secret/);
     const rel = runBin(["serve", "--transport", "stdio", "--config", configPath]);
     assert.equal(rel.status, 0);
-  }, "KNOWN-BUG: F13-B3"); // SecretProvider::resolve_dsn handles env:/secret:/${VAR} only; "file:" falls through as a literal DSN
-  await check("secrets: file: reference never leaks file contents (p4ss) even though unimplemented", async () => {
+  });
+  await check("secrets: file: reference never leaks file contents (p4ss) ", async () => {
     const secretFile = path.join(TMP, "dsn2.secret");
     fs.writeFileSync(secretFile, SECRET_DSN + "\n");
     const { configPath, dir } = makeIsolatedConfig({ dir: path.join(TMP, "sec-file2"), transform: (t) => t.replace('dsn = "postgres://localhost:5432/app_prod"', `dsn = "file:${posix(secretFile)}"`) });
@@ -466,10 +467,17 @@ async function main() {
     });
     assert.ok(!out.includes("p%40ss") && !out.includes("p@ss"));
   });
-  await check("secrets: env: http tokens -> unset env var silently DISABLES bearer auth (must warn or refuse)", async () => {
+  await check("secrets: env: http tokens -> unset env var must not silently disable bearer auth (refuse to start or warn)", async () => {
     const port = 18400 + Math.floor(Math.random() * 500);
     const { configPath } = makeIsolatedConfig({ dir: path.join(TMP, "http-notok"), transform: (t) => t.replace('bind = "127.0.0.1:8080"', `bind = "127.0.0.1:${port}"`) });
-    const srv = await startHttp({ config: configPath, port, unsetEnv: ["DB_MCP_AUTH_TOKEN", "DB_MCP_ADMIN_TOKEN"] });
+    let srv;
+    try {
+      srv = await startHttp({ config: configPath, port, unsetEnv: ["DB_MCP_AUTH_TOKEN", "DB_MCP_ADMIN_TOKEN"] });
+    } catch (err) {
+      // Fail closed: refusing to start on an unresolvable token reference is the correct outcome.
+      assert.match(String(err), /could not be resolved/, `server failed to start for an unexpected reason: ${err}`);
+      return;
+    }
     try {
       const r = await postJson(port, "/mcp", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "list_connections", arguments: {} } });
       const a = await postJson(port, "/admin/approve", { change_id: "chg_none", approver: "mallory" });
@@ -477,7 +485,7 @@ async function main() {
       assert.ok(r.status === 401 || warned, `unauthenticated /mcp returned ${r.status} with no warning on stderr`);
       assert.ok(a.status === 401 || warned, `unauthenticated /admin/approve reached the handler (${a.status}) with no warning`);
     } finally { await srv.stop(); }
-  }, "KNOWN-BUG: F13-B4"); // resolve_optional_token maps Err(_) => None (db-mcp-server/src/main.rs:96-107)
+  });
   await check("secrets: sqlite relative DSN path resolves against cwd (not the config file dir); nested dirs are created", async () => {
     const cwd = path.join(TMP, "sq-cwd");
     const cfgDir = path.join(TMP, "sq-cfg");
@@ -614,12 +622,11 @@ async function main() {
       assert.equal((await s.call("execute_query", { connection: "c1", sql: "SELECT count(*) AS n FROM t" })).status, "ok");
     });
   });
-  await check("modes: typo read_onli=true leaves connection writable (runtime consequence of F13-B1)", async () => {
-    await withServer({ config: writeCfg("ro-typo.toml", MIN("read_onli = true\n")) }, async (s) => {
-      const w = await s.call("execute_query", { connection: "c1", sql: "INSERT INTO t VALUES (1)" });
-      assert.equal(w.code, "READONLY_VIOLATION", "misspelled read_only silently ignored; INSERT succeeded");
-    });
-  }, "KNOWN-BUG: F13-B1");
+  await check("modes: typo read_onli=true refuses to start instead of leaving the connection writable (F13-B1)", () => {
+    const r = runBin(["serve", "--transport", "stdio", "--config", writeCfg("ro-typo.toml", MIN("read_onli = true\n"))]);
+    assert.notEqual(r.status, 0, "server started with a misspelled read_only");
+    assert.match(r.stderr, /unknown field `read_onli`/);
+  });
   await check("profiles: active_profiles=[Explore] -> tools/list only Explore tools; hidden tool call -> TOOL_NOT_ENABLED", async () => {
     const { configPath } = makeIsolatedConfig({ dir: path.join(TMP, "prof-explore"), transform: (t) => t.replace(/active_profiles = .*/, 'active_profiles = ["Explore"]') });
     await withServer({ config: configPath }, async (s) => {

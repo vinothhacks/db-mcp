@@ -21,7 +21,7 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - ./config/db-mcp.example.toml:/etc/db-mcp/db-mcp.toml:ro
-      - ./research:/var/lib/db-mcp/research
+      - db-mcp-data:/var/lib/db-mcp/research
     depends_on:
       postgres:
         condition: service_healthy
@@ -64,3 +64,6 @@ services:
       timeout: 5s
       retries: 15
       start_period: 10s
+
+volumes:
+  db-mcp-data:

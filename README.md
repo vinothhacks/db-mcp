@@ -35,7 +35,8 @@ npx @vinoth_n_3000/db-mcp serve --transport stdio --config ./db-mcp.toml
 On first run the launcher downloads the prebuilt `db-mcp-server` binary for your platform from the
 [GitHub release](https://github.com/vinothhacks/db-mcp/releases) matching the package version, verifies its SHA-256,
 and caches it under `~/.db-mcp/bin/`. If no prebuilt binary exists for your platform it falls back to
-`cargo install` from this repository (requires Rust), or to a binary you point at with `DB_MCP_BINARY_PATH`.
+`cargo install` from this repository (requires Rust), or to a binary you point at with `DB_MCP_BINARY_PATH`. If the `.sha256` file cannot be fetched the launcher refuses to install (fail closed); set
+`DB_MCP_ALLOW_UNVERIFIED=1` to override at your own risk.
 
 ### Option B: cargo
 
@@ -43,6 +44,15 @@ and caches it under `~/.db-mcp/bin/`. If no prebuilt binary exists for your plat
 cargo install --git https://github.com/vinothhacks/db-mcp --locked db-mcp-server
 db-mcp-server serve --transport stdio --config ./db-mcp.toml
 ```
+
+### Verify your install
+
+```bash
+npx @vinoth_n_3000/db-mcp selftest
+```
+
+Runs an end-to-end check of every feature (all tools, HTTP, audit, governed ontology) against a temporary copy of the
+bundled example config. It never touches your own config, databases or audit logs.
 
 ### Option C: Docker (self-hosted HTTP)
 
@@ -72,7 +82,7 @@ The server speaks MCP over stdio. Point your client at the launcher (or the bina
 claude mcp add db-mcp -- npx -y @vinoth_n_3000/db-mcp serve --transport stdio --config /abs/path/db-mcp.toml
 ```
 
-**Cursor / Windsurf / Claude Desktop / VS Code** (`mcp.json`, `claude_desktop_config.json`, `.vscode/mcp.json`)
+**Cursor / Windsurf / Claude Desktop** (`mcp.json`, `claude_desktop_config.json`)
 
 ```json
 {
@@ -85,6 +95,9 @@ claude mcp add db-mcp -- npx -y @vinoth_n_3000/db-mcp serve --transport stdio --
   }
 }
 ```
+
+**VS Code** uses a different shape: `.vscode/mcp.json` with a top-level `"servers"` key and `"type": "stdio"` per
+server (not `mcpServers`). See the [VS Code recipe](docs/CLIENT-SETUP.md#vs-code-vscodemcpjson).
 
 More client recipes, HTTP mode and the admin approval flow: [docs/CLIENT-SETUP.md](docs/CLIENT-SETUP.md).
 

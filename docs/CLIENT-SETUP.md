@@ -115,4 +115,9 @@ bound into the approval hash (`APPROVAL_HASH_MISMATCH`, `SCHEMA_DRIFT_DETECTED`)
 | `DB_MCP_SKIP_DOWNLOAD=1` | Never download prebuilt binaries (build locally or fail) |
 | `DB_MCP_RELEASE_BASE_URL` | Override the release download base (mirrors / air-gapped) |
 | `DB_MCP_AUTH_TOKEN`, `DB_MCP_ADMIN_TOKEN` | Bearer tokens referenced from the example config |
+| `DB_MCP_CACHE_DIR` | Directory for the per-user binary cache (default `~/.db-mcp`) |
+| `DB_MCP_QUIET=1` | Suppress launcher progress messages on stderr |
+| `DB_MCP_REPO` | GitHub `owner/repo` used for release downloads and `cargo install --git` (default `vinothhacks/db-mcp`) |
+| `DB_MCP_VERSION` | Release version the launcher fetches (default: the package version) |
+| `DB_MCP_ALLOW_UNVERIFIED=1` | Install a downloaded binary even when its `.sha256` file cannot be fetched. Default is fail closed; a checksum that is present but does not match is always an error |
 | `RUST_LOG` | Tracing filter for the server (`info`, `debug`, ...) |
