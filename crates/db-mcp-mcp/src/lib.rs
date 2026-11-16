@@ -33,7 +33,7 @@ use db_mcp_core::{
     PostgresHealthProvider, PostgresIndexAdvisor, SchemaSnapshot, SqlStatementClass,
 };
 use db_mcp_executor::{BoundedExecutor, GovernedQueryRequest};
-use db_mcp_mysql::{MySqlAdapter, MySqlConfig};
+use db_mcp_mysql::{MySqlAdapter, MySqlBackendMode, MySqlConfig};
 use db_mcp_pg_insights::PgInsightsEngine;
 use db_mcp_policy::{PolicyEngine, PolicyEvaluation, CODE_MUTATION_NOT_ALLOWED_IN_READ_ONLY};
 use db_mcp_postgres::{PostgresAdapter, PostgresConfig};
@@ -382,8 +382,16 @@ impl DbMcpRuntime {
                     Arc::new(PostgresAdapter::new(cfg)?)
                 }
                 DatabaseEngine::MySql => {
-                    let mut cfg =
-                        MySqlConfig::new(&conn.id, resolved_dsn).with_read_only(conn.read_only);
+                    // Explicit backend: a live connection never falls back to the simulation.
+                    let mode = if conn.effective_backend()? == config::BACKEND_SIMULATED {
+                        MySqlBackendMode::SimulatedOnly
+                    } else {
+                        MySqlBackendMode::LiveOnly
+                    };
+                    let mut cfg = MySqlConfig::new(&conn.id, resolved_dsn)
+                        .with_read_only(conn.read_only)
+                        .with_backend_mode(mode)
+                        .with_max_execution_time_ms(conn.timeout_ms);
                     if let Some(schema) = &conn.default_schema {
                         cfg = cfg.with_default_schema(schema.clone());
                     }
@@ -1059,6 +1067,7 @@ impl DbMcpRuntime {
                         }
                         let mut entry = serde_json::to_value(&summary).unwrap_or_else(|_| json!({}));
                         entry["simulated"] = json!(simulated);
+                        entry["backend"] = json!(if simulated { "simulated" } else { "live" });
                         if simulated {
                             entry["warnings"] = json!([format!(
                                 "connection '{}' is served by the embedded simulated {} engine (no external server is queried; results are illustrative)",

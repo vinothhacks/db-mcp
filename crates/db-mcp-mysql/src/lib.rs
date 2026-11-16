@@ -2,8 +2,9 @@
 //! `SchemaDiffProvider`, and `TransactionalDdlProvider`.
 //!
 //! Features:
-//! - Live MySQL TCP connection probing and handshake verification alongside a deterministic
-//!   simulated MySQL execution & catalog engine (`MySqlBackendMode::LiveOrSimulated`)
+//! - Explicit backend selection (`MySqlBackendMode`): `LiveOnly` talks to a real MySQL 8 server
+//!   and fails closed (`CONNECTION_UNAVAILABLE`) when it is unreachable; `SimulatedOnly` serves a
+//!   deterministic embedded engine and never contacts a server. There is no silent fallback.
 //! - `information_schema` progressive discovery (`TABLES`, `COLUMNS`, `STATISTICS`, `KEY_COLUMN_USAGE`)
 //! - `EXPLAIN FORMAT=JSON` generation and structured plan parsing (`access_type: "ALL"` vs `"ref"` / `"range"`)
 //! - `KILL QUERY <thread_id>` active query cancellation tracking
@@ -38,22 +39,37 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use url::Url;
 
+pub mod live;
+
+pub use live::{parse_mysql_dsn, MySqlDsn, CODE_CONNECTION_UNAVAILABLE};
+
 /// Warning emitted whenever DDL is executed on MySQL/MariaDB.
 pub const MYSQL_NON_TRANSACTIONAL_DDL_WARNING: &str =
     "MySQL/MariaDB does not support transactional DDL (supports_transactional_ddl=false); DDL statements cause an implicit commit and require a compensating migration to undo.";
 
-/// Execution mode for `MySqlAdapter`.
+/// Execution mode for `MySqlAdapter`. Selected explicitly by configuration (`backend`); a live
+/// connection never falls back to the simulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MySqlBackendMode {
-    LiveOrSimulated,
+    /// Embedded simulation (bundled example config, offline tests). No server is contacted.
     SimulatedOnly,
+    /// Real MySQL server reached through the DSN; failures are reported, never simulated.
     LiveOnly,
 }
 
 impl Default for MySqlBackendMode {
     fn default() -> Self {
-        Self::LiveOrSimulated
+        Self::LiveOnly
+    }
+}
+
+impl MySqlBackendMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SimulatedOnly => "simulated",
+            Self::LiveOnly => "live",
+        }
     }
 }
 
@@ -90,7 +106,7 @@ impl MySqlConfig {
             read_only: false,
             default_schema: default_mysql_schema(),
             max_execution_time_ms: default_max_execution_time_ms(),
-            backend_mode: MySqlBackendMode::LiveOrSimulated,
+            backend_mode: MySqlBackendMode::LiveOnly,
             init_sql: None,
         }
     }
@@ -370,6 +386,7 @@ pub struct MySqlAdapter {
     kill_query_log: Arc<Mutex<Vec<String>>>,
     session_log: Arc<Mutex<Vec<String>>>,
     next_thread_id: Arc<AtomicU64>,
+    live: Option<Arc<live::LiveMySql>>,
 }
 
 impl std::fmt::Debug for MySqlAdapter {
@@ -387,6 +404,20 @@ impl std::fmt::Debug for MySqlAdapter {
 impl MySqlAdapter {
     /// Create a new `MySqlAdapter` from `MySqlConfig`.
     pub fn new(config: MySqlConfig) -> DbMcpResult<Self> {
+        let live = if config.backend_mode == MySqlBackendMode::LiveOnly {
+            if config.init_sql.as_deref().map(str::trim).is_some_and(|s| !s.is_empty()) {
+                return Err(DbMcpError::ConfigurationError(format!(
+                    "Connection '{}': init_sql is only allowed with backend = \"simulated\"; it is never run on a live server",
+                    config.connection_id
+                )));
+            }
+            Some(Arc::new(live::LiveMySql::new(
+                &config.connection_id,
+                config.dsn.expose_secret(),
+            )?))
+        } else {
+            None
+        };
         let conn = Connection::open_in_memory()
             .map_err(|e| DbMcpError::AdapterError(e.to_string()))?;
 
@@ -410,7 +441,32 @@ impl MySqlAdapter {
             kill_query_log: Arc::new(Mutex::new(Vec::new())),
             session_log: Arc::new(Mutex::new(Vec::new())),
             next_thread_id: Arc::new(AtomicU64::new(700)),
+            live,
         })
+    }
+
+    /// `live` or `simulated`.
+    pub fn backend(&self) -> &'static str {
+        self.config.backend_mode.as_str()
+    }
+
+    /// Read-only `check-connection` report (JSON). Never contains the DSN or password.
+    pub async fn check_connection(&self) -> serde_json::Value {
+        match &self.live {
+            Some(live) => live.check().await,
+            None => serde_json::json!({
+                "connection": self.config.connection_id,
+                "engine": "mysql",
+                "backend": "simulated",
+                "server_version": null,
+                "can_connect": true,
+                "select_1": true,
+                "object_count": null,
+                "permissions": [],
+                "can_write": !self.config.read_only,
+                "warnings": ["embedded simulated MySQL engine: no server is contacted and the DSN is ignored"],
+            }),
+        }
     }
 
     /// Create a simulated MySQL adapter for offline testing.
@@ -496,15 +552,11 @@ impl MySqlAdapter {
         catalog_describe_object(&all, schema, object_name, detail_level)
     }
 
+    /// A live backend is never served by the simulation: until the statement is run on the
+    /// server, every live call fails closed here.
     async fn ensure_connectivity(&self) -> DbMcpResult<()> {
-        if self.config.backend_mode == MySqlBackendMode::LiveOnly {
-            let dsn_raw = self.config.dsn.expose_secret();
-            probe_mysql_tcp(dsn_raw, Duration::from_millis(500)).await?;
-        } else if self.config.backend_mode == MySqlBackendMode::LiveOrSimulated {
-            let dsn_raw = self.config.dsn.expose_secret();
-            if dsn_raw.starts_with("mysql://") || dsn_raw.starts_with("mariadb://") {
-                let _ = probe_mysql_tcp(dsn_raw, Duration::from_millis(80)).await;
-            }
+        if let Some(live) = &self.live {
+            return Err(live.not_yet_available().await);
         }
         Ok(())
     }
@@ -1215,9 +1267,7 @@ impl DatabaseAdapter for MySqlAdapter {
     }
 
     fn is_simulated(&self) -> bool {
-        // No wire-protocol client is implemented: statements always run on the embedded engine,
-        // even when the configured host answers a TCP probe.
-        true
+        self.live.is_none()
     }
 
     fn capabilities(&self) -> DatabaseCapabilities {

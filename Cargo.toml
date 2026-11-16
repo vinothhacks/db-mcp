@@ -50,6 +50,7 @@ tower = { version = "0.4", features = ["util"] }
 url = { version = "2.5", features = ["serde"] }
 dashmap = "6.0"
 regex = "1.10"
+mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust"] }
 
 # Internal workspace crates
 db-mcp-core = { path = "crates/db-mcp-core" }

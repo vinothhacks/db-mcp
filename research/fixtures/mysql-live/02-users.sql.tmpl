@@ -1,0 +1,21 @@
+-- Accounts for the live MySQL tests. __RO_PASSWORD__ / __DIAG_PASSWORD__ / __RW_PASSWORD__ are
+-- replaced by scripts/live-db-up.sh with fresh random values (never committed).
+--
+-- dbmcp_ro   : the documented minimum (SELECT, SHOW VIEW on the application schema only).
+-- dbmcp_diag : minimum + the optional diagnostics grants (performance_schema SELECT, SHOW_ROUTINE,
+--              PROCESS) -> full workload analysis, routine definitions, every session in health.
+-- dbmcp_rw   : a writer account, used only to prove check-connection warns (can_write=true) and
+--              that the read-only session refuses writes even when the account could write.
+CREATE USER 'dbmcp_ro'@'%' IDENTIFIED WITH caching_sha2_password BY '__RO_PASSWORD__';
+GRANT SELECT, SHOW VIEW ON appdb.* TO 'dbmcp_ro'@'%';
+
+CREATE USER 'dbmcp_diag'@'%' IDENTIFIED WITH caching_sha2_password BY '__DIAG_PASSWORD__';
+GRANT SELECT, SHOW VIEW ON appdb.* TO 'dbmcp_diag'@'%';
+GRANT SELECT ON performance_schema.* TO 'dbmcp_diag'@'%';
+GRANT SHOW_ROUTINE ON *.* TO 'dbmcp_diag'@'%';
+GRANT PROCESS ON *.* TO 'dbmcp_diag'@'%';
+
+CREATE USER 'dbmcp_rw'@'%' IDENTIFIED WITH caching_sha2_password BY '__RW_PASSWORD__';
+GRANT SELECT, INSERT, UPDATE, DELETE, SHOW VIEW ON appdb.* TO 'dbmcp_rw'@'%';
+
+FLUSH PRIVILEGES;
