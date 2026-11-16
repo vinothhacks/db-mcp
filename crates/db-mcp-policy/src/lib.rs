@@ -218,15 +218,16 @@ impl ConnectionPolicyConfig {
             return false;
         }
 
+        // The connection allowlist is authoritative: roles are self-asserted by the caller, so an
+        // admin/dba role gets no implicit bypass and must be listed like any other role.
         if !self.allowed_roles.is_empty() && !self.allowed_roles.iter().any(|r| r == "*") {
-            let role_ok = caller.is_admin()
-                || self.allowed_roles.iter().any(|allowed| {
-                    allowed.eq_ignore_ascii_case(&caller.role)
-                        || caller
-                            .roles
-                            .iter()
-                            .any(|cr| cr.eq_ignore_ascii_case(allowed))
-                });
+            let role_ok = self.allowed_roles.iter().any(|allowed| {
+                allowed.eq_ignore_ascii_case(&caller.role)
+                    || caller
+                        .roles
+                        .iter()
+                        .any(|cr| cr.eq_ignore_ascii_case(allowed))
+            });
             if !role_ok {
                 return false;
             }
@@ -662,8 +663,8 @@ impl PolicyEngine {
         }
 
         // 7. CTE Write & Statement Class / Operating Mode rules
-        if analysis.has_cte_write {
-            return match cfg.mode {
+        let mode_evaluation = if analysis.has_cte_write {
+            match cfg.mode {
                 OperatingMode::Development => PolicyEvaluation::Allowed,
                 OperatingMode::ReadOnly => PolicyEvaluation::Denied {
                     code: CODE_MUTATION_NOT_ALLOWED_IN_READ_ONLY.to_string(),
@@ -681,57 +682,76 @@ impl PolicyEngine {
                         }
                     }
                 }
-            };
-        }
-
-        match analysis.overall_class {
-            SqlStatementClass::Read => PolicyEvaluation::Allowed,
-            SqlStatementClass::Write | SqlStatementClass::Ddl | SqlStatementClass::Transaction => {
-                match cfg.mode {
-                    OperatingMode::Development => PolicyEvaluation::Allowed,
-                    OperatingMode::ReadOnly => PolicyEvaluation::Denied {
-                        code: CODE_MUTATION_NOT_ALLOWED_IN_READ_ONLY.to_string(),
-                        message: format!(
-                            "Mutating SQL statement class '{}' is not allowed in ReadOnly mode.",
-                            analysis.overall_class
-                        ),
-                        next_action: Some("propose_change".to_string()),
-                    },
-                    OperatingMode::GovernedProduction => {
-                        if is_approved_change {
-                            PolicyEvaluation::Allowed
-                        } else {
-                            PolicyEvaluation::RequiresApproval {
-                                reason: format!(
-                                    "Production '{}' changes require an approved proposal.",
-                                    analysis.overall_class
-                                ),
-                                next_action: "propose_change".to_string(),
+            }
+        } else {
+            match analysis.overall_class {
+                SqlStatementClass::Read => PolicyEvaluation::Allowed,
+                SqlStatementClass::Write | SqlStatementClass::Ddl | SqlStatementClass::Transaction => {
+                    match cfg.mode {
+                        OperatingMode::Development => PolicyEvaluation::Allowed,
+                        OperatingMode::ReadOnly => PolicyEvaluation::Denied {
+                            code: CODE_MUTATION_NOT_ALLOWED_IN_READ_ONLY.to_string(),
+                            message: format!(
+                                "Mutating SQL statement class '{}' is not allowed in ReadOnly mode.",
+                                analysis.overall_class
+                            ),
+                            next_action: Some("propose_change".to_string()),
+                        },
+                        OperatingMode::GovernedProduction => {
+                            if is_approved_change {
+                                PolicyEvaluation::Allowed
+                            } else {
+                                PolicyEvaluation::RequiresApproval {
+                                    reason: format!(
+                                        "Production '{}' changes require an approved proposal.",
+                                        analysis.overall_class
+                                    ),
+                                    next_action: "propose_change".to_string(),
+                                }
                             }
                         }
                     }
                 }
+                SqlStatementClass::PrivilegeOrAdmin => match cfg.mode {
+                    OperatingMode::Development if caller.is_admin() => PolicyEvaluation::Allowed,
+                    OperatingMode::ReadOnly => PolicyEvaluation::Denied {
+                        code: CODE_MUTATION_NOT_ALLOWED_IN_READ_ONLY.to_string(),
+                        message: "Administrative or privilege statements are forbidden in ReadOnly mode."
+                            .to_string(),
+                        next_action: None,
+                    },
+                    _ => PolicyEvaluation::Denied {
+                        code: CODE_PRIVILEGED_FUNCTION_FORBIDDEN.to_string(),
+                        message: "Administrative or privilege SQL statements are forbidden by policy."
+                            .to_string(),
+                        next_action: None,
+                    },
+                },
+                SqlStatementClass::Unknown => {
+                    // Only reachable in Development mode since ReadOnly/GovernedProduction failed closed above.
+                    PolicyEvaluation::Allowed
+                }
             }
-            SqlStatementClass::PrivilegeOrAdmin => match cfg.mode {
-                OperatingMode::Development if caller.is_admin() => PolicyEvaluation::Allowed,
-                OperatingMode::ReadOnly => PolicyEvaluation::Denied {
-                    code: CODE_MUTATION_NOT_ALLOWED_IN_READ_ONLY.to_string(),
-                    message: "Administrative or privilege statements are forbidden in ReadOnly mode."
-                        .to_string(),
-                    next_action: None,
-                },
-                _ => PolicyEvaluation::Denied {
-                    code: CODE_PRIVILEGED_FUNCTION_FORBIDDEN.to_string(),
-                    message: "Administrative or privilege SQL statements are forbidden by policy."
-                        .to_string(),
-                    next_action: None,
-                },
-            },
-            SqlStatementClass::Unknown => {
-                // Only reachable in Development mode since ReadOnly/GovernedProduction failed closed above.
-                PolicyEvaluation::Allowed
+        };
+        if !mode_evaluation.is_allowed() {
+            return mode_evaluation;
+        }
+
+        // 7b. `EXPLAIN ANALYZE` executes the statement: the same switch that governs
+        //     explain_query(analyze=true) applies when it is sent through execute_query.
+        if !cfg.allow_explain_analyze && is_explain_analyze(analysis) {
+            return explain_analyze_denied(connection_id);
+        }
+
+        // 8. Result-disclosure provenance: redaction masks sensitive columns by output column
+        //    name, so ad-hoc SQL may only return a sensitive column as a bare, unaliased item.
+        if !is_named_tool && !is_approved_change {
+            if let Some(denial) = disclosure_provenance_denial(&cfg, analysis, connection_id) {
+                return denial;
             }
         }
+
+        PolicyEvaluation::Allowed
     }
 
     /// Parse and evaluate raw SQL in one step.
@@ -760,20 +780,9 @@ impl PolicyEngine {
             return base_eval;
         }
         let cfg = self.effective_config(connection_id);
-        let is_analyze = analyze_flag
-            || analysis
-                .statements
-                .iter()
-                .any(|s| s.statement_kind == "EXPLAIN_ANALYZE");
+        let is_analyze = analyze_flag || is_explain_analyze(analysis);
         if is_analyze && !cfg.allow_explain_analyze {
-            return PolicyEvaluation::Denied {
-                code: CODE_ANALYZE_EXPLAIN_FORBIDDEN.to_string(),
-                message: format!(
-                    "Execution-based EXPLAIN ANALYZE is disabled by policy on connection '{}'. Use plain EXPLAIN (analyze=false).",
-                    connection_id
-                ),
-                next_action: Some("explain_query".to_string()),
-            };
+            return explain_analyze_denied(connection_id);
         }
         PolicyEvaluation::Allowed
     }
@@ -793,6 +802,120 @@ impl PolicyEngine {
         let cfg = self.effective_config(connection_id);
         apply_plan_disclosure_controls(plan, &cfg);
     }
+}
+
+/// True if any statement is an execution-based `EXPLAIN ANALYZE` (read or mutating).
+fn is_explain_analyze(analysis: &SqlAnalysis) -> bool {
+    analysis
+        .statements
+        .iter()
+        .any(|s| s.statement_kind.starts_with("EXPLAIN_ANALYZE"))
+}
+
+fn explain_analyze_denied(connection_id: &str) -> PolicyEvaluation {
+    PolicyEvaluation::Denied {
+        code: CODE_ANALYZE_EXPLAIN_FORBIDDEN.to_string(),
+        message: format!(
+            "Execution-based EXPLAIN ANALYZE is disabled by policy on connection '{}'. Use plain EXPLAIN (analyze=false).",
+            connection_id
+        ),
+        next_action: Some("explain_query".to_string()),
+    }
+}
+
+/// Deny ad-hoc SQL that would let a sensitive column's value reach the result (or a readable
+/// column) under a name result redaction does not recognise: aliases, expressions, set-operation
+/// positions, column alias lists, `INSERT ... SELECT`, `UPDATE ... SET` and column renames.
+/// Fails closed when output provenance cannot be tracked or a statement body is opaque.
+fn disclosure_provenance_denial(
+    cfg: &ConnectionPolicyConfig,
+    analysis: &SqlAnalysis,
+    connection_id: &str,
+) -> Option<PolicyEvaluation> {
+    if cfg.sensitive_columns.is_empty() {
+        return None;
+    }
+    let disclosure = &analysis.disclosure;
+
+    for exp in &disclosure.exposures {
+        if !cfg.is_sensitive_column(exp.table.as_deref(), &exp.column) {
+            continue;
+        }
+        // Still masked when it surfaces under another sensitive name.
+        if exp
+            .output_name
+            .as_deref()
+            .is_some_and(|name| cfg.is_sensitive_column(None, name))
+        {
+            continue;
+        }
+        let surfaces_as = match &exp.output_name {
+            Some(name) => format!("as '{name}'"),
+            None => "inside an expression or an unnamed position".to_string(),
+        };
+        return Some(PolicyEvaluation::Denied {
+            code: CODE_SENSITIVE_COLUMN_FORBIDDEN.to_string(),
+            message: format!(
+                "Sensitive column '{}' would be returned {} on connection '{}', where result redaction cannot mask it. Select the column directly without an alias, expression, set operation or positional copy (it is returned as [REDACTED]), or use a curated named tool.",
+                exp.column, surfaces_as, connection_id
+            ),
+            next_action: Some("select_sensitive_column_directly".to_string()),
+        });
+    }
+
+    if let Some(reason) = disclosure.untracked_provenance.first() {
+        let touches_sensitive_table = analysis.referenced_tables.is_empty()
+            || analysis
+                .referenced_tables
+                .iter()
+                .any(|t| cfg.is_sensitive_table(t));
+        if touches_sensitive_table {
+            return Some(PolicyEvaluation::Denied {
+                code: CODE_UNPROVENANCED_SENSITIVE_QUERY.to_string(),
+                message: format!(
+                    "Result column provenance cannot be tracked on connection '{}' ({}), so sensitive columns could be returned unredacted. List the columns explicitly.",
+                    connection_id, reason
+                ),
+                next_action: Some("list_columns_explicitly".to_string()),
+            });
+        }
+    }
+
+    for text in &disclosure.opaque_sql {
+        if let Some(column) = cfg
+            .sensitive_columns
+            .iter()
+            .find(|pattern| mentions_sensitive_column(text, pattern))
+        {
+            return Some(PolicyEvaluation::Denied {
+                code: CODE_SENSITIVE_COLUMN_FORBIDDEN.to_string(),
+                message: format!(
+                    "SQL whose body cannot be analysed references sensitive column '{}' on connection '{}'; its output cannot be redacted reliably.",
+                    column, connection_id
+                ),
+                next_action: Some("remove_sensitive_column_reference".to_string()),
+            });
+        }
+    }
+    None
+}
+
+/// True if `text` mentions the column named by a `sensitive_columns` pattern as a whole word.
+fn mentions_sensitive_column(text: &str, pattern: &str) -> bool {
+    let name = base_identifier(pattern);
+    if name == "*" {
+        return true;
+    }
+    if name.is_empty() {
+        return false;
+    }
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
+    let lower = text.to_ascii_lowercase();
+    lower.match_indices(&name).any(|(start, matched)| {
+        let before = lower[..start].chars().next_back();
+        let after = lower[start + matched.len()..].chars().next();
+        !before.is_some_and(is_word) && !after.is_some_and(is_word)
+    })
 }
 
 /// Returns true if a query uses wildcard projection (`SELECT *`, `tbl.*`) or has no explicit column provenance.
@@ -835,7 +958,11 @@ pub fn apply_result_disclosure_controls(
                 && col_lower.trim_start_matches("column").parse::<u32>().is_ok()
             || col_lower.contains('(');
 
-        let is_sensitive = config.is_sensitive_column(None, &col.name);
+        // Output names may be qualified (`users.password_hash` under SQLite full_column_names).
+        let is_sensitive = config.is_sensitive_column(None, &col.name)
+            || col.name.rsplit_once('.').is_some_and(|(table, column)| {
+                config.is_sensitive_column(Some(table), column)
+            });
 
         if config.enforce_unrestricted_sql_provenance && (is_sensitive || is_anonymous_expr) {
             return Err(DbMcpError::PolicyDenied {
@@ -1019,6 +1146,90 @@ mod tests {
                 .denial_code(),
             Some(CODE_UNAUTHORIZED_ROLE)
         );
+    }
+
+    #[test]
+    fn test_explain_analyze_via_execute_query_follows_allow_explain_analyze() {
+        let caller = CallerIdentity::local_agent("agent-1");
+        let engine = PolicyEngine::with_configs(
+            OperatingMode::ReadOnly,
+            vec![
+                ConnectionPolicyConfig::read_only("ro"),
+                ConnectionPolicyConfig::development("dev").with_allow_explain_analyze(false),
+                ConnectionPolicyConfig::development("dev-allow"),
+            ],
+        );
+        let eval = |conn: &str, sql: &str| {
+            engine
+                .evaluate_raw_sql(&caller, conn, DatabaseEngine::Postgres, sql)
+                .unwrap()
+                .1
+        };
+        let denied = eval("ro", "EXPLAIN ANALYZE SELECT id FROM users");
+        assert_eq!(denied.denial_code(), Some(CODE_ANALYZE_EXPLAIN_FORBIDDEN));
+        let PolicyEvaluation::Denied { next_action, .. } = denied else { unreachable!() };
+        assert_eq!(next_action.as_deref(), Some("explain_query"));
+        // Mode rules keep their codes for mutations; Development still needs the switch.
+        assert_eq!(
+            eval("ro", "EXPLAIN ANALYZE DELETE FROM users").denial_code(),
+            Some(CODE_MUTATION_NOT_ALLOWED_IN_READ_ONLY)
+        );
+        assert_eq!(
+            eval("dev", "EXPLAIN ANALYZE DELETE FROM users").denial_code(),
+            Some(CODE_ANALYZE_EXPLAIN_FORBIDDEN)
+        );
+        assert!(eval("ro", "EXPLAIN SELECT id FROM users").is_allowed());
+        assert!(eval("dev-allow", "EXPLAIN ANALYZE SELECT id FROM users").is_allowed());
+    }
+
+    #[test]
+    fn test_bareword_pragma_write_denied_for_non_admin_in_development() {
+        let engine = PolicyEngine::with_configs(
+            OperatingMode::Development,
+            vec![ConnectionPolicyConfig::development("dev")],
+        );
+        let agent = CallerIdentity::local_agent("agent-1");
+        let admin = CallerIdentity::new("root", "admin", vec!["*".to_string()], "stdio");
+        for sql in ["PRAGMA journal_mode = WAL", "/**/PRAGMA journal_mode = WAL", "PRAGMA journal_mode(WAL)"] {
+            let (_, eval) = engine
+                .evaluate_raw_sql(&agent, "dev", DatabaseEngine::Sqlite, sql)
+                .unwrap();
+            assert_eq!(eval.denial_code(), Some(CODE_PRIVILEGED_FUNCTION_FORBIDDEN), "{sql}");
+            let (_, eval) = engine
+                .evaluate_raw_sql(&admin, "dev", DatabaseEngine::Sqlite, sql)
+                .unwrap();
+            assert!(eval.is_allowed(), "{sql}");
+        }
+        let (_, eval) = engine
+            .evaluate_raw_sql(&agent, "dev", DatabaseEngine::Sqlite, "PRAGMA table_info(users)")
+            .unwrap();
+        assert!(eval.is_allowed());
+    }
+
+    #[test]
+    fn test_allowed_roles_has_no_admin_bypass() {
+        let cfg = ConnectionPolicyConfig::development("dev-db")
+            .with_allowed_roles(vec!["developer".to_string()]);
+        let engine = PolicyEngine::with_configs(OperatingMode::Development, vec![cfg]);
+        for role in ["dba", "admin", "DBA"] {
+            let caller = CallerIdentity::new("bob", role, vec!["*".to_string()], "stdio");
+            assert!(caller.is_admin());
+            assert!(!engine.can_access_connection(&caller, "dev-db"), "{role}");
+            assert_eq!(
+                engine.authorize_connection(&caller, "dev-db").denial_code(),
+                Some(CODE_UNAUTHORIZED_ROLE),
+                "{role}"
+            );
+        }
+        let developer = CallerIdentity::new("bob", "Developer", vec!["*".to_string()], "stdio");
+        assert!(engine.can_access_connection(&developer, "dev-db"));
+
+        // Listing an admin role still grants it access.
+        let listed = ConnectionPolicyConfig::development("dev-db")
+            .with_allowed_roles(vec!["developer".to_string(), "dba".to_string()]);
+        let engine = PolicyEngine::with_configs(OperatingMode::Development, vec![listed]);
+        let dba = CallerIdentity::new("bob", "dba", vec!["*".to_string()], "stdio");
+        assert!(engine.can_access_connection(&dba, "dev-db"));
     }
 
     #[test]
@@ -1270,5 +1481,125 @@ mod tests {
         let struct_str = serde_json::to_string(&plan.structured_plan).unwrap();
         assert!(!struct_str.contains("my_struct_pass"));
         assert!(!struct_str.contains("should_be_redacted"));
+    }
+
+    fn eval_dev(engine: DatabaseEngine, sql: &str) -> PolicyEvaluation {
+        let policy = PolicyEngine::with_configs(
+            OperatingMode::Development,
+            vec![ConnectionPolicyConfig::development("dev")],
+        );
+        let caller = CallerIdentity::local_agent("agent-1");
+        policy.evaluate_raw_sql(&caller, "dev", engine, sql).unwrap().1
+    }
+
+    #[test]
+    fn test_sensitive_column_rename_bypasses_fail_closed() {
+        for engine in [DatabaseEngine::Sqlite, DatabaseEngine::Postgres, DatabaseEngine::MySql] {
+            for sql in [
+                "SELECT password_hash AS ph FROM users",
+                "SELECT upper(password_hash) FROM users",
+                "SELECT email || ':' || password_hash AS creds FROM users",
+                "SELECT ph FROM (SELECT password_hash AS ph FROM users) t",
+                "SELECT 1 UNION SELECT password_hash FROM users",
+                "SELECT (SELECT password_hash FROM users LIMIT 1) AS v",
+                "INSERT INTO notes (body) SELECT password_hash FROM users",
+                "UPDATE users SET email = password_hash",
+                "EXPLAIN SELECT password_hash AS ph FROM users",
+            ] {
+                let eval = eval_dev(engine, sql);
+                assert_eq!(eval.denial_code(), Some(CODE_SENSITIVE_COLUMN_FORBIDDEN), "{engine} {sql}");
+                let PolicyEvaluation::Denied { next_action, .. } = eval else { unreachable!() };
+                assert_eq!(next_action.as_deref(), Some("select_sensitive_column_directly"));
+            }
+            let eval = eval_dev(engine, "SELECT id, email, role, created_at, 1 FROM orders UNION SELECT * FROM users");
+            assert_eq!(eval.denial_code(), Some(CODE_UNPROVENANCED_SENSITIVE_QUERY), "{engine}");
+        }
+        // Mode rules keep their own denial codes; disclosure only gates otherwise-allowed SQL.
+        let ro = PolicyEngine::with_configs(
+            OperatingMode::ReadOnly,
+            vec![ConnectionPolicyConfig::read_only("ro")],
+        );
+        let caller = CallerIdentity::local_agent("agent-1");
+        let (_, eval) = ro
+            .evaluate_raw_sql(&caller, "ro", DatabaseEngine::Postgres, "INSERT INTO copy SELECT * FROM users")
+            .unwrap();
+        assert_eq!(eval.denial_code(), Some(CODE_MUTATION_NOT_ALLOWED_IN_READ_ONLY));
+        assert_eq!(
+            eval_dev(DatabaseEngine::Sqlite, "SELECT ph FROM (SELECT password_hash AS ph FROM users)").denial_code(),
+            Some(CODE_SENSITIVE_COLUMN_FORBIDDEN)
+        );
+        assert_eq!(
+            eval_dev(DatabaseEngine::Sqlite, "ALTER TABLE users RENAME COLUMN password_hash TO ph").denial_code(),
+            Some(CODE_SENSITIVE_COLUMN_FORBIDDEN)
+        );
+        assert_eq!(
+            eval_dev(DatabaseEngine::Postgres, "SELECT row_to_json(u) AS j FROM users u").denial_code(),
+            Some(CODE_UNPROVENANCED_SENSITIVE_QUERY)
+        );
+        assert_eq!(
+            eval_dev(
+                DatabaseEngine::Postgres,
+                "CREATE FUNCTION leak() RETURNS text AS $$ SELECT password_hash FROM users LIMIT 1 $$ LANGUAGE sql"
+            )
+            .denial_code(),
+            Some(CODE_SENSITIVE_COLUMN_FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn test_sensitive_column_direct_select_and_filters_still_allowed() {
+        for engine in [DatabaseEngine::Sqlite, DatabaseEngine::Postgres, DatabaseEngine::MySql] {
+            for sql in [
+                "SELECT password_hash FROM users",
+                "SELECT * FROM users ORDER BY id",
+                "SELECT u.password_hash, o.id FROM users u JOIN orders o ON o.user_id = u.id",
+                "WITH c AS (SELECT password_hash FROM users) SELECT * FROM c",
+                "SELECT id FROM users WHERE password_hash = 'hash_alice_secret'",
+                "SELECT upper(password_hash) AS password_hash FROM users",
+                "SELECT id FROM users UNION ALL SELECT id FROM orders",
+                "INSERT INTO users (id, email, password_hash) VALUES (3, 'c@example.com', 'h')",
+                "SELECT 'k' AS api_key",
+            ] {
+                assert!(eval_dev(engine, sql).is_allowed(), "{engine} {sql}: {:?}", eval_dev(engine, sql));
+            }
+        }
+    }
+
+    #[test]
+    fn test_named_tools_and_approved_changes_keep_curated_sensitive_projections() {
+        let policy = PolicyEngine::with_configs(
+            OperatingMode::Development,
+            vec![ConnectionPolicyConfig::development("dev")],
+        );
+        let caller = CallerIdentity::local_agent("agent-1");
+        let analysis =
+            parse_and_analyze_sql(DatabaseEngine::Sqlite, "SELECT password_hash AS ph FROM users").unwrap();
+        assert!(policy
+            .evaluate_sql_with_context(&caller, "dev", &analysis, false, true)
+            .is_allowed());
+        assert_eq!(
+            policy.evaluate_explain(&caller, "dev", &analysis, false).denial_code(),
+            Some(CODE_SENSITIVE_COLUMN_FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn test_result_redaction_matches_qualified_output_names() {
+        let cfg = ConnectionPolicyConfig::development("dev");
+        let mut result = QueryResult {
+            execution_id: ExecutionId::new(),
+            columns: vec![ColumnMetadata::new("users.password_hash", "text")],
+            rows: vec![vec![serde_json::json!("hash_alice_secret")]],
+            returned_rows: 1,
+            rows_affected: None,
+            truncated: false,
+            bytes_used: 32,
+            execution_time_ms: 1,
+            warnings: vec![],
+            schema_version: None,
+        };
+        apply_result_disclosure_controls(&mut result, &cfg).unwrap();
+        assert!(result.columns[0].redacted);
+        assert_eq!(result.rows[0][0], serde_json::json!("[REDACTED]"));
     }
 }

@@ -23,7 +23,9 @@ use sqlparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
 
+pub mod disclosure;
 pub mod routine;
+pub use disclosure::*;
 pub use routine::*;
 
 /// Privileged or side-effecting SQL functions that must be flagged and restricted.
@@ -60,7 +62,63 @@ pub const PRIVILEGED_FUNCTIONS: &[&str] = &[
     "load_extension",
     "fts3_tokenizer",
     "attach",
+    // SQLite fileio / shell extension functions: read, write or open files on the server host.
+    "readfile",
+    "writefile",
+    "edit",
+    // PostgreSQL run-time configuration change (search_path hijack, statement_timeout, ...).
+    "set_config",
 ];
+
+/// SQLite pragmas that take an argument but only read state (`PRAGMA table_info(users)`).
+const READ_ONLY_PRAGMAS_WITH_ARGUMENT: &[&str] = &[
+    "table_info",
+    "table_xinfo",
+    "table_list",
+    "index_info",
+    "index_xinfo",
+    "index_list",
+    "foreign_key_list",
+    "foreign_key_check",
+    "integrity_check",
+    "quick_check",
+];
+
+/// SQLite pragmas that change state even without an argument.
+const SIDE_EFFECT_PRAGMAS: &[&str] = &["optimize", "shrink_memory", "wal_checkpoint", "incremental_vacuum"];
+
+/// Classify a pragma: any assignment (`PRAGMA x = v`), any argument to a pragma that is not a
+/// known read-only introspection pragma (`PRAGMA journal_mode(WAL)`), and side-effecting
+/// pragmas are writes.
+fn classify_pragma(name: &str, has_argument: bool, is_assignment: bool) -> (SqlStatementClass, &'static str) {
+    let base = name
+        .rsplit('.')
+        .next()
+        .unwrap_or(name)
+        .trim()
+        .trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']')
+        .to_ascii_lowercase();
+    let writes = is_assignment
+        || (has_argument && !READ_ONLY_PRAGMAS_WITH_ARGUMENT.contains(&base.as_str()))
+        || (!has_argument && SIDE_EFFECT_PRAGMAS.contains(&base.as_str()));
+    if writes {
+        (SqlStatementClass::PrivilegeOrAdmin, "PRAGMA_WRITE")
+    } else {
+        (SqlStatementClass::Read, "PRAGMA_READ")
+    }
+}
+
+/// Classify raw `PRAGMA ...` text that the AST parser rejected (e.g. `PRAGMA journal_mode = WAL`).
+fn classify_raw_pragma(normalized: &str) -> (SqlStatementClass, &'static str) {
+    let rest = normalized.trim_start().get(6..).unwrap_or("").trim_start();
+    let name_end = rest
+        .find(|c: char| c == '=' || c == '(' || c == ';' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    let after = rest[name_end..].trim_start();
+    let is_assignment = after.starts_with('=');
+    let has_argument = is_assignment || after.starts_with('(');
+    classify_pragma(&rest[..name_end], has_argument, is_assignment)
+}
 
 /// Returns true if a function name (qualified or unqualified) is a privileged or side-effecting function.
 pub fn is_privileged_function(raw_name: &str) -> bool {
@@ -125,6 +183,9 @@ pub struct StatementAnalysis {
     pub referenced_columns: Vec<ColumnReference>,
     pub predicates: Vec<PredicateColumn>,
     pub is_transactional_ddl_safe: bool,
+    /// How column values reach the statement's output (result-disclosure provenance).
+    #[serde(default)]
+    pub disclosure: DisclosureAnalysis,
 }
 
 /// Full analysis result for a SQL string (single or multi-statement).
@@ -148,6 +209,9 @@ pub struct SqlAnalysis {
     pub statements: Vec<StatementAnalysis>,
     #[serde(default)]
     pub parse_warnings: Vec<String>,
+    /// Result-disclosure provenance merged across all statements.
+    #[serde(default)]
+    pub disclosure: DisclosureAnalysis,
 }
 
 /// Deterministically normalize SQL by collapsing whitespace, stripping comments, and trimming trailing semicolons.
@@ -382,8 +446,10 @@ pub fn parse_and_analyze_sql(engine: DatabaseEngine, sql: &str) -> DbMcpResult<S
     let mut has_writes = false;
     let mut has_ddl = false;
     let mut has_cte_write = false;
+    let mut disclosure = DisclosureAnalysis::default();
 
     for st in &statement_analyses {
+        disclosure.merge(&st.disclosure);
         if st.statement_class == SqlStatementClass::Write {
             has_writes = true;
         }
@@ -435,6 +501,7 @@ pub fn parse_and_analyze_sql(engine: DatabaseEngine, sql: &str) -> DbMcpResult<S
         predicates: predicates.into_iter().collect(),
         statements: statement_analyses,
         parse_warnings,
+        disclosure,
     })
 }
 
@@ -882,7 +949,11 @@ fn classify_top_level_statement(stmt: &Statement) -> (SqlStatementClass, &'stati
         Statement::Explain { statement, analyze, .. } => {
             let (inner_class, _) = classify_top_level_statement(statement);
             if inner_class != SqlStatementClass::Read {
-                (inner_class, "EXPLAIN_MUTATING")
+                if *analyze {
+                    (inner_class, "EXPLAIN_ANALYZE_MUTATING")
+                } else {
+                    (inner_class, "EXPLAIN_MUTATING")
+                }
             } else if *analyze {
                 (SqlStatementClass::Read, "EXPLAIN_ANALYZE")
             } else {
@@ -932,12 +1003,8 @@ fn classify_top_level_statement(stmt: &Statement) -> (SqlStatementClass, &'stati
         Statement::Call(_) => (SqlStatementClass::Write, "CALL"),
         Statement::Execute { .. } => (SqlStatementClass::Write, "EXECUTE"),
         Statement::SetVariable { .. } => (SqlStatementClass::Transaction, "SET"),
-        Statement::Pragma { value, .. } => {
-            if value.is_some() {
-                (SqlStatementClass::PrivilegeOrAdmin, "PRAGMA_WRITE")
-            } else {
-                (SqlStatementClass::Read, "PRAGMA_READ")
-            }
+        Statement::Pragma { name, value, is_eq } => {
+            classify_pragma(&name.to_string(), value.is_some(), *is_eq)
         }
         _ => (SqlStatementClass::Unknown, "UNKNOWN"),
     }
@@ -981,6 +1048,12 @@ fn analyze_ast_statement(
         DatabaseEngine::MySql => final_class != SqlStatementClass::Ddl,
     };
 
+    let mut disclosure = analyze_statement_disclosure(engine, stmt);
+    if kind == "UNKNOWN" {
+        // Unclassified statements may embed queries the AST walk does not understand.
+        disclosure.opaque_sql.push(raw_sql.to_string());
+    }
+
     StatementAnalysis {
         index,
         raw_sql: raw_sql.to_string(),
@@ -994,6 +1067,7 @@ fn analyze_ast_statement(
         referenced_columns: inspector.referenced_columns.into_iter().collect(),
         predicates: inspector.predicates.into_iter().collect(),
         is_transactional_ddl_safe,
+        disclosure,
     }
 }
 
@@ -1055,12 +1129,20 @@ fn analyze_fallback_statement(
 ) -> StatementAnalysis {
     let (has_cte_write, priv_fns) = inspect_tokens_for_hazards(engine, raw_sql);
     let upper = raw_sql.trim_start().to_ascii_uppercase();
-    let first_word = upper.split_whitespace().next().unwrap_or("");
+    // Leading comments must not hide the statement keyword (`/**/PRAGMA journal_mode = WAL`).
+    let normalized = normalize_sql(raw_sql);
+    let normalized_upper = normalized.to_ascii_uppercase();
+    let first_word = normalized_upper
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ';')
+        .next()
+        .unwrap_or("");
 
     let (class, kind) = if !priv_fns.is_empty()
         || matches!(first_word, "ATTACH" | "DETACH" | "VACUUM" | "COPY" | "GRANT" | "REVOKE")
     {
         (SqlStatementClass::PrivilegeOrAdmin, first_word)
+    } else if engine == DatabaseEngine::Sqlite && first_word == "PRAGMA" {
+        classify_raw_pragma(&normalized)
     } else if has_cte_write {
         (SqlStatementClass::Write, "CTE_WRITE")
     } else {
@@ -1080,6 +1162,7 @@ fn analyze_fallback_statement(
         referenced_columns: Vec::new(),
         predicates: Vec::new(),
         is_transactional_ddl_safe: false,
+        disclosure: DisclosureAnalysis::opaque(raw_sql),
     }
 }
 
@@ -1153,6 +1236,19 @@ mod tests {
             SqlStatementClass::PrivilegeOrAdmin
         );
 
+        for (engine, sql, name) in [
+            (DatabaseEngine::Sqlite, "SELECT readfile('/etc/passwd')", "readfile"),
+            (DatabaseEngine::Sqlite, "SELECT writefile('/tmp/x', 'abc')", "writefile"),
+            (DatabaseEngine::Sqlite, "SELECT edit('x', 'vi')", "edit"),
+            (DatabaseEngine::Postgres, "SELECT set_config('search_path', 'evil', false)", "set_config"),
+            (DatabaseEngine::Postgres, "SELECT lo_import('/etc/passwd')", "lo_import"),
+            (DatabaseEngine::Postgres, "SELECT lo_export(1, '/tmp/x')", "lo_export"),
+        ] {
+            let analysis = parse_and_analyze_sql(engine, sql).unwrap();
+            assert!(analysis.privileged_functions.contains(&name.to_string()), "{sql}");
+            assert_eq!(analysis.overall_class, SqlStatementClass::PrivilegeOrAdmin, "{sql}");
+        }
+
         let mysql_sql = "SELECT LOAD_FILE('/var/lib/mysql-files/secret.txt')";
         let mysql_analysis = parse_and_analyze_sql(DatabaseEngine::MySql, mysql_sql).unwrap();
         assert!(mysql_analysis.has_privileged_functions);
@@ -1183,10 +1279,175 @@ mod tests {
     }
 
     #[test]
+    fn test_pragma_writes_are_privileged_and_reads_are_not() {
+        let class = |sql: &str| {
+            let a = parse_and_analyze_sql(DatabaseEngine::Sqlite, sql).unwrap();
+            (a.overall_class, a.statements[0].statement_kind.clone())
+        };
+        for sql in [
+            "PRAGMA journal_mode = WAL",
+            "pragma journal_mode=wal",
+            "/* c */ PRAGMA journal_mode = WAL",
+            "PRAGMA journal_mode(WAL)",
+            "PRAGMA main.journal_mode = 'delete'",
+            "PRAGMA foreign_keys = 0",
+            "PRAGMA writable_schema=1",
+            "PRAGMA wal_checkpoint",
+        ] {
+            assert_eq!(class(sql).0, SqlStatementClass::PrivilegeOrAdmin, "{sql}");
+        }
+        for sql in [
+            "PRAGMA table_info(users)",
+            "PRAGMA table_info('users')",
+            "PRAGMA main.index_list(users)",
+            "PRAGMA journal_mode",
+            "PRAGMA foreign_keys",
+        ] {
+            assert_eq!(class(sql).0, SqlStatementClass::Read, "{sql}");
+        }
+        // Not SQLite: PRAGMA stays unknown (fails closed in governed modes).
+        let pg = parse_and_analyze_sql(DatabaseEngine::Postgres, "PRAGMA journal_mode = WAL").unwrap();
+        assert_ne!(pg.overall_class, SqlStatementClass::Read);
+    }
+
+    #[test]
+    fn test_explain_analyze_kinds() {
+        let kind = |sql: &str| {
+            parse_and_analyze_sql(DatabaseEngine::Postgres, sql).unwrap().statements[0]
+                .statement_kind
+                .clone()
+        };
+        assert_eq!(kind("EXPLAIN ANALYZE SELECT 1"), "EXPLAIN_ANALYZE");
+        assert_eq!(kind("EXPLAIN ANALYZE DELETE FROM users"), "EXPLAIN_ANALYZE_MUTATING");
+        assert_eq!(kind("EXPLAIN DELETE FROM users"), "EXPLAIN_MUTATING");
+        assert_eq!(kind("EXPLAIN SELECT 1"), "EXPLAIN");
+    }
+
+    #[test]
     fn test_normalize_and_hash_sql() {
         let s1 = "SELECT   id,  email \n FROM users -- inline comment\n WHERE id = 1 ; ";
         let s2 = "SELECT id, email FROM users WHERE id = 1";
         assert_eq!(normalize_sql(s1), normalize_sql(s2));
         assert_eq!(hash_sql(s1), hash_sql(s2));
+    }
+
+    fn exposed(engine: DatabaseEngine, sql: &str) -> Vec<(String, Option<String>)> {
+        parse_and_analyze_sql(engine, sql)
+            .unwrap()
+            .disclosure
+            .exposures
+            .into_iter()
+            .map(|e| (e.column, e.output_name))
+            .collect()
+    }
+
+    fn untracked(engine: DatabaseEngine, sql: &str) -> Vec<String> {
+        parse_and_analyze_sql(engine, sql)
+            .unwrap()
+            .disclosure
+            .untracked_provenance
+    }
+
+    #[test]
+    fn test_disclosure_bare_projection_and_predicates_are_not_exposures() {
+        for engine in [DatabaseEngine::Sqlite, DatabaseEngine::Postgres, DatabaseEngine::MySql] {
+            for sql in [
+                "SELECT password_hash FROM users",
+                "SELECT users.password_hash FROM users",
+                "SELECT u.password_hash, o.id FROM users u JOIN orders o ON o.user_id = u.id",
+                "SELECT * FROM users ORDER BY id",
+                "WITH c AS (SELECT password_hash FROM users) SELECT * FROM c",
+                "SELECT id FROM users WHERE password_hash = 'x' ORDER BY password_hash",
+                "SELECT id FROM users WHERE id IN (SELECT id FROM users WHERE password_hash IS NULL)",
+                "SELECT id FROM users UNION ALL SELECT id FROM orders",
+                "INSERT INTO users (id, password_hash) VALUES (1, 'h')",
+                "UPDATE users SET password_hash = 'x' WHERE password_hash = 'y'",
+            ] {
+                let analysis = parse_and_analyze_sql(engine, sql).unwrap();
+                let sensitive: Vec<_> = analysis
+                    .disclosure
+                    .exposures
+                    .iter()
+                    .filter(|e| {
+                        e.column == "password_hash"
+                            && e.output_name.as_deref() != Some("password_hash")
+                    })
+                    .collect();
+                assert!(sensitive.is_empty(), "{engine} {sql}: {sensitive:?}");
+                assert!(analysis.disclosure.untracked_provenance.is_empty(), "{engine} {sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_disclosure_renamed_and_derived_projections_are_exposures() {
+        let ph = |out: Option<&str>| ("password_hash".to_string(), out.map(str::to_string));
+        for engine in [DatabaseEngine::Sqlite, DatabaseEngine::Postgres, DatabaseEngine::MySql] {
+            let cases: [(&str, Option<&str>); 11] = [
+                ("SELECT password_hash AS ph FROM users", Some("ph")),
+                ("SELECT upper(password_hash) FROM users", None),
+                ("SELECT email || ':' || password_hash AS creds FROM users", Some("creds")),
+                ("SELECT ph FROM (SELECT password_hash AS ph FROM users) t", Some("ph")),
+                ("SELECT 1 UNION SELECT password_hash FROM users", None),
+                ("SELECT (SELECT password_hash FROM users LIMIT 1) AS v", Some("v")),
+                ("WITH c(x) AS (SELECT password_hash FROM users) SELECT x FROM c", Some("x")),
+                ("INSERT INTO notes SELECT password_hash FROM users", None),
+                ("INSERT INTO notes (body) SELECT password_hash FROM users", Some("body")),
+                ("UPDATE users SET email = password_hash", Some("email")),
+                ("CREATE VIEW v AS SELECT password_hash AS x FROM users", Some("x")),
+            ];
+            for (sql, out) in cases {
+                assert!(exposed(engine, sql).contains(&ph(out)), "{engine} {sql}: {:?}", exposed(engine, sql));
+            }
+            // The leftmost branch names the column: a sensitive name stays masked.
+            assert!(exposed(engine, "SELECT password_hash FROM users UNION SELECT password_hash FROM users")
+                .iter()
+                .all(|(_, out)| out.as_deref() == Some("password_hash")));
+        }
+        assert!(exposed(DatabaseEngine::Sqlite, "ALTER TABLE users RENAME COLUMN password_hash TO ph")
+            .contains(&ph(Some("ph"))));
+    }
+
+    #[test]
+    fn test_disclosure_untracked_provenance() {
+        for engine in [DatabaseEngine::Sqlite, DatabaseEngine::Postgres, DatabaseEngine::MySql] {
+            for sql in [
+                "SELECT id, email, role, created_at, 1 FROM orders UNION SELECT * FROM users",
+                "INSERT INTO copy SELECT * FROM users",
+                "SELECT x FROM (SELECT * FROM users) AS t(a, b, x)",
+            ] {
+                assert!(!untracked(engine, sql).is_empty(), "{engine} {sql}");
+            }
+            assert!(untracked(engine, "SELECT * FROM users").is_empty());
+            assert!(untracked(engine, "SELECT * INTO new_table FROM users").is_empty(), "{engine}");
+            assert!(untracked(engine, "SELECT count(*) FROM users").is_empty());
+        }
+        let pg = DatabaseEngine::Postgres;
+        for sql in [
+            "SELECT u FROM users u",
+            "SELECT row_to_json(u) AS j FROM users u",
+            "SELECT row_to_json(u.*) AS j FROM users u",
+            "SELECT x FROM users AS u(a, x)",
+        ] {
+            assert!(!untracked(pg, sql).is_empty(), "{sql}");
+        }
+        assert!(untracked(pg, "SELECT n FROM generate_series(1, 3) AS g(n)").is_empty());
+    }
+
+    #[test]
+    fn test_disclosure_opaque_sql_is_reported() {
+        let analysis = parse_and_analyze_sql(
+            DatabaseEngine::Postgres,
+            "CREATE FUNCTION leak() RETURNS text AS $$ SELECT password_hash FROM users LIMIT 1 $$ LANGUAGE sql",
+        )
+        .unwrap();
+        assert!(analysis
+            .disclosure
+            .opaque_sql
+            .iter()
+            .any(|t| t.contains("password_hash")));
+        let unparsed =
+            parse_and_analyze_sql(DatabaseEngine::Sqlite, "FOOBAR_VENDOR password_hash WITH MAGIC").unwrap();
+        assert_eq!(unparsed.disclosure.opaque_sql.len(), 1);
     }
 }

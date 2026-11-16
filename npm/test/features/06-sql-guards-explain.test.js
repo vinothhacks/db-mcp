@@ -255,10 +255,11 @@ const MATRIX = [
   { id: "priv_in_from", sql: "SELECT * FROM pg_ls_dir('/')", mysql: P, pg: P, sqlite: P },
   { id: "priv_in_where", sql: "SELECT 1 FROM users WHERE pg_sleep(1) IS NULL", mysql: P, pg: P, sqlite: P },
   { id: "priv_in_order_by", sql: "SELECT id FROM users ORDER BY pg_sleep(1)", mysql: P, pg: P, sqlite: P },
-  // SQLite fileio extension + Postgres set_config are not on PRIVILEGED_FUNCTIONS (crates/db-mcp-sql/src/lib.rs:30-63)
-  { id: "sqlite_readfile", sql: "SELECT readfile('/etc/passwd')", mysql: P, pg: SKIP, sqlite: P, bug: "F06-B7" }, // KNOWN-BUG: F06-B7
-  { id: "sqlite_writefile", sql: "SELECT writefile('/tmp/x', 'abc')", mysql: P, pg: SKIP, sqlite: P, bug: "F06-B7" }, // KNOWN-BUG: F06-B7
-  { id: "pg_set_config", sql: "SELECT set_config('search_path', 'evil', false)", mysql: SKIP, pg: P, sqlite: SKIP, bug: "F06-B7" }, // KNOWN-BUG: F06-B7
+  // SQLite fileio extension + Postgres set_config are on PRIVILEGED_FUNCTIONS (F06-B7 fixed)
+  { id: "sqlite_readfile", sql: "SELECT readfile('/etc/passwd')", mysql: P, pg: SKIP, sqlite: P },
+  { id: "sqlite_writefile", sql: "SELECT writefile('/tmp/x', 'abc')", mysql: P, pg: SKIP, sqlite: P },
+  { id: "sqlite_edit", sql: "SELECT edit('x', 'vi')", mysql: P, pg: SKIP, sqlite: P },
+  { id: "pg_set_config", sql: "SELECT set_config('search_path', 'evil', false)", mysql: SKIP, pg: P, sqlite: SKIP },
 
   // --- parser bypass attempts / dialect edge cases ---
   { id: "bypass_comment_no_space", sql: "SELECT/**/1", mysql: OK, pg: OK, sqlite: OK },
@@ -271,9 +272,8 @@ const MATRIX = [
   { id: "dialect_backticks_on_pg", sql: "SELECT `id` FROM `users`", mysql: OK, pg: CLOSED_GOV, sqlite: OK },
   { id: "dialect_explain_select_via_execute", sql: "EXPLAIN SELECT 1", mysql: OK, pg: OK, sqlite: OK },
   { id: "dialect_pragma_read", sql: "PRAGMA table_info(users)", mysql: CLOSED_RO, pg: CLOSED_GOV, sqlite: OK },
-  // allow_explain_analyze=false must also govern execute_query("EXPLAIN ANALYZE ...") - policy currently lets it
-  // through to the adapter (crates/db-mcp-policy/src/lib.rs:523-705 never checks statement_kind EXPLAIN_ANALYZE).
-  { id: "explain_analyze_select_via_execute", sql: "EXPLAIN ANALYZE SELECT id FROM users", mysql: X, pg: X, sqlite: SKIP, bug: "F06-B1" }, // KNOWN-BUG: F06-B1
+  // allow_explain_analyze=false also governs execute_query("EXPLAIN ANALYZE ...") (F06-B1 fixed).
+  { id: "explain_analyze_select_via_execute", sql: "EXPLAIN ANALYZE SELECT id FROM users", mysql: X, pg: X, sqlite: SKIP },
 ];
 
 // ---------------------------------------------------------------------------
@@ -326,17 +326,25 @@ async function runSensitiveProjectionBypass(s) {
     expectOutcome("baseline", res, OK);
     assert.equal(leaks(res), false, "password_hash values leaked without alias");
   });
-  // Redaction keys on result column *names* only (crates/db-mcp-policy/src/lib.rs:800-836); aliasing or UNION hides the name.
-  await check(`${MYSQL} alias bypass: SELECT password_hash AS x must still be redacted`, async () => { // KNOWN-BUG: F06-B3
+  // Redaction keys on result column *names*; aliasing or UNION would hide the name, so policy denies
+  // a sensitive column that is renamed before it can reach the result (fail closed).
+  await check(`${MYSQL} alias bypass: SELECT password_hash AS x is denied, never returned raw`, async () => {
     const res = await s.call("execute_query", { connection: MYSQL, sql: "SELECT password_hash AS x FROM users" });
-    expectOutcome("alias", res, OK);
     assert.equal(leaks(res), false, `raw hashes returned: ${JSON.stringify(res.rows)}`);
-  }, "F06-B3");
-  await check(`${MYSQL} UNION bypass: SELECT 1 UNION SELECT password_hash must still be redacted`, async () => { // KNOWN-BUG: F06-B3
+    expectOutcome("alias", res, "SENSITIVE_COLUMN_FORBIDDEN");
+  });
+  await check(`${MYSQL} UNION bypass: SELECT 1 UNION SELECT password_hash is denied, never returned raw`, async () => {
     const res = await s.call("execute_query", { connection: MYSQL, sql: "SELECT 1 UNION SELECT password_hash FROM users" });
-    expectOutcome("union", res, OK);
     assert.equal(leaks(res), false, `raw hashes returned: ${JSON.stringify(res.rows)}`);
-  }, "F06-B3");
+    expectOutcome("union", res, "SENSITIVE_COLUMN_FORBIDDEN");
+  });
+  await check(`${PG} alias / expression bypass on the pg simulation is denied`, async () => {
+    for (const sql of ["SELECT password_hash AS x FROM users", "SELECT upper(password_hash) AS u FROM users"]) {
+      const res = await s.call("execute_query", { connection: PG, sql });
+      assert.equal(leaks(res), false, `raw hashes returned: ${JSON.stringify(res.rows)}`);
+      expectOutcome(sql, res, "SENSITIVE_COLUMN_FORBIDDEN");
+    }
+  });
 }
 
 async function runExplain(sessions) {
@@ -500,17 +508,16 @@ async function runMultiStatementAllowed() {
       const res = await s[MYSQL].call("explain_query", { connection: MYSQL, sql: "SELECT 1; SELECT 2", format: "text" });
       expectOutcome("explain-multi-allowed", res, [INV, M]);
     });
-    // Adapters prepare only the first statement (e.g. crates/db-mcp-sqlite/src/lib.rs:1364 conn.prepare) and
-    // silently discard the tail: no warning, no error, no second result set.
-    await check(`${SQLITE} multi allowed: trailing statements are executed or explicitly reported`, async () => { // KNOWN-BUG: F06-B2
+    // F06-B2 fixed: the SQLite adapter executes every statement of an allowed batch and reports it.
+    await check(`${SQLITE} multi allowed: trailing statements are executed or explicitly reported`, async () => {
       const res = await s[SQLITE].call("execute_query", { connection: SQLITE, sql: "SELECT 1 AS a; SELECT 2 AS b" });
       expectOutcome("tail", res, OK);
       const names = (res.columns || []).map((c) => c.name);
       const secondExecuted = names.includes("b");
       const reported = (res.warnings || []).some((w) => /statement/i.test(w));
       assert.ok(secondExecuted || reported, `second statement silently dropped: columns=${names} warnings=${JSON.stringify(res.warnings)}`);
-    }, "F06-B2");
-    await check(`${SQLITE} multi allowed: DML in the middle of a batch is applied or explicitly reported`, async () => { // KNOWN-BUG: F06-B2
+    });
+    await check(`${SQLITE} multi allowed: DML in the middle of a batch is applied or explicitly reported`, async () => {
       const n = async () => (await s[SQLITE].call("execute_query", { connection: SQLITE, sql: "SELECT COUNT(*) FROM orders" })).rows[0][0];
       const before = await n();
       const res = await s[SQLITE].call("execute_query", { connection: SQLITE, sql: `SELECT 1; INSERT INTO orders (id, user_id, status, total_cents, created_at) VALUES (${900 + before}, 1, 'f06', 1, 'now'); SELECT 2` });
@@ -518,7 +525,7 @@ async function runMultiStatementAllowed() {
       const after = await n();
       const reported = (res.warnings || []).some((w) => /statement/i.test(w));
       assert.ok(after === before + 1 || reported, `INSERT silently dropped (before=${before} after=${after}) warnings=${JSON.stringify(res.warnings)}`);
-    }, "F06-B2");
+    });
   } finally {
     for (const c of CONNS) await s[c].close();
   }
@@ -613,12 +620,12 @@ async function runAudit() {
     assert.ok(e, "no audit entry");
     assert.equal(e.decision, "denied", `decision=${e.decision}`);
   }, "F06-B5");
-  await check(`${MYSQL} execute_query EXPLAIN ANALYZE is audited as a policy denial (not an adapter failure)`, async () => { // KNOWN-BUG: F06-B1
+  await check(`${MYSQL} execute_query EXPLAIN ANALYZE is audited as a policy denial (not an adapter failure)`, async () => {
     const e = lines.find((l) => l.connection === MYSQL && l.tool_name === "execute_query" && /^EXPLAIN ANALYZE SELECT/i.test(l.normalized_sql || ""));
     assert.ok(e, "no audit entry for EXPLAIN ANALYZE");
     assert.equal(e.decision, "denied", `decision=${e.decision} denial_code=${e.denial_code}`);
     assert.equal(e.denial_code, X);
-  }, "F06-B1");
+  });
 }
 
 // ---------------------------------------------------------------------------

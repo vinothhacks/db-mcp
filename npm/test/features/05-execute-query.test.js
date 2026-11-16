@@ -373,13 +373,11 @@ async function sectionLimits(c) {
     assert.equal(p.returned_rows, 500);
     assert.equal(p.truncated, true);
   });
-  // KNOWN-BUG: F05-B4 - max_rows=0 is clamped to 0 which the adapter/executor treat as "unlimited".
+  // F05-B4 fixed: a zero budget override is rejected instead of disabling the cap.
   await check("3.05 request max_rows=0 cannot exceed the connection cap", async () => {
     const { payload: p } = await eq(c, { connection: L, sql: "SELECT id FROM big ORDER BY id", max_rows: 0 });
-    if (p.status === "denied") { denied(p, "INVALID_ARGUMENT"); return; }
-    okEnvelope(p);
-    assert.ok(p.returned_rows <= 500, `max_rows=0 returned ${p.returned_rows} rows (cap is 500)`);
-  }, "F05-B4");
+    denied(p, "INVALID_ARGUMENT");
+  });
   await check("3.06 negative / string / huge max_rows never exceed the cap", async () => {
     for (const v of [-1, "5", 1e18]) {
       const { payload: p } = await eq(c, { connection: L, sql: "SELECT id FROM big ORDER BY id", max_rows: v });
@@ -408,13 +406,10 @@ async function sectionLimits(c) {
     assert.equal(p.truncated, true);
     assert.ok(p.returned_rows < 50, `returned ${p.returned_rows}`);
   });
-  // KNOWN-BUG: F05-B4 - max_bytes=0 disables the byte budget entirely.
   await check("3.10 request max_bytes=0 cannot exceed the connection byte budget", async () => {
     const { payload: p } = await eq(c, { connection: "slow-sqlite", sql: "SELECT id, payload FROM big ORDER BY id", max_bytes: 0 });
-    if (p.status === "denied") { denied(p, "INVALID_ARGUMENT"); return; }
-    okEnvelope(p);
-    assert.ok(p.returned_rows < 50, `max_bytes=0 returned all ${p.returned_rows} rows past the 300-byte budget`);
-  }, "F05-B4");
+    denied(p, "INVALID_ARGUMENT");
+  });
   await check("3.11 timeout_ms=1 against a slow recursive CTE -> EXECUTION_TIMEOUT (retryable)", async () => {
     const t0 = Date.now();
     const { payload: p, raw } = await eq(c, { connection: L, sql: SLOW_1S, timeout_ms: 1 });
@@ -443,14 +438,12 @@ async function sectionLimits(c) {
     denied(p, "EXECUTION_TIMEOUT");
     assert.ok(Date.now() - t0 < 2500);
   });
-  // KNOWN-BUG: F05-B4 - timeout_ms=0 is clamped to 0, which execute_bounded replaces with a 10 s default.
   await check("3.15 request timeout_ms=0 cannot exceed the connection timeout", async () => {
     const t0 = Date.now();
     const { payload: p } = await eq(c, { connection: "slow-sqlite", sql: SLOW_3S, timeout_ms: 0 });
-    if (p.status === "denied" && p.code === "INVALID_ARGUMENT") return;
-    denied(p, "EXECUTION_TIMEOUT", `(took ${Date.now() - t0}ms)`);
+    denied(p, "INVALID_ARGUMENT", `(took ${Date.now() - t0}ms)`);
     assert.ok(Date.now() - t0 < 2500, `ran ${Date.now() - t0}ms past the 1000ms connection cap`);
-  }, "F05-B4");
+  });
   await check("3.16 negative timeout_ms is ignored or rejected, never a hang", async () => {
     const { payload: p } = await eq(c, { connection: L, sql: "SELECT 1 AS ok", timeout_ms: -5 });
     if (p.status === "denied") { denied(p, "INVALID_ARGUMENT"); return; }
@@ -522,18 +515,20 @@ async function sectionRedaction(c) {
       redactedOk(p, 0);
     }
   });
-  // KNOWN-BUG: F05-B2 - disclosure control matches only the OUTPUT column name.
+  // Redaction masks by output column name, so a sensitive column that is renamed (alias, expression,
+  // subquery re-alias, set-operation position) is denied before execution (fail closed).
   const leak = async (label, sql) => check(label, async () => {
     const { payload: p } = await eq(c, { connection: L, sql });
-    if (p.status === "denied") { denied(p, ["SENSITIVE_COLUMN_FORBIDDEN", "UNPROVENANCED_SENSITIVE_QUERY"]); return; }
-    okEnvelope(p);
-    const text = JSON.stringify(p.rows).toLowerCase();
+    const text = JSON.stringify(p.rows || []).toLowerCase();
     assert.ok(!text.includes("hash_alice_secret") && !text.includes("hash_bob_secret"), `sensitive value leaked: ${JSON.stringify(p.rows)}`);
-  }, "F05-B2");
+    denied(p, "SENSITIVE_COLUMN_FORBIDDEN", sql);
+    assert.equal(p.next_action, "select_sensitive_column_directly");
+  });
   await leak("5.04 aliased sensitive column (password_hash AS ph) does not leak", "SELECT password_hash AS ph FROM users");
   await leak("5.05 expression over sensitive column (upper(password_hash)) does not leak", "SELECT upper(password_hash) FROM users");
   await leak("5.06 concatenation with sensitive column does not leak", "SELECT email || ':' || password_hash AS creds FROM users");
   await leak("5.07 sensitive column re-aliased through a subquery does not leak", "SELECT ph FROM (SELECT password_hash AS ph FROM users)");
+  await leak("5.07b sensitive column in a later UNION branch does not leak", "SELECT 'x' AS k UNION SELECT password_hash FROM users");
   await check("5.08 output column named like a sensitive column is redacted even for literals", async () => {
     const { payload: p } = await eq(c, { connection: L, sql: "SELECT 'k' AS api_key" });
     redactedOk(p);
@@ -652,11 +647,12 @@ async function sectionModes(c) {
       denied((await eq(c, { connection: L, sql })).payload, "PRIVILEGED_FUNCTION_FORBIDDEN", sql);
     }
   });
-  // KNOWN-BUG: F05-B8 - `PRAGMA x = BAREWORD` fails to parse, falls back to Unknown, and Development allows Unknown.
   await check("6.08 Development: bareword PRAGMA write (journal_mode = WAL) is denied for a non-admin", async () => {
-    const { payload: p } = await eq(c, { connection: L, sql: "PRAGMA journal_mode = WAL" });
-    denied(p, ["PRIVILEGED_FUNCTION_FORBIDDEN", "UNKNOWN_SQL_IN_GOVERNED_MODE"]);
-  }, "F05-B8");
+    for (const sql of ["PRAGMA journal_mode = WAL", "/* c */ PRAGMA journal_mode = WAL", "PRAGMA journal_mode(WAL)"]) {
+      const { payload: p } = await eq(c, { connection: L, sql });
+      denied(p, ["PRIVILEGED_FUNCTION_FORBIDDEN", "UNKNOWN_SQL_IN_GOVERNED_MODE"], sql);
+    }
+  });
   await check("6.09 Development: read-only PRAGMA is allowed", async () => {
     const { payload: p } = await eq(c, { connection: L, sql: "PRAGMA table_info(users)" });
     okEnvelope(p);
@@ -751,10 +747,11 @@ async function sectionRoles(config, c) {
     denied((await eq(c, { connection: "principal-sqlite", sql: "SELECT 1" })).payload, ["UNAUTHORIZED_ROLE", "UNAUTHORIZED_CONNECTION", "UNAUTHORIZED"]);
     okEnvelope((await eq(intern, { connection: "principal-sqlite", sql: "SELECT 1 AS ok" })).payload);
   });
-  await check("7.04 allowed_roles=[dba]: agent denied, dba and admin allowed", async () => {
+  // allowed_roles is authoritative (F13-B11): a self-asserted admin role is not implicitly allowed.
+  await check("7.04 allowed_roles=[dba]: agent and unlisted admin denied, dba allowed", async () => {
     denied((await eq(c, { connection: "role-sqlite", sql: "SELECT 1" })).payload, "UNAUTHORIZED_ROLE");
     okEnvelope((await eq(dba, { connection: "role-sqlite", sql: "SELECT 1 AS ok" })).payload);
-    okEnvelope((await eq(admin, { connection: "role-sqlite", sql: "SELECT 1 AS ok" })).payload);
+    denied((await eq(admin, { connection: "role-sqlite", sql: "SELECT 1" })).payload, "UNAUTHORIZED_ROLE");
   });
   await check("7.05 admin may run literal PRAGMA writes in Development, non-admin may not", async () => {
     okEnvelope((await eq(admin, { connection: L, sql: "PRAGMA journal_mode = 'delete'" })).payload);
