@@ -278,6 +278,12 @@ pub struct ChangeStoreConfig {
     pub policy_revision: String,
     #[serde(default = "default_ttl_seconds")]
     pub default_ttl_seconds: i64,
+    /// Secret reference (`env:VAR`, `file:/path`, `secret:NAME` or literal) for the HMAC key that
+    /// signs approval records. When unset, env `DB_MCP_APPROVAL_KEY` is used if present. Without
+    /// a key, approvals in a persistent store are unkeyed (warning) and GovernedProduction
+    /// connections refuse `apply_change`. A set but unresolvable reference is a startup error.
+    #[serde(default)]
+    pub approval_key: Option<String>,
 }
 
 impl Default for ChangeStoreConfig {
@@ -286,6 +292,7 @@ impl Default for ChangeStoreConfig {
             storage_path: None,
             policy_revision: default_policy_revision(),
             default_ttl_seconds: default_ttl_seconds(),
+            approval_key: None,
         }
     }
 }

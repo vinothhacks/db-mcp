@@ -125,6 +125,7 @@ sqlite_path = "research/traces/audit.db"
 storage_path = "research/traces/changes.db"
 policy_revision = "policy_v1"
 default_ttl_seconds = 3600
+approval_key = "env:DB_MCP_APPROVAL_KEY"   # HMAC key signing approvals (required for GovernedProduction apply)
 
 [[connections]]
 id = "prod-postgres"
@@ -168,6 +169,12 @@ agent: propose_change  ->  chg_123 (PENDING, approval_hash)
 admin: db-mcp approve --change-id chg_123 --approver release-admin      # CLI, or POST /admin/approve
 agent: apply_change    ->  executes once, re-verifies hash + schema fingerprint, audited
 ```
+
+`propose_change` applies the same connection policy as `execute_query` (restricted tables, multi-statement,
+ReadOnly connections, privileged and administrative statements) and refuses plain reads (`NOT_A_CHANGE`);
+`apply_change` checks the policy again. Only a pending proposal can be approved, once (`CHANGE_NOT_PENDING`).
+Approvals are signed with an HMAC key (`changes.approval_key` or `DB_MCP_APPROVAL_KEY`, same key for the server
+and `db-mcp approve`); without a key, GovernedProduction connections refuse `apply_change` (`APPROVAL_KEY_REQUIRED`).
 
 ---
 

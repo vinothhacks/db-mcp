@@ -354,7 +354,8 @@ async function stdioSuite() {
 
 async function httpSuite() {
   const port = await getFreePort();
-  const env = { DB_MCP_AUTH_TOKEN: "smoke-agent-token", DB_MCP_ADMIN_TOKEN: "smoke-admin-token" };
+  // GovernedProduction apply_change requires keyed approvals (changes.approval_key / DB_MCP_APPROVAL_KEY).
+  const env = { DB_MCP_AUTH_TOKEN: "smoke-agent-token", DB_MCP_ADMIN_TOKEN: "smoke-admin-token", DB_MCP_APPROVAL_KEY: process.env.DB_MCP_APPROVAL_KEY || "smoke-approval-key-0123456789abcdef" };
   const child = spawnDbMcpServer(["serve", "--transport", "http", "--bind", `127.0.0.1:${port}`, "--config", CONFIG], { cwd: REPO_ROOT, env, stdio: ["ignore", "pipe", "pipe"] });
   const base = `http://127.0.0.1:${port}`;
   const errs = []; child.stderr.on("data", (d) => errs.push(String(d)));

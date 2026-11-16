@@ -510,26 +510,8 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// HMAC-SHA256 (RFC 2104) without an extra crate dependency.
-pub fn hmac_sha256_hex(key: &[u8], message: &[u8]) -> String {
-    const BLOCK: usize = 64;
-    let mut k = if key.len() > BLOCK {
-        Sha256::digest(key).to_vec()
-    } else {
-        key.to_vec()
-    };
-    k.resize(BLOCK, 0);
-    let ipad: Vec<u8> = k.iter().map(|b| b ^ 0x36).collect();
-    let opad: Vec<u8> = k.iter().map(|b| b ^ 0x5c).collect();
-    let mut inner = Sha256::new();
-    inner.update(&ipad);
-    inner.update(message);
-    let inner = inner.finalize();
-    let mut outer = Sha256::new();
-    outer.update(&opad);
-    outer.update(inner);
-    hex::encode(outer.finalize())
-}
+/// HMAC-SHA256 (RFC 2104) without an extra crate dependency (shared with the change store).
+pub use db_mcp_core::hmac_sha256_hex;
 
 /// Lowercase, schema-free table name used for matching (`main.Orders` -> `orders`).
 pub fn base_table_name(table: &str) -> String {

@@ -68,6 +68,11 @@ function getFreePort() {
   });
 }
 
+// Keyed approvals (F10-03): every server and `db-mcp approve` spawned below inherits this key.
+// GovernedProduction connections refuse apply_change without one.
+const APPROVAL_KEY = process.env.DB_MCP_APPROVAL_KEY || `f10-approval-key-${crypto.randomBytes(12).toString("hex")}`;
+process.env.DB_MCP_APPROVAL_KEY = APPROVAL_KEY;
+
 // Private temp dir (NOT a shared scratchpad) so parallel test runs never share a change store.
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "db-mcp-f10-"));
 const { configPath: CFG, dir: ISO } = makeIsolatedConfig({ dir: TMP });
@@ -214,10 +219,9 @@ async function sectionLifecycleProd(agent) {
     assertDenied(await callTool(agent, "apply_change", { change_id: id }), "APPROVAL_REQUIRED", "apply");
   });
   await check("apply-before-approval next_action explains out-of-band approval (not 'propose_change')", async () => {
-    // KNOWN-BUG: F10-09 next_action is "propose_change" although the change is already proposed.
     const r = await callTool(agent, "apply_change", { change_id: id });
     assert.match(String(r.next_action), /approve/i, `next_action=${r.next_action}`);
-  }, { known: "F10-09" });
+  });
   await check("CLI self-approval by proposer -> non-zero exit, SELF_APPROVAL_FORBIDDEN on stderr", () => {
     const r = cliApprove(id, "agent-alice", "admin");
     assert.notEqual(r.status, 0);
@@ -255,10 +259,9 @@ async function sectionLifecycleProd(agent) {
     assert.equal(j.approval.approval_hash, d.approval_hash);
   });
   await check("CLI approve a second time (another admin) is rejected", () => {
-    // KNOWN-BUG: F10-02 a second approval silently overwrites the first ApprovalRecord.
     const r = cliApprove(id, "dba-carol", "admin");
     assert.notEqual(r.status, 0, `second approval succeeded: ${r.stdout}`);
-  }, { known: "F10-02" });
+  });
   await check("get_change after approval shows state=approved + approval record", async () => {
     const g = await callTool(agent, "get_change", { change_id: id });
     assert.equal(g.data.state, "approved");
@@ -266,11 +269,10 @@ async function sectionLifecycleProd(agent) {
     assert.equal(g.data.approval.approval_hash, d.approval_hash);
   });
   await check("first approver is preserved (not overwritten by a later approve)", async () => {
-    // KNOWN-BUG: F10-02
     const g = await callTool(agent, "get_change", { change_id: id });
     assert.equal(g.data.approval.approved_by, "dba-bob");
     assert.equal(g.data.approval.comment, "LGTM");
-  }, { known: "F10-02" });
+  });
 
   // Replay: two apply calls fired without awaiting (stdio serialises them, HTTP section covers true parallelism)
   const [a1, a2] = await Promise.all([callTool(agent, "apply_change", { change_id: id }), callTool(agent, "apply_change", { change_id: id })]);
@@ -282,10 +284,9 @@ async function sectionLifecycleProd(agent) {
     assert.equal(a1.rows[0][1], "applied");
   });
   await check("apply_change response carries the execution result (rows_affected)", () => {
-    // KNOWN-BUG: F10-07 ApplyChangeOutcome.query_result is dropped; only the proposal is returned.
     const ra = a1.data.rows_affected ?? a1.rows_affected ?? a1.data.execution?.rows_affected ?? a1.data.query_result?.rows_affected;
     assert.equal(ra, 1, `no rows_affected in apply response; keys=${Object.keys(a1.data).join(",")}`);
-  }, { known: "F10-07" });
+  });
   await check("second concurrent apply -> APPROVAL_ALREADY_CONSUMED (exactly one applied)", () => {
     assertDenied(a2, "APPROVAL_ALREADY_CONSUMED", "apply#2");
   });
@@ -303,10 +304,9 @@ async function sectionLifecycleProd(agent) {
     assert.ok(g.data.approval);
   });
   await check("get_change after apply records who applied (applied_by)", async () => {
-    // KNOWN-BUG: F10-07 ChangeProposal has no applied_by; only the audit log knows the applier.
     const g = await callTool(agent, "get_change", { change_id: id });
     assert.equal(g.data.applied_by, "agent-alice");
-  }, { known: "F10-07" });
+  });
   await check("CLI approve of an applied change -> rejected (already consumed)", () => {
     const r = cliApprove(id, "dba-dan", "admin");
     assert.notEqual(r.status, 0);
@@ -387,30 +387,36 @@ async function sectionGovernanceRules(agent) {
     }
   });
   await check("SELECT cannot be proposed (nothing to govern)", async () => {
-    // KNOWN-BUG: F10-04a read statements are accepted, approved and executed through apply_change.
     const r = await callTool(agent, "propose_change", { connection: "prod-postgres", sql: "SELECT id, password_hash FROM users" });
     assert.equal(r.status, "denied", `SELECT accepted as ${r.data && r.data.change_id}`);
-  }, { known: "F10-04a" });
+  });
   await check("multi-statement batch rejected when allow_multi_statement=false", async () => {
-    // KNOWN-BUG: F10-04b accepted; SQLite executes only the first statement and reports 'applied'.
     const r = await callTool(agent, "propose_change", { connection: "local-sqlite", sql: "UPDATE orders SET status='x' WHERE id=101; UPDATE orders SET status='y' WHERE id=102" });
     assert.equal(r.status, "denied", `multi-statement accepted as ${r.data && r.data.change_id}`);
-  }, { known: "F10-04b" });
+  });
   await check("mutation on ReadOnly connection (analytics-mysql) rejected at propose time", async () => {
-    // KNOWN-BUG: F10-04c accepted at propose/approve; only fails at apply with READONLY_VIOLATION (proposal -> failed).
     const r = await callTool(agent, "propose_change", { connection: "analytics-mysql", sql: "DELETE FROM orders WHERE id = 101" });
     assert.equal(r.status, "denied", `read-only mutation accepted as ${r.data && r.data.change_id}`);
-  }, { known: "F10-04c" });
+  });
   await check("restricted table (internal_secrets) cannot be targeted by a proposal", async () => {
-    // KNOWN-BUG: F10-04d restricted_tables policy is not applied; DELETE FROM internal_secrets gets applied.
     const r = await callTool(agent, "propose_change", { connection: "local-sqlite", sql: "DELETE FROM internal_secrets" });
     assert.equal(r.status, "denied", `restricted-table mutation accepted as ${r.data && r.data.change_id}`);
-  }, { known: "F10-04d" });
+  });
   await check("admin/privilege statement (VACUUM) cannot be proposed", async () => {
-    // KNOWN-BUG: F10-04e privilege_or_admin class accepted (policy forbids it for execute_query).
     const r = await callTool(agent, "propose_change", { connection: "local-sqlite", sql: "VACUUM" });
     assert.equal(r.status, "denied");
-  }, { known: "F10-04e" });
+  });
+  await check("propose_change denials carry the same policy codes as execute_query", async () => {
+    const cases = [
+      ["prod-postgres", "SELECT id FROM users", "NOT_A_CHANGE"],
+      ["local-sqlite", "UPDATE orders SET status='x' WHERE id=101; UPDATE orders SET status='y' WHERE id=102", "MULTI_STATEMENT_FORBIDDEN"],
+      ["analytics-mysql", "DELETE FROM orders WHERE id = 101", "MUTATION_NOT_ALLOWED_IN_READ_ONLY"],
+      ["local-sqlite", "DELETE FROM internal_secrets", "RESTRICTED_TABLE_FORBIDDEN"],
+    ];
+    for (const [connection, sql, code] of cases) {
+      assertDenied(await callTool(agent, "propose_change", { connection, sql }), code, sql);
+    }
+  });
 
   // execute_query + change_id path
   await check("execute_query with a bogus change_id on GovernedProduction is denied", async () => {
@@ -481,13 +487,11 @@ async function sectionTamperDrift(agent) {
     assert.match(r.stderr, /hash mismatch|integrity/i);
   });
   await check("forged approval written directly to changes.db is not accepted by apply_change", async () => {
-    // KNOWN-BUG: F10-03 approval_hash is an unkeyed SHA-256 over proposal fields; writing state='approved'
-    // plus a fabricated ApprovalRecord (approved_by any name, hash copied) passes every check and executes.
     const p = await callTool(agent, "propose_change", { connection: "local-sqlite", sql: "UPDATE orders SET status = 'forged' WHERE id = 101" });
     pyTamper(p.data.change_id, "p['state']='approved'; p['approval']={'approved_by':'ghost','approved_at':'2026-01-01T00:00:00Z','approval_hash':p['approval_hash']}");
     const r = await callTool(agent, "apply_change", { change_id: p.data.change_id });
     assert.equal(r.status, "denied", `forged approval executed: state=${r.data && r.data.state}`);
-  }, { known: "F10-03" });
+  });
   // (a) schema drift
   await check("out-of-band schema change after approval -> SCHEMA_DRIFT_DETECTED, approval not consumed", async () => {
     const p = await callTool(agent, "propose_change", { connection: "local-sqlite", sql: "UPDATE orders SET status = 'drift' WHERE id = 101" });
@@ -547,23 +551,18 @@ async function sectionTtl(agent) {
     }
   });
   await check("ttl_seconds=0 is rejected as INVALID_ARGUMENT", async () => {
-    // KNOWN-BUG: F10-05 no validation; proposal is created already expired.
     assertDenied(await callTool(agent, "propose_change", { connection: "local-sqlite", sql: "UPDATE orders SET status = 'd' WHERE id = 101", ttl_seconds: 0 }), "INVALID_ARGUMENT", "ttl 0");
-  }, { known: "F10-05" });
+  });
   await check("negative ttl_seconds is rejected as INVALID_ARGUMENT", async () => {
-    // KNOWN-BUG: F10-05 expires_at lands in the past.
     assertDenied(await callTool(agent, "propose_change", { connection: "local-sqlite", sql: "UPDATE orders SET status = 'd' WHERE id = 101", ttl_seconds: -5 }), "INVALID_ARGUMENT", "ttl -5");
-  }, { known: "F10-05" });
+  });
   await check("non-integer ttl_seconds (1.5) is rejected, not silently replaced by the default", async () => {
-    // KNOWN-BUG: F10-05 as_i64() fails -> default TTL used silently.
     assertDenied(await callTool(agent, "propose_change", { connection: "local-sqlite", sql: "UPDATE orders SET status = 'd' WHERE id = 101", ttl_seconds: 1.5 }), "INVALID_ARGUMENT", "ttl 1.5");
-  }, { known: "F10-05" });
+  });
   await check("absurd ttl_seconds (1e12) is rejected (max TTL)", async () => {
-    // KNOWN-BUG: F10-05 accepted; expires in year 33715.
     assertDenied(await callTool(agent, "propose_change", { connection: "local-sqlite", sql: "UPDATE orders SET status = 'd' WHERE id = 101", ttl_seconds: 1e12 }), "INVALID_ARGUMENT", "ttl 1e12");
-  }, { known: "F10-05" });
+  });
   await check("ttl_seconds=9223372036854775 returns a denial and does NOT crash the server", async () => {
-    // KNOWN-BUG: F10-05 (DoS) chrono TimeDelta::seconds panics -> whole stdio server process exits.
     const probe = await initClient(stdioClient("agent-alice", "agent", CFG, 8000));
     try {
       let resp;
@@ -578,7 +577,7 @@ async function sectionTtl(agent) {
     } finally {
       probe.close();
     }
-  }, { known: "F10-05" });
+  });
 }
 
 async function sectionPersistence() {
@@ -614,6 +613,79 @@ async function sectionPersistence() {
     assert.notEqual(r.status, 0, `approve without --config succeeded against the wrong store: ${r.stdout}`);
     assert.match(r.stderr, /not found/i);
   });
+}
+
+async function sectionKeyedApprovals() {
+  section("8b keyed approvals (approval_mac) and apply-time policy re-check");
+  const unkeyedEnv = { ...process.env, DB_MCP_QUIET: "1" };
+  delete unkeyedEnv.DB_MCP_APPROVAL_KEY;
+  const c = await initClient(stdioClient("agent-alice", "agent"));
+  try {
+    const p = await callTool(c, "propose_change", { connection: "prod-postgres", sql: "UPDATE orders SET status = 'keyed' WHERE id = 101" });
+    await check("CLI approve with a key signs the record (approval_mac) and reports no warnings", () => {
+      const r = cliApprove(p.data.change_id, "dba-bob", "admin");
+      assert.equal(r.status, 0, r.stderr);
+      const j = JSON.parse(r.stdout);
+      assert.match(String(j.approval.approval_mac), /^[0-9a-f]{64}$/);
+      assert.deepEqual(j.warnings, []);
+    });
+    await check("approval_mac binds the approver: editing approved_by after approval -> APPROVAL_HASH_MISMATCH", async () => {
+      pyTamper(p.data.change_id, "p['approval']['approved_by'] = 'dba-mallory'");
+      assertDenied(await callTool(c, "apply_change", { change_id: p.data.change_id }), "APPROVAL_HASH_MISMATCH", "edited approver");
+    });
+    await check("apply_change re-checks connection policy (table restricted after approval) -> RESTRICTED_TABLE_FORBIDDEN", async () => {
+      const q = await callTool(c, "propose_change", { connection: "local-sqlite", sql: "UPDATE inventory SET reserved_qty = 2 WHERE sku = 'SKU-PRO-1'" });
+      assert.equal(cliApprove(q.data.change_id, "dba-bob", "admin").status, 0);
+      const { configPath: cfgR } = makeIsolatedConfig({
+        dir: ISO,
+        fileName: "db-mcp-restricted.toml",
+        transform: (t) => t.replace('restricted_tables = ["internal_secrets"]', 'restricted_tables = ["internal_secrets", "inventory"]'),
+      });
+      const rc = await initClient(stdioClient("agent-alice", "agent", cfgR));
+      try {
+        assertDenied(await callTool(rc, "apply_change", { change_id: q.data.change_id }), "RESTRICTED_TABLE_FORBIDDEN", "restricted at apply");
+        const g = await callTool(rc, "get_change", { change_id: q.data.change_id });
+        assert.equal(g.data.state, "approved", "a policy denial at apply must not consume the approval");
+      } finally {
+        rc.close();
+      }
+    });
+    const n = await callTool(c, "propose_change", { connection: "prod-postgres", sql: "UPDATE orders SET status = 'nokey' WHERE id = 101" });
+    await check("without a key: CLI approve warns 'not keyed'; GovernedProduction apply -> APPROVAL_KEY_REQUIRED; keyed server rejects the unsigned record", async () => {
+      const r = spawnSync(process.execPath, [WRAPPER, "approve", "--change-id", n.data.change_id, "--approver", "dba-bob", "--role", "admin", "--config", CFG], { cwd: REPO_ROOT, encoding: "utf8", env: unkeyedEnv, timeout: 60000 });
+      assert.equal(r.status, 0, r.stderr);
+      const j = JSON.parse(r.stdout);
+      assert.equal(j.approval.approval_mac, undefined);
+      assert.match(j.warnings.join(" "), /not keyed/);
+      assert.match(r.stderr, /not keyed/);
+      const saved = process.env.DB_MCP_APPROVAL_KEY;
+      delete process.env.DB_MCP_APPROVAL_KEY;
+      let nk;
+      try {
+        nk = stdioClient("agent-alice", "agent");
+      } finally {
+        process.env.DB_MCP_APPROVAL_KEY = saved;
+      }
+      await initClient(nk);
+      try {
+        assertDenied(await callTool(nk, "apply_change", { change_id: n.data.change_id }), "APPROVAL_KEY_REQUIRED", "unkeyed prod apply");
+        assert.match(nk.stderr.join(""), /not keyed/, "server without a key must warn at startup");
+        // Development connection: still works without a key, with a warning in the envelope.
+        const d = await callTool(nk, "propose_change", { connection: "local-sqlite", sql: "UPDATE orders SET status = 'devnokey' WHERE id = 101" });
+        const ra = spawnSync(process.execPath, [WRAPPER, "approve", "--change-id", d.data.change_id, "--approver", "dba-bob", "--role", "admin", "--config", CFG], { cwd: REPO_ROOT, encoding: "utf8", env: unkeyedEnv, timeout: 60000 });
+        assert.equal(ra.status, 0, ra.stderr);
+        const a = await callTool(nk, "apply_change", { change_id: d.data.change_id });
+        assertSuccessEnvelope(a, "unkeyed dev apply");
+        assert.match(a.warnings.join(" "), /not keyed/);
+      } finally {
+        nk.close();
+      }
+      assertDenied(await callTool(c, "apply_change", { change_id: n.data.change_id }), "APPROVAL_HASH_MISMATCH", "unsigned approval on keyed server");
+    });
+  } finally {
+    c.close();
+    await sleep(400);
+  }
 }
 
 async function sectionHttp() {
@@ -714,11 +786,14 @@ async function sectionHttp() {
       assert.deepEqual(q.payload.rows, [["http"]]);
     });
     await check("concurrent approvals by three admins -> only one succeeds", async () => {
-      // KNOWN-BUG: F10-02 every approve succeeds and overwrites the previous record.
       const p2 = await mcp("propose_change", { connection: "prod-postgres", sql: "UPDATE orders SET status = 'race' WHERE id = 101" }, "proposer-pat", "agent");
       const rs = await Promise.all(["a1", "a2", "a3"].map((n) => approve({ change_id: p2.payload.data.change_id, approver: n, role: "admin" })));
       assert.equal(rs.filter((r) => r.http === 200).length, 1, rs.map((r) => r.http).join(","));
-    }, { known: "F10-02" });
+      for (const r of rs.filter((x) => x.http !== 200)) {
+        assert.equal(r.body.code, "CHANGE_NOT_PENDING", JSON.stringify(r.body));
+        assert.equal(typeof r.body.next_action, "string");
+      }
+    });
     await check("tools/list over HTTP has no approve tool", async () => {
       const r = await fetch(`${base}/mcp`, { method: "POST", headers: { "content-type": "application/json", authorization: "Bearer f10-agent-token" }, body: JSON.stringify({ jsonrpc: "2.0", id: 9999, method: "tools/list" }) });
       const names = (await r.json()).result.tools.map((t) => t.name);
@@ -825,6 +900,7 @@ async function main() {
     await sleep(400);
   }
   await sectionPersistence();
+  await sectionKeyedApprovals();
   await sectionHttp();
   const agent2 = await initClient(stdioClient("agent-alice", "agent"));
   try {

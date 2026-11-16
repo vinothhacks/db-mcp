@@ -474,6 +474,8 @@ async fn adversarial_security_and_governance_suite() {
     ));
     let mut cfg = ServerConfig::default_demo();
     cfg.changes.storage_path = Some(tmp_store.display().to_string());
+    // A persistent store needs an approval key for GovernedProduction apply_change (fail closed).
+    cfg.changes.approval_key = Some("contract-test-approval-key-0123456789".to_string());
     let tamper_runtime = DbMcpRuntime::from_config(cfg).unwrap();
     let t_prop = tamper_runtime
         .call_tool(

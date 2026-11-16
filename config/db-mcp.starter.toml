@@ -23,6 +23,8 @@ sqlite_path = ".db-mcp/audit.db"
 storage_path = ".db-mcp/changes.db"
 policy_revision = "policy_v1"
 default_ttl_seconds = 3600
+# HMAC key signing approval records; required for apply_change on GovernedProduction connections.
+# approval_key = "env:DB_MCP_APPROVAL_KEY"
 
 # ---------------------------------------------------------------------------
 # Local SQLite database (works out of the box; file is created if missing)

@@ -657,11 +657,9 @@ async function sectionCapabilitiesAndChanges(s, cfgPath) {
   let multiApply = null;
   if (multi.status === "ok") { approveViaCli(multi.data.change_id, cfgPath); multiApply = await s.call("apply_change", { change_id: multi.data.change_id }); }
   const txa = await s.call("execute_query", { connection: "local-sqlite", sql: "SELECT COUNT(*) FROM tx_a" });
-  // KNOWN-BUG: F15-19 propose_change ignores allow_multi_statement=false; apply_change runs adapter.execute which silently
-  // executes only the first statement and reports state=applied (partial, non-atomic change)
   await check("multi-statement DDL change is rejected (allow_multi_statement=false) or applied atomically with its failure reported", () => {
     assert.ok(multi.status !== "ok" || (multiApply && multiApply.status !== "ok"), `propose=${multi.status} apply=${multiApply && multiApply.status} state=${multiApply && multiApply.data && multiApply.data.state} tx_a exists=${txa.status === "ok"}`);
-  }, { knownBug: "F15-19" });
+  });
 }
 
 async function sectionRunawayOnEmbeddedEngines(s) {

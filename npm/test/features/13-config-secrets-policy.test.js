@@ -739,7 +739,8 @@ async function main() {
   await check("http: with tokens set, /mcp requires bearer; header role cannot approve, /admin/approve needs the separate admin token", async () => {
     const port = 19000 + Math.floor(Math.random() * 500);
     const { configPath, dir } = makeIsolatedConfig({ dir: path.join(TMP, "http-tok"), transform: (t) => t.replace('bind = "127.0.0.1:8080"', `bind = "127.0.0.1:${port}"`) });
-    const srv = await startHttp({ config: configPath, port, env: { DB_MCP_AUTH_TOKEN: "tok-user-123456", DB_MCP_ADMIN_TOKEN: "tok-admin-654321" } });
+    // DB_MCP_APPROVAL_KEY: GovernedProduction apply_change requires keyed approvals.
+    const srv = await startHttp({ config: configPath, port, env: { DB_MCP_AUTH_TOKEN: "tok-user-123456", DB_MCP_ADMIN_TOKEN: "tok-admin-654321", DB_MCP_APPROVAL_KEY: "f13-approval-key-0123456789abcdef" } });
     try {
       const U = { authorization: "Bearer tok-user-123456" };
       const asAdminHdr = { ...U, "x-mcp-principal": "mallory", "x-mcp-role": "admin" };
