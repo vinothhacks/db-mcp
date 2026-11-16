@@ -255,10 +255,11 @@ const MATRIX = [
   { id: "priv_in_from", sql: "SELECT * FROM pg_ls_dir('/')", mysql: P, pg: P, sqlite: P },
   { id: "priv_in_where", sql: "SELECT 1 FROM users WHERE pg_sleep(1) IS NULL", mysql: P, pg: P, sqlite: P },
   { id: "priv_in_order_by", sql: "SELECT id FROM users ORDER BY pg_sleep(1)", mysql: P, pg: P, sqlite: P },
-  // SQLite fileio extension + Postgres set_config are not on PRIVILEGED_FUNCTIONS (crates/db-mcp-sql/src/lib.rs:30-63)
-  { id: "sqlite_readfile", sql: "SELECT readfile('/etc/passwd')", mysql: P, pg: SKIP, sqlite: P, bug: "F06-B7" }, // KNOWN-BUG: F06-B7
-  { id: "sqlite_writefile", sql: "SELECT writefile('/tmp/x', 'abc')", mysql: P, pg: SKIP, sqlite: P, bug: "F06-B7" }, // KNOWN-BUG: F06-B7
-  { id: "pg_set_config", sql: "SELECT set_config('search_path', 'evil', false)", mysql: SKIP, pg: P, sqlite: SKIP, bug: "F06-B7" }, // KNOWN-BUG: F06-B7
+  // SQLite fileio extension + Postgres set_config are on PRIVILEGED_FUNCTIONS (F06-B7 fixed)
+  { id: "sqlite_readfile", sql: "SELECT readfile('/etc/passwd')", mysql: P, pg: SKIP, sqlite: P },
+  { id: "sqlite_writefile", sql: "SELECT writefile('/tmp/x', 'abc')", mysql: P, pg: SKIP, sqlite: P },
+  { id: "sqlite_edit", sql: "SELECT edit('x', 'vi')", mysql: P, pg: SKIP, sqlite: P },
+  { id: "pg_set_config", sql: "SELECT set_config('search_path', 'evil', false)", mysql: SKIP, pg: P, sqlite: SKIP },
 
   // --- parser bypass attempts / dialect edge cases ---
   { id: "bypass_comment_no_space", sql: "SELECT/**/1", mysql: OK, pg: OK, sqlite: OK },
@@ -271,9 +272,8 @@ const MATRIX = [
   { id: "dialect_backticks_on_pg", sql: "SELECT `id` FROM `users`", mysql: OK, pg: CLOSED_GOV, sqlite: OK },
   { id: "dialect_explain_select_via_execute", sql: "EXPLAIN SELECT 1", mysql: OK, pg: OK, sqlite: OK },
   { id: "dialect_pragma_read", sql: "PRAGMA table_info(users)", mysql: CLOSED_RO, pg: CLOSED_GOV, sqlite: OK },
-  // allow_explain_analyze=false must also govern execute_query("EXPLAIN ANALYZE ...") - policy currently lets it
-  // through to the adapter (crates/db-mcp-policy/src/lib.rs:523-705 never checks statement_kind EXPLAIN_ANALYZE).
-  { id: "explain_analyze_select_via_execute", sql: "EXPLAIN ANALYZE SELECT id FROM users", mysql: X, pg: X, sqlite: SKIP, bug: "F06-B1" }, // KNOWN-BUG: F06-B1
+  // allow_explain_analyze=false also governs execute_query("EXPLAIN ANALYZE ...") (F06-B1 fixed).
+  { id: "explain_analyze_select_via_execute", sql: "EXPLAIN ANALYZE SELECT id FROM users", mysql: X, pg: X, sqlite: SKIP },
 ];
 
 // ---------------------------------------------------------------------------
@@ -621,12 +621,12 @@ async function runAudit() {
     assert.ok(e, "no audit entry");
     assert.equal(e.decision, "denied", `decision=${e.decision}`);
   }, "F06-B5");
-  await check(`${MYSQL} execute_query EXPLAIN ANALYZE is audited as a policy denial (not an adapter failure)`, async () => { // KNOWN-BUG: F06-B1
+  await check(`${MYSQL} execute_query EXPLAIN ANALYZE is audited as a policy denial (not an adapter failure)`, async () => {
     const e = lines.find((l) => l.connection === MYSQL && l.tool_name === "execute_query" && /^EXPLAIN ANALYZE SELECT/i.test(l.normalized_sql || ""));
     assert.ok(e, "no audit entry for EXPLAIN ANALYZE");
     assert.equal(e.decision, "denied", `decision=${e.decision} denial_code=${e.denial_code}`);
     assert.equal(e.denial_code, X);
-  }, "F06-B1");
+  });
 }
 
 // ---------------------------------------------------------------------------

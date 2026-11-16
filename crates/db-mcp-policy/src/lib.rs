@@ -737,6 +737,12 @@ impl PolicyEngine {
             return mode_evaluation;
         }
 
+        // 7b. `EXPLAIN ANALYZE` executes the statement: the same switch that governs
+        //     explain_query(analyze=true) applies when it is sent through execute_query.
+        if !cfg.allow_explain_analyze && is_explain_analyze(analysis) {
+            return explain_analyze_denied(connection_id);
+        }
+
         // 8. Result-disclosure provenance: redaction masks sensitive columns by output column
         //    name, so ad-hoc SQL may only return a sensitive column as a bare, unaliased item.
         if !is_named_tool && !is_approved_change {
@@ -774,20 +780,9 @@ impl PolicyEngine {
             return base_eval;
         }
         let cfg = self.effective_config(connection_id);
-        let is_analyze = analyze_flag
-            || analysis
-                .statements
-                .iter()
-                .any(|s| s.statement_kind == "EXPLAIN_ANALYZE");
+        let is_analyze = analyze_flag || is_explain_analyze(analysis);
         if is_analyze && !cfg.allow_explain_analyze {
-            return PolicyEvaluation::Denied {
-                code: CODE_ANALYZE_EXPLAIN_FORBIDDEN.to_string(),
-                message: format!(
-                    "Execution-based EXPLAIN ANALYZE is disabled by policy on connection '{}'. Use plain EXPLAIN (analyze=false).",
-                    connection_id
-                ),
-                next_action: Some("explain_query".to_string()),
-            };
+            return explain_analyze_denied(connection_id);
         }
         PolicyEvaluation::Allowed
     }
@@ -806,6 +801,25 @@ impl PolicyEngine {
     pub fn apply_plan_disclosure_controls(&self, connection_id: &str, plan: &mut ExplainPlan) {
         let cfg = self.effective_config(connection_id);
         apply_plan_disclosure_controls(plan, &cfg);
+    }
+}
+
+/// True if any statement is an execution-based `EXPLAIN ANALYZE` (read or mutating).
+fn is_explain_analyze(analysis: &SqlAnalysis) -> bool {
+    analysis
+        .statements
+        .iter()
+        .any(|s| s.statement_kind.starts_with("EXPLAIN_ANALYZE"))
+}
+
+fn explain_analyze_denied(connection_id: &str) -> PolicyEvaluation {
+    PolicyEvaluation::Denied {
+        code: CODE_ANALYZE_EXPLAIN_FORBIDDEN.to_string(),
+        message: format!(
+            "Execution-based EXPLAIN ANALYZE is disabled by policy on connection '{}'. Use plain EXPLAIN (analyze=false).",
+            connection_id
+        ),
+        next_action: Some("explain_query".to_string()),
     }
 }
 
@@ -1132,6 +1146,64 @@ mod tests {
                 .denial_code(),
             Some(CODE_UNAUTHORIZED_ROLE)
         );
+    }
+
+    #[test]
+    fn test_explain_analyze_via_execute_query_follows_allow_explain_analyze() {
+        let caller = CallerIdentity::local_agent("agent-1");
+        let engine = PolicyEngine::with_configs(
+            OperatingMode::ReadOnly,
+            vec![
+                ConnectionPolicyConfig::read_only("ro"),
+                ConnectionPolicyConfig::development("dev").with_allow_explain_analyze(false),
+                ConnectionPolicyConfig::development("dev-allow"),
+            ],
+        );
+        let eval = |conn: &str, sql: &str| {
+            engine
+                .evaluate_raw_sql(&caller, conn, DatabaseEngine::Postgres, sql)
+                .unwrap()
+                .1
+        };
+        let denied = eval("ro", "EXPLAIN ANALYZE SELECT id FROM users");
+        assert_eq!(denied.denial_code(), Some(CODE_ANALYZE_EXPLAIN_FORBIDDEN));
+        let PolicyEvaluation::Denied { next_action, .. } = denied else { unreachable!() };
+        assert_eq!(next_action.as_deref(), Some("explain_query"));
+        // Mode rules keep their codes for mutations; Development still needs the switch.
+        assert_eq!(
+            eval("ro", "EXPLAIN ANALYZE DELETE FROM users").denial_code(),
+            Some(CODE_MUTATION_NOT_ALLOWED_IN_READ_ONLY)
+        );
+        assert_eq!(
+            eval("dev", "EXPLAIN ANALYZE DELETE FROM users").denial_code(),
+            Some(CODE_ANALYZE_EXPLAIN_FORBIDDEN)
+        );
+        assert!(eval("ro", "EXPLAIN SELECT id FROM users").is_allowed());
+        assert!(eval("dev-allow", "EXPLAIN ANALYZE SELECT id FROM users").is_allowed());
+    }
+
+    #[test]
+    fn test_bareword_pragma_write_denied_for_non_admin_in_development() {
+        let engine = PolicyEngine::with_configs(
+            OperatingMode::Development,
+            vec![ConnectionPolicyConfig::development("dev")],
+        );
+        let agent = CallerIdentity::local_agent("agent-1");
+        let admin = CallerIdentity::new("root", "admin", vec!["*".to_string()], "stdio");
+        for sql in ["PRAGMA journal_mode = WAL", "/**/PRAGMA journal_mode = WAL", "PRAGMA journal_mode(WAL)"] {
+            let (_, eval) = engine
+                .evaluate_raw_sql(&agent, "dev", DatabaseEngine::Sqlite, sql)
+                .unwrap();
+            assert_eq!(eval.denial_code(), Some(CODE_PRIVILEGED_FUNCTION_FORBIDDEN), "{sql}");
+            let (_, eval) = engine
+                .evaluate_raw_sql(&admin, "dev", DatabaseEngine::Sqlite, sql)
+                .unwrap();
+            assert!(eval.is_allowed(), "{sql}");
+        }
+        let (_, eval) = engine
+            .evaluate_raw_sql(&agent, "dev", DatabaseEngine::Sqlite, "PRAGMA table_info(users)")
+            .unwrap();
+        assert!(eval.is_allowed());
     }
 
     #[test]

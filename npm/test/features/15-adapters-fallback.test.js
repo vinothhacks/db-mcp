@@ -602,7 +602,8 @@ async function sectionSqliteReadOnly() {
     assert.equal(entry.mode, "development");
     assert.equal(ins.code, "READONLY_VIOLATION");
     assert.equal(cte.code, "READONLY_VIOLATION");
-    assert.equal(wal.code, "READONLY_VIOLATION");
+    // Policy now classifies bareword PRAGMA writes as privileged (F05-B8), so a non-admin is stopped before the adapter.
+    assert.ok(["READONLY_VIOLATION", "PRIVILEGED_FUNCTION_FORBIDDEN"].includes(wal.code), `PRAGMA journal_mode=WAL: ${wal.code}`);
     assert.deepEqual(qo.rows, [[1]]);
     assert.deepEqual(sel.rows, [[2]]);
   });

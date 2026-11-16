@@ -654,11 +654,12 @@ async function sectionModes(c) {
       denied((await eq(c, { connection: L, sql })).payload, "PRIVILEGED_FUNCTION_FORBIDDEN", sql);
     }
   });
-  // KNOWN-BUG: F05-B8 - `PRAGMA x = BAREWORD` fails to parse, falls back to Unknown, and Development allows Unknown.
   await check("6.08 Development: bareword PRAGMA write (journal_mode = WAL) is denied for a non-admin", async () => {
-    const { payload: p } = await eq(c, { connection: L, sql: "PRAGMA journal_mode = WAL" });
-    denied(p, ["PRIVILEGED_FUNCTION_FORBIDDEN", "UNKNOWN_SQL_IN_GOVERNED_MODE"]);
-  }, "F05-B8");
+    for (const sql of ["PRAGMA journal_mode = WAL", "/* c */ PRAGMA journal_mode = WAL", "PRAGMA journal_mode(WAL)"]) {
+      const { payload: p } = await eq(c, { connection: L, sql });
+      denied(p, ["PRIVILEGED_FUNCTION_FORBIDDEN", "UNKNOWN_SQL_IN_GOVERNED_MODE"], sql);
+    }
+  });
   await check("6.09 Development: read-only PRAGMA is allowed", async () => {
     const { payload: p } = await eq(c, { connection: L, sql: "PRAGMA table_info(users)" });
     okEnvelope(p);

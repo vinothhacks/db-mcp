@@ -62,7 +62,63 @@ pub const PRIVILEGED_FUNCTIONS: &[&str] = &[
     "load_extension",
     "fts3_tokenizer",
     "attach",
+    // SQLite fileio / shell extension functions: read, write or open files on the server host.
+    "readfile",
+    "writefile",
+    "edit",
+    // PostgreSQL run-time configuration change (search_path hijack, statement_timeout, ...).
+    "set_config",
 ];
+
+/// SQLite pragmas that take an argument but only read state (`PRAGMA table_info(users)`).
+const READ_ONLY_PRAGMAS_WITH_ARGUMENT: &[&str] = &[
+    "table_info",
+    "table_xinfo",
+    "table_list",
+    "index_info",
+    "index_xinfo",
+    "index_list",
+    "foreign_key_list",
+    "foreign_key_check",
+    "integrity_check",
+    "quick_check",
+];
+
+/// SQLite pragmas that change state even without an argument.
+const SIDE_EFFECT_PRAGMAS: &[&str] = &["optimize", "shrink_memory", "wal_checkpoint", "incremental_vacuum"];
+
+/// Classify a pragma: any assignment (`PRAGMA x = v`), any argument to a pragma that is not a
+/// known read-only introspection pragma (`PRAGMA journal_mode(WAL)`), and side-effecting
+/// pragmas are writes.
+fn classify_pragma(name: &str, has_argument: bool, is_assignment: bool) -> (SqlStatementClass, &'static str) {
+    let base = name
+        .rsplit('.')
+        .next()
+        .unwrap_or(name)
+        .trim()
+        .trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']')
+        .to_ascii_lowercase();
+    let writes = is_assignment
+        || (has_argument && !READ_ONLY_PRAGMAS_WITH_ARGUMENT.contains(&base.as_str()))
+        || (!has_argument && SIDE_EFFECT_PRAGMAS.contains(&base.as_str()));
+    if writes {
+        (SqlStatementClass::PrivilegeOrAdmin, "PRAGMA_WRITE")
+    } else {
+        (SqlStatementClass::Read, "PRAGMA_READ")
+    }
+}
+
+/// Classify raw `PRAGMA ...` text that the AST parser rejected (e.g. `PRAGMA journal_mode = WAL`).
+fn classify_raw_pragma(normalized: &str) -> (SqlStatementClass, &'static str) {
+    let rest = normalized.trim_start().get(6..).unwrap_or("").trim_start();
+    let name_end = rest
+        .find(|c: char| c == '=' || c == '(' || c == ';' || c.is_whitespace())
+        .unwrap_or(rest.len());
+    let after = rest[name_end..].trim_start();
+    let is_assignment = after.starts_with('=');
+    let has_argument = is_assignment || after.starts_with('(');
+    classify_pragma(&rest[..name_end], has_argument, is_assignment)
+}
 
 /// Returns true if a function name (qualified or unqualified) is a privileged or side-effecting function.
 pub fn is_privileged_function(raw_name: &str) -> bool {
@@ -893,7 +949,11 @@ fn classify_top_level_statement(stmt: &Statement) -> (SqlStatementClass, &'stati
         Statement::Explain { statement, analyze, .. } => {
             let (inner_class, _) = classify_top_level_statement(statement);
             if inner_class != SqlStatementClass::Read {
-                (inner_class, "EXPLAIN_MUTATING")
+                if *analyze {
+                    (inner_class, "EXPLAIN_ANALYZE_MUTATING")
+                } else {
+                    (inner_class, "EXPLAIN_MUTATING")
+                }
             } else if *analyze {
                 (SqlStatementClass::Read, "EXPLAIN_ANALYZE")
             } else {
@@ -943,12 +1003,8 @@ fn classify_top_level_statement(stmt: &Statement) -> (SqlStatementClass, &'stati
         Statement::Call(_) => (SqlStatementClass::Write, "CALL"),
         Statement::Execute { .. } => (SqlStatementClass::Write, "EXECUTE"),
         Statement::SetVariable { .. } => (SqlStatementClass::Transaction, "SET"),
-        Statement::Pragma { value, .. } => {
-            if value.is_some() {
-                (SqlStatementClass::PrivilegeOrAdmin, "PRAGMA_WRITE")
-            } else {
-                (SqlStatementClass::Read, "PRAGMA_READ")
-            }
+        Statement::Pragma { name, value, is_eq } => {
+            classify_pragma(&name.to_string(), value.is_some(), *is_eq)
         }
         _ => (SqlStatementClass::Unknown, "UNKNOWN"),
     }
@@ -1073,12 +1129,20 @@ fn analyze_fallback_statement(
 ) -> StatementAnalysis {
     let (has_cte_write, priv_fns) = inspect_tokens_for_hazards(engine, raw_sql);
     let upper = raw_sql.trim_start().to_ascii_uppercase();
-    let first_word = upper.split_whitespace().next().unwrap_or("");
+    // Leading comments must not hide the statement keyword (`/**/PRAGMA journal_mode = WAL`).
+    let normalized = normalize_sql(raw_sql);
+    let normalized_upper = normalized.to_ascii_uppercase();
+    let first_word = normalized_upper
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ';')
+        .next()
+        .unwrap_or("");
 
     let (class, kind) = if !priv_fns.is_empty()
         || matches!(first_word, "ATTACH" | "DETACH" | "VACUUM" | "COPY" | "GRANT" | "REVOKE")
     {
         (SqlStatementClass::PrivilegeOrAdmin, first_word)
+    } else if engine == DatabaseEngine::Sqlite && first_word == "PRAGMA" {
+        classify_raw_pragma(&normalized)
     } else if has_cte_write {
         (SqlStatementClass::Write, "CTE_WRITE")
     } else {
@@ -1172,6 +1236,19 @@ mod tests {
             SqlStatementClass::PrivilegeOrAdmin
         );
 
+        for (engine, sql, name) in [
+            (DatabaseEngine::Sqlite, "SELECT readfile('/etc/passwd')", "readfile"),
+            (DatabaseEngine::Sqlite, "SELECT writefile('/tmp/x', 'abc')", "writefile"),
+            (DatabaseEngine::Sqlite, "SELECT edit('x', 'vi')", "edit"),
+            (DatabaseEngine::Postgres, "SELECT set_config('search_path', 'evil', false)", "set_config"),
+            (DatabaseEngine::Postgres, "SELECT lo_import('/etc/passwd')", "lo_import"),
+            (DatabaseEngine::Postgres, "SELECT lo_export(1, '/tmp/x')", "lo_export"),
+        ] {
+            let analysis = parse_and_analyze_sql(engine, sql).unwrap();
+            assert!(analysis.privileged_functions.contains(&name.to_string()), "{sql}");
+            assert_eq!(analysis.overall_class, SqlStatementClass::PrivilegeOrAdmin, "{sql}");
+        }
+
         let mysql_sql = "SELECT LOAD_FILE('/var/lib/mysql-files/secret.txt')";
         let mysql_analysis = parse_and_analyze_sql(DatabaseEngine::MySql, mysql_sql).unwrap();
         assert!(mysql_analysis.has_privileged_functions);
@@ -1199,6 +1276,51 @@ mod tests {
         );
         assert!(gov_res.is_err());
         assert_eq!(gov_res.unwrap_err().code(), "UNKNOWN_SQL_CONSTRUCT");
+    }
+
+    #[test]
+    fn test_pragma_writes_are_privileged_and_reads_are_not() {
+        let class = |sql: &str| {
+            let a = parse_and_analyze_sql(DatabaseEngine::Sqlite, sql).unwrap();
+            (a.overall_class, a.statements[0].statement_kind.clone())
+        };
+        for sql in [
+            "PRAGMA journal_mode = WAL",
+            "pragma journal_mode=wal",
+            "/* c */ PRAGMA journal_mode = WAL",
+            "PRAGMA journal_mode(WAL)",
+            "PRAGMA main.journal_mode = 'delete'",
+            "PRAGMA foreign_keys = 0",
+            "PRAGMA writable_schema=1",
+            "PRAGMA wal_checkpoint",
+        ] {
+            assert_eq!(class(sql).0, SqlStatementClass::PrivilegeOrAdmin, "{sql}");
+        }
+        for sql in [
+            "PRAGMA table_info(users)",
+            "PRAGMA table_info('users')",
+            "PRAGMA main.index_list(users)",
+            "PRAGMA journal_mode",
+            "PRAGMA foreign_keys",
+        ] {
+            assert_eq!(class(sql).0, SqlStatementClass::Read, "{sql}");
+        }
+        // Not SQLite: PRAGMA stays unknown (fails closed in governed modes).
+        let pg = parse_and_analyze_sql(DatabaseEngine::Postgres, "PRAGMA journal_mode = WAL").unwrap();
+        assert_ne!(pg.overall_class, SqlStatementClass::Read);
+    }
+
+    #[test]
+    fn test_explain_analyze_kinds() {
+        let kind = |sql: &str| {
+            parse_and_analyze_sql(DatabaseEngine::Postgres, sql).unwrap().statements[0]
+                .statement_kind
+                .clone()
+        };
+        assert_eq!(kind("EXPLAIN ANALYZE SELECT 1"), "EXPLAIN_ANALYZE");
+        assert_eq!(kind("EXPLAIN ANALYZE DELETE FROM users"), "EXPLAIN_ANALYZE_MUTATING");
+        assert_eq!(kind("EXPLAIN DELETE FROM users"), "EXPLAIN_MUTATING");
+        assert_eq!(kind("EXPLAIN SELECT 1"), "EXPLAIN");
     }
 
     #[test]
