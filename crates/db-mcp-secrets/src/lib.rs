@@ -84,6 +84,23 @@ impl<'de> Deserialize<'de> for SecretString {
     }
 }
 
+/// Read a `file:<path>` secret reference: the file contents with trailing newlines trimmed.
+/// A missing or unreadable file is an error; contents are never included in messages.
+pub fn read_secret_file(path: &str) -> DbMcpResult<SecretString> {
+    if path.is_empty() {
+        return Err(DbMcpError::ConfigurationError(
+            "file: secret reference has an empty path".to_string(),
+        ));
+    }
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        DbMcpError::ConfigurationError(format!(
+            "Secret file '{path}' could not be read: {}",
+            e.kind()
+        ))
+    })?;
+    Ok(SecretString::new(raw.trim_end_matches(['\r', '\n']).to_string()))
+}
+
 /// Trait implemented by credential providers.
 pub trait SecretProvider: Send + Sync {
     /// Resolve a secret key (e.g. `DB_PASSWORD` or `env:DB_PASSWORD`) into a `SecretString`.
@@ -97,6 +114,9 @@ pub trait SecretProvider: Send + Sync {
         }
         if let Some(secret_key) = trimmed.strip_prefix("secret:") {
             return self.get_secret(secret_key.trim());
+        }
+        if let Some(path) = trimmed.strip_prefix("file:") {
+            return read_secret_file(path.trim());
         }
 
         // Interpolate `${VAR_NAME}` placeholders inside a DSN template.
@@ -344,5 +364,22 @@ mod tests {
             direct.redacted_dsn_preview(),
             "mysql://root:[REDACTED]@127.0.0.1:3306/app"
         );
+    }
+
+    #[test]
+    fn file_secret_ref_reads_and_trims_newline() {
+        let path = std::env::temp_dir().join(format!("db_mcp_secret_{}", std::process::id()));
+        std::fs::write(&path, "s3cret-value\r\n").unwrap();
+        let composite = CompositeSecretProvider::with_static_and_env(StaticSecretProvider::new());
+        let got = composite
+            .resolve_dsn(&format!("file:{}", path.display()))
+            .unwrap();
+        assert_eq!(got.expose_secret(), "s3cret-value");
+        let _ = std::fs::remove_file(&path);
+        let err = composite
+            .resolve_dsn(&format!("file:{}", path.display()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not be read"), "{err}");
     }
 }

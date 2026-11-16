@@ -49,6 +49,9 @@ let failed = 0;
 let skipped = 0;
 const failures = [];
 
+// The starter config references env:DATABASE_URL / env:MYSQL_URL; unset variables are a config error.
+const STARTER_ENV = { DATABASE_URL: "postgres://127.0.0.1:1/x", MYSQL_URL: "mysql://127.0.0.1:1/x" };
+
 function ok(name) {
   passed++;
   console.log(`  ok    ${name}`);
@@ -405,7 +408,7 @@ async function main() {
   });
   await check("verify-config through the packed launcher with DB_MCP_BINARY_PATH -> exit 0, JSON status ok, 3 connections", () => {
     if (!HAVE_BINARY) return skip("verify-config via DB_MCP_BINARY_PATH", "no built binary") || "skip";
-    const r = runLauncher(PACKED_LAUNCHER, ["verify-config", "--config", "db-mcp.toml"], { cwd: userDir, env: strippedEnv({ DB_MCP_BINARY_PATH: BUILT_BINARY }) });
+    const r = runLauncher(PACKED_LAUNCHER, ["verify-config", "--config", "db-mcp.toml"], { cwd: userDir, env: strippedEnv({ DB_MCP_BINARY_PATH: BUILT_BINARY, ...STARTER_ENV }) });
     assert.equal(r.status, 0, r.stderr);
     const j = JSON.parse(r.stdout);
     assert.equal(j.status, "ok");
@@ -430,8 +433,6 @@ async function main() {
     assert.match(r.stdout, /DB_MCP_CACHE_DIR/);
   });
   await check("`--help` / `-h` with no binary available still exits 0 with the launcher help (must not try to download or build)", () => {
-    // KNOWN-BUG: F14-01 - runCli() prints the launcher help, then falls through to ensureBinary() for the
-    // forwarded `--help`; without a binary it attempts download/cargo and exits 1.
     const r = runLauncher(PACKED_LAUNCHER, ["--help"], { cwd: userDir, env: strippedEnv({ DB_MCP_SKIP_DOWNLOAD: "1" }) });
     assert.match(r.stdout, /Launcher commands:/);
     assert.equal(r.status, 0, `--help exited ${r.status}: ${r.stderr.trim().split("\n")[0]}`);
@@ -543,7 +544,7 @@ async function main() {
         assert.equal(r.stdout.trim(), expectedCached);
       });
       await check("verify-config runs through the cached binary (no DB_MCP_BINARY_PATH), stdout is pure JSON", () => {
-        const r = runLauncher(PACKED_LAUNCHER, ["verify-config", "--config", "db-mcp.toml"], { cwd: userDir, env: installEnv() });
+        const r = runLauncher(PACKED_LAUNCHER, ["verify-config", "--config", "db-mcp.toml"], { cwd: userDir, env: installEnv(STARTER_ENV) });
         assert.equal(r.status, 0, r.stderr);
         assert.equal(JSON.parse(r.stdout).status, "ok");
       });
@@ -587,8 +588,6 @@ async function main() {
 
       // missing checksum
       await check("missing .sha256 -> install refuses by default (fail closed) instead of silently installing an unverified binary", () => {
-        // KNOWN-BUG: F14-02 - downloadPrebuilt() logs "checksum file unavailable ...; continuing without
-        // verification" and installs anyway. Expected: fail unless an explicit opt-out (e.g. DB_MCP_ALLOW_UNVERIFIED=1).
         const a4 = buildReleaseAsset({ version: "0.1.3", target, ext, outDir: assetsRoot, binarySrc: BUILT_BINARY, layout: "nested" });
         fs.rmSync(a4.sha);
         const cache5 = path.join(TMP, "cache-nosha");
@@ -596,6 +595,16 @@ async function main() {
         assert.match(r.stderr, /checksum file unavailable/, "a warning must at least be printed");
         assert.equal(r.status, 1, `install succeeded without checksum verification (exit ${r.status})`);
         assert.ok(!exists(path.join(cache5, "bin", "v0.1.3", target, BIN_NAME)), "unverified binary must not be cached");
+      });
+
+      await check("missing .sha256 + DB_MCP_ALLOW_UNVERIFIED=1 -> install proceeds with a loud warning", () => {
+        const a5 = buildReleaseAsset({ version: "0.1.4", target, ext, outDir: assetsRoot, binarySrc: BUILT_BINARY, layout: "nested" });
+        fs.rmSync(a5.sha);
+        const cache7 = path.join(TMP, "cache-nosha-optout");
+        const r = runLauncher(PACKED_LAUNCHER, ["install"], { cwd: userDir, env: installEnv({ DB_MCP_CACHE_DIR: cache7, DB_MCP_VERSION: "0.1.4", DB_MCP_ALLOW_UNVERIFIED: "1" }), timeout: 120000 });
+        assert.equal(r.status, 0, r.stderr);
+        assert.match(r.stderr, /WITHOUT verification/);
+        assert.ok(exists(path.join(cache7, "bin", "v0.1.4", target, BIN_NAME)));
       });
 
       // 404
@@ -769,19 +778,15 @@ async function main() {
   console.log("\n[6] Dockerfile and docker-compose static review");
   const msrv = maxRustVersionFromLock();
   await check(`Dockerfile builder image toolchain >= highest rust-version in Cargo.lock (${msrv.max} needed by ${msrv.who})`, () => {
-    // KNOWN-BUG: F14-03 - `FROM rust:1.82-slim-bookworm` cannot compile the locked graph (uuid 1.29 needs 1.89,
-    // icu_* 2.4 need 1.88, tokio 1.54 needs 1.85). `docker build` fails at `cargo build`.
     const m = dockerfile.match(/^FROM rust:(\d+\.\d+(?:\.\d+)?)/m);
     assert.ok(m, "no rust base image");
     assert.ok(semverGte(m[1], msrv.max), `rust:${m[1]} < required ${msrv.max} (${msrv.who})`);
   });
   await check("Cargo.toml workspace rust-version is not lower than what the lock file actually requires", () => {
-    // KNOWN-BUG: F14-04 - rust-version = "1.75" is advertised while the pinned dependencies need >= 1.89.
     const rv = cargoToml.match(/^rust-version\s*=\s*"([^"]+)"/m)[1];
     assert.ok(semverGte(rv, msrv.max), `rust-version ${rv} < ${msrv.max} (${msrv.who})`);
   });
   await check("Dockerfile copies Cargo.lock and builds with --locked (reproducible image)", () => {
-    // KNOWN-BUG: F14-05 - only `COPY Cargo.toml ./` is present; cargo re-resolves every dependency at image build time.
     assert.match(dockerfile, /COPY Cargo\.toml Cargo\.lock|COPY Cargo\.lock/, "Cargo.lock is not copied into the builder stage");
     assert.match(dockerfile, /cargo build --release --locked/, "builder does not use --locked");
   });
@@ -798,8 +803,6 @@ async function main() {
     assert.match(compose, /"8080:8080"/);
   });
   await check("Dockerfile does not bake the research/ evidence bundle (~21 MB of traces/REA evidence) into the image", () => {
-    // KNOWN-BUG: F14-06 - `COPY research ./research` (builder) and `COPY --from=builder /workspace/research` (runtime);
-    // only research/fixtures/ is needed by the example config, and compose bind-mounts ./research anyway.
     assert.ok(!/^COPY research \.\/research/m.test(dockerfile), "builder copies the whole research/ tree");
     assert.ok(!/COPY --from=builder \/workspace\/research /.test(dockerfile), "runtime copies the whole research/ tree");
   });
@@ -856,7 +859,7 @@ async function main() {
   console.log("\n[8] README and docs/CLIENT-SETUP.md accuracy");
   await check("README: every `npm run <script>` and launcher subcommand shown exists", () => {
     for (const m of [...readme.matchAll(/npm run ([\w:.-]+)/g)]) assert.ok(PKG.scripts[m[1]], `npm run ${m[1]} does not exist`);
-    for (const m of [...readme.matchAll(/npx @vinoth_n_3000\/db-mcp (\w[\w-]*)/g)]) assert.ok(["init", "install", "where", "serve", "approve", "verify-config"].includes(m[1]), `unknown subcommand ${m[1]}`);
+    for (const m of [...readme.matchAll(/npx @vinoth_n_3000\/db-mcp (\w[\w-]*)/g)]) assert.ok(["init", "install", "where", "selftest", "serve", "approve", "verify-config"].includes(m[1]), `unknown subcommand ${m[1]}`);
   });
   await check("README: `cargo install --git ... db-mcp-server` names the real bin crate and repository", () => {
     const binCrate = read(path.join(REPO_ROOT, "crates", "db-mcp-server", "Cargo.toml"));
@@ -879,8 +882,6 @@ async function main() {
     }
   });
   await check("CLIENT-SETUP env var table documents every DB_MCP_* knob the launcher reads", () => {
-    // KNOWN-BUG: F14-09 - DB_MCP_CACHE_DIR, DB_MCP_VERSION, DB_MCP_REPO and DB_MCP_QUIET are read by the launcher
-    // but absent from the docs/CLIENT-SETUP.md table (and DB_MCP_CACHE_DIR only appears in --launcher-help).
     const knobs = [...new Set([...launcherSrc.matchAll(/process\.env\.(DB_MCP_[A-Z_]+)/g)].map((m) => m[1]))].sort();
     assert.ok(knobs.length >= 7, knobs.join(","));
     const missing = knobs.filter((k) => !new RegExp(`\\|\\s*\`${k}`).test(clientSetup));

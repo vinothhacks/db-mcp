@@ -9,6 +9,7 @@ use db_mcp_core::{
 };
 use db_mcp_policy::ConnectionPolicyConfig;
 use db_mcp_tools::NamedToolRegistry;
+use db_mcp_secrets::{CompositeSecretProvider, SecretProvider, SecretString, StaticSecretProvider};
 use serde::{Deserialize, Deserializer, Serialize};
 
 fn default_server_name() -> String {
@@ -127,6 +128,7 @@ where
 
 /// Configuration for a single database connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConnectionConfig {
     pub id: String,
     #[serde(deserialize_with = "deserialize_engine")]
@@ -186,6 +188,23 @@ impl ConnectionConfig {
         }
     }
 
+    /// Resolve the DSN (`env:NAME`, `file:/path`, `secret:NAME`, `${NAME}`, or literal).
+    ///
+    /// Unset variables and unreadable files are errors. Messages name the variable or path,
+    /// never the DSN or secret contents. For SQLite, `file:` is a SQLite URI, not a secret ref.
+    pub fn resolve_dsn(&self, secrets: &dyn SecretProvider) -> DbMcpResult<SecretString> {
+        let raw = self.dsn.trim();
+        if self.engine == DatabaseEngine::Sqlite && raw.starts_with("file:") {
+            return Ok(SecretString::new(raw));
+        }
+        secrets.resolve_dsn(raw).map_err(|e| {
+            DbMcpError::ConfigurationError(format!(
+                "Connection '{}' dsn could not be resolved: {e}",
+                self.id.trim()
+            ))
+        })
+    }
+
     pub fn to_policy_config(
         &self,
         default_mode: OperatingMode,
@@ -207,6 +226,7 @@ impl ConnectionConfig {
 
 /// Streamable HTTP transport configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpServerConfig {
     #[serde(default = "default_bind")]
     pub bind: String,
@@ -228,6 +248,7 @@ impl Default for HttpServerConfig {
 
 /// Audit sink configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditConfig {
     #[serde(default = "default_true")]
     pub in_memory: bool,
@@ -249,6 +270,7 @@ impl Default for AuditConfig {
 
 /// Out-of-band change proposal store configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChangeStoreConfig {
     #[serde(default)]
     pub storage_path: Option<String>,
@@ -270,6 +292,7 @@ impl Default for ChangeStoreConfig {
 
 /// Governed ontology (semantic layer) configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OntologyConfig {
     /// Dedicated metadata database (SQLite file). `None` keeps an in-memory store (demo only):
     /// out-of-band review via the CLI requires a persistent path.
@@ -318,8 +341,23 @@ impl Default for OntologyConfig {
     }
 }
 
+/// `http.bind` must be `host:port` with a numeric port.
+fn validate_bind(bind: &str) -> DbMcpResult<()> {
+    let bad = || {
+        DbMcpError::ConfigurationError(format!(
+            "http.bind '{bind}' is not a valid host:port (e.g. 127.0.0.1:8080)"
+        ))
+    };
+    let (host, port) = bind.trim().rsplit_once(':').ok_or_else(bad)?;
+    if host.trim().is_empty() || host.contains(char::is_whitespace) || port.parse::<u16>().is_err() {
+        return Err(bad());
+    }
+    Ok(())
+}
+
 /// Top-level `db-mcp` server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default = "default_server_name")]
     pub server_name: String,
@@ -645,6 +683,10 @@ impl ServerConfig {
                 path_ref.display()
             ))
         })?;
+        let content = content
+            .strip_prefix('\u{feff}')
+            .unwrap_or(&content)
+            .to_string();
         let ext = path_ref
             .extension()
             .and_then(|s| s.to_str())
@@ -663,6 +705,18 @@ impl ServerConfig {
                 "server_name must not be empty".to_string(),
             ));
         }
+        if self.connections.is_empty() {
+            return Err(DbMcpError::ConfigurationError(
+                "config defines no connections; add at least one [[connections]] entry".to_string(),
+            ));
+        }
+        validate_bind(&self.http.bind)?;
+        if self.changes.default_ttl_seconds <= 0 {
+            return Err(DbMcpError::ConfigurationError(
+                "changes.default_ttl_seconds must be greater than zero".to_string(),
+            ));
+        }
+        let dsn_secrets = CompositeSecretProvider::with_static_and_env(StaticSecretProvider::new());
         let mut seen_ids = HashSet::new();
         for conn in &self.connections {
             let trimmed = conn.id.trim();
@@ -686,10 +740,11 @@ impl ServerConfig {
                     "Connection '{trimmed}' limits must be greater than zero"
                 )));
             }
+            conn.resolve_dsn(&dsn_secrets)?;
         }
         let _registry = NamedToolRegistry::from_specs(self.named_tools.clone())?;
         for tool in &self.named_tools {
-            if !seen_ids.is_empty() && !seen_ids.contains(tool.connection.trim()) {
+            if !seen_ids.contains(tool.connection.trim()) {
                 return Err(DbMcpError::InvalidArgument(format!(
                     "Named tool '{}' references unknown connection '{}'",
                     tool.name, tool.connection
@@ -710,5 +765,96 @@ impl ServerConfig {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: &str = "server_name = \"t\"\n[[connections]]\nid = \"c1\"\nengine = \"Sqlite\"\ndsn = \"sqlite://:memory:\"\n";
+    const TOOL: &str = "[[named_tools]]\nname = \"t\"\ndescription = \"d\"\nconnection = \"c1\"\nstatement = \"SELECT 1\"\n";
+
+    fn err(extra: &str) -> String {
+        ServerConfig::from_toml_str(&format!("{BASE}{extra}"))
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[test]
+    fn base_loads() {
+        ServerConfig::from_toml_str(BASE).unwrap();
+        ServerConfig::from_toml_str(&format!("{BASE}{TOOL}")).unwrap();
+    }
+
+    #[test]
+    fn unknown_fields_rejected_everywhere() {
+        assert!(err("read_onli = true\n").contains("unknown field `read_onli`"));
+        let top = ServerConfig::from_toml_str(&format!("bogus = 1\n{BASE}")).unwrap_err();
+        assert!(top.to_string().contains("unknown field `bogus`"));
+        for table in ["http", "audit", "changes", "ontology"] {
+            let cfg = format!("{BASE}[{table}]\nbogus_key = 1\n");
+            assert!(
+                ServerConfig::from_toml_str(&cfg)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unknown field"),
+                "[{table}] accepted an unknown key"
+            );
+        }
+        assert!(ServerConfig::from_toml_str(&format!("{BASE}{TOOL}bogus = 1\n")).is_err());
+        let param = "[[named_tools.parameters]]\nname = \"p\"\nparam_type = \"string\"\ndescription = \"d\"\nbogus = 1\n";
+        assert!(ServerConfig::from_toml_str(&format!("{BASE}{TOOL}{param}")).is_err());
+    }
+
+    #[test]
+    fn missing_env_dsn_fails_naming_variable() {
+        let cfg = BASE.replace("sqlite://:memory:", "env:DB_MCP_TEST_UNSET_DSN_VAR");
+        let e = ServerConfig::from_toml_str(&cfg).unwrap_err().to_string();
+        assert!(e.contains("DB_MCP_TEST_UNSET_DSN_VAR") && e.contains("'c1'"), "{e}");
+    }
+
+    #[test]
+    fn missing_secret_file_fails() {
+        let cfg = BASE
+            .replace("Sqlite", "Postgres")
+            .replace("sqlite://:memory:", "file:/definitely/not/here.secret");
+        let e = ServerConfig::from_toml_str(&cfg).unwrap_err().to_string();
+        assert!(e.contains("not/here.secret"), "{e}");
+    }
+
+    #[test]
+    fn sqlite_file_uri_dsn_is_not_a_secret_ref() {
+        let cfg = BASE.replace("sqlite://:memory:", "file:/tmp/x.db");
+        ServerConfig::from_toml_str(&cfg).unwrap();
+    }
+
+    #[test]
+    fn tool_with_unknown_connection_rejected_even_without_connections() {
+        let tool = TOOL.replace("\"c1\"", "\"ghost\"");
+        assert!(ServerConfig::from_toml_str(&format!("server_name = \"t\"\n{tool}")).is_err());
+        assert!(err(&tool).contains("unknown connection 'ghost'"));
+    }
+
+    #[test]
+    fn zero_connections_ttl_and_bind_rejected() {
+        let e = ServerConfig::from_toml_str("server_name = \"t\"\n").unwrap_err();
+        assert!(e.to_string().contains("no connections"));
+        assert!(err("[changes]\ndefault_ttl_seconds = -5\n").contains("default_ttl_seconds"));
+        assert!(err("[changes]\ndefault_ttl_seconds = 0\n").contains("default_ttl_seconds"));
+        assert!(err("[http]\nbind = \"not-an-addr\"\n").contains("http.bind"));
+        assert!(err("[http]\nbind = \"host:99999\"\n").contains("http.bind"));
+        ServerConfig::from_toml_str(&format!("{BASE}[http]\nbind = \"localhost:9000\"\n")).unwrap();
+    }
+
+    #[test]
+    fn bom_prefixed_json_loads() {
+        let dir = std::env::temp_dir().join(format!("db_mcp_bom_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("c.json");
+        let body = r#"{"connections":[{"id":"c1","engine":"Sqlite","dsn":"sqlite://:memory:"}]}"#;
+        std::fs::write(&p, format!("\u{feff}{body}")).unwrap();
+        assert!(ServerConfig::from_file(&p).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

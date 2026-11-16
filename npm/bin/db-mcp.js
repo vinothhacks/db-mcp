@@ -206,7 +206,17 @@ async function downloadPrebuilt({ version = VERSION } = {}) {
     try {
       expected = (await fetchBuffer(asset.shaUrl, { expectText: true })).trim().split(/\s+/)[0].toLowerCase();
     } catch (err) {
-      log(`checksum file unavailable (${err.message}); continuing without verification`);
+      if (process.env.DB_MCP_ALLOW_UNVERIFIED === "1") {
+        log(`checksum file unavailable (${err.message}); continuing WITHOUT verification (DB_MCP_ALLOW_UNVERIFIED=1)`);
+      } else {
+        throw new Error(
+          `checksum file unavailable (${err.message}); refusing to install an unverified binary. ` +
+            `Set DB_MCP_ALLOW_UNVERIFIED=1 to skip verification at your own risk`
+        );
+      }
+    }
+    if (expected !== null && !/^[0-9a-f]{64}$/.test(expected)) {
+      throw new Error(`checksum file for ${asset.archive} is malformed`);
     }
     if (expected) {
       const actual = sha256(archive);
@@ -402,9 +412,16 @@ function printLauncherHelp() {
       `Server commands (forwarded to db-mcp-server):\n` +
       `  serve --transport stdio|http [--bind host:port] --config <file> [--principal id] [--role role]\n` +
       `  approve --change-id <chg_id> --approver <principal> [--role admin] [--comment text] --config <file>\n` +
-      `  verify-config --config <file>\n` +
-      `  verify-audit --config <file>   (verify audit hash chains; non-zero exit on tamper)\n\n` +
-      `Environment: DB_MCP_BINARY_PATH, DB_MCP_SKIP_DOWNLOAD=1, DB_MCP_RELEASE_BASE_URL, DB_MCP_CACHE_DIR\n\n`
+      `  verify-config --config <file>
+` +
+      `  verify-audit --config <file>   (verify audit hash chains; non-zero exit on tamper)
+
+` +
+      `Environment: DB_MCP_BINARY_PATH, DB_MCP_SKIP_DOWNLOAD=1, DB_MCP_RELEASE_BASE_URL, DB_MCP_CACHE_DIR,
+` +
+      `             DB_MCP_QUIET=1, DB_MCP_REPO, DB_MCP_VERSION, DB_MCP_ALLOW_UNVERIFIED=1
+
+`
   );
 }
 
@@ -449,6 +466,8 @@ async function runCli() {
   if (cmd === "--launcher-help" || cmd === "-h" || cmd === "--help" || cmd === "help" || cmd === undefined) {
     printLauncherHelp();
     if (cmd === "--launcher-help" || cmd === undefined) process.exit(0);
+    // Never download or build just to print help: forward only when a binary is already installed.
+    if (!findLocalBinary()) process.exit(0);
   }
 
   let binaryPath;
