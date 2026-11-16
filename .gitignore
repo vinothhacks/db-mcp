@@ -28,6 +28,7 @@ research/traces/*.db-journal
 research/traces/*.db-wal
 research/traces/*.db-shm
 research/traces/*.jsonl
+research/traces/*.lock
 research/traces/rea-*.json
 research/fixtures/*.db
 research/fixtures/*.db-journal
