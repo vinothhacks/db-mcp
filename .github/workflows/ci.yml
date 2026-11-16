@@ -60,7 +60,7 @@ jobs:
         shell: bash
         run: |
           bash scripts/live-db-up.sh mysql > "$RUNNER_TEMP/mysql-env.sh"
-          sed -n 's#.*://[^:]*:\([^@]*\)@.*##p' "$RUNNER_TEMP/mysql-env.sh" | while read -r pw; do echo "::add-mask::$pw"; done
+          sed -n "s/^export [A-Z_]*='\(.*\)'$/\1/p" "$RUNNER_TEMP/mysql-env.sh" | while IFS= read -r dsn; do echo "::add-mask::$dsn"; pw="${dsn#*://*:}"; echo "::add-mask::${pw%%@*}"; done
           sed -e 's/^export //' -e "s/'//g" "$RUNNER_TEMP/mysql-env.sh" >> "$GITHUB_ENV"
       - name: Gated Rust live tests (db-mcp-mysql)
         run: cargo test --release -p db-mcp-mysql
