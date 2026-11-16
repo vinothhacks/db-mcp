@@ -5,7 +5,7 @@
 # in tool output, errors or audit logs.
 
 server_name = "db-mcp"
-server_version = "0.2.2"
+server_version = "0.3.0"
 default_mode = "ReadOnly"                 # Development | ReadOnly | GovernedProduction
 active_profiles = ["Explore", "Query", "Diagnose", "Change", "Schema", "Ontology"]
 

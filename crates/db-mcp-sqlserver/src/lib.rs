@@ -507,12 +507,12 @@ impl SqlServerAdapter {
     /// Check out a connection; a pooled connection that died is replaced once.
     async fn checkout_live(&self) -> DbMcpResult<TdsClient> {
         let mut client = self.checkout().await?;
-        if run_simple(&mut client, &self.dsn, "SELECT 1;", "ping").await.is_ok() {
+        if run_simple(&mut client, &self.dsn, "SELECT /* db-mcp:internal */ 1;", "ping").await.is_ok() {
             return Ok(client);
         }
         drop(client);
         let mut fresh = self.connect().await?;
-        run_simple(&mut fresh, &self.dsn, "SELECT 1;", "ping").await?;
+        run_simple(&mut fresh, &self.dsn, "SELECT /* db-mcp:internal */ 1;", "ping").await?;
         Ok(fresh)
     }
 
@@ -915,7 +915,7 @@ impl SqlServerAdapter {
         for (_, why) in info.missing_grants() {
             check.warnings.push(format!("optional: {why}"));
         }
-        match self.query_rows("SELECT 1 AS ok", 1).await {
+        match self.query_rows("SELECT /* db-mcp:internal */ 1 AS ok", 1).await {
             Ok(r) => check.select_1 = r.rows.first().and_then(|row| row.first()).and_then(|v| v.as_i64()) == Some(1),
             Err(e) => check.warnings.push(format!("SELECT 1 failed: {}", self.dsn.scrub(&e.to_string()))),
         }

@@ -361,9 +361,21 @@ function cli(args) {
 
     await check("full login: analyze_workload reads Query Store (or the plan cache)", async () => {
       for (let i = 0; i < 3; i++) ok(await call("execute_query", { connection: "mssql-full", sql: "SELECT id, total_cents FROM dbo.orders WHERE status = @P1", params: ["completed"] }));
-      const p = ok(await call("analyze_workload", { connection: "mssql-full", top_n: 10 }));
+      // Query Store records new queries asynchronously: on a fresh server they can take a few
+      // seconds to appear, so poll (bounded) instead of reading once.
+      let p;
+      for (let attempt = 0; attempt < 8; attempt++) {
+        // top_n 50: on a fresh server the fixture seeding and earlier checks outrank this cheap
+        // statement by total time; this check is about reading Query Store, not about ranking.
+        p = ok(await call("analyze_workload", { connection: "mssql-full", top_n: 50 }));
+        if (p.data.top_queries.some((q) => /dbo\.orders/i.test(q.normalized_query))) break;
+        await new Promise((r) => setTimeout(r, 2000));
+      }
       assert.ok(["query_store", "sys.dm_exec_query_stats"].includes(p.data.source), p.data.source);
-      assert.ok(p.data.top_queries.some((q) => /dbo\.orders/i.test(q.normalized_query)), JSON.stringify(p.data.top_queries).slice(0, 300));
+      assert.ok(
+        p.data.top_queries.some((q) => /dbo\.orders/i.test(q.normalized_query)),
+        `source=${p.data.source} queries=${JSON.stringify(p.data.top_queries.map((q) => `${q.calls}x ${q.normalized_query.slice(0, 80)}`))} notes=${JSON.stringify(p.data.notes || p.warnings || [])}`
+      );
       assert.ok(!p.data.top_queries.some((q) => /db-mcp:internal|'completed'/.test(q.normalized_query)), "internal statements or literals leaked");
     });
 
