@@ -24,6 +24,72 @@ Baseline: `cargo test --workspace` 75/75, `npm test` 3/3 suites, `npm run verify
 | F14 | Install and packaging | not completed | | launcher unit tests pass (`launcher.test.js`) |
 | F15 | Adapters and live fallback | not completed | | see "simulation disclosure" below |
 
+## v0.2.2 verification and fix pass (2026-11-16)
+
+Fourteen independent verifier agents (one per feature) re-ran every suite against the v0.2.1 release binary and
+explored beyond it. Their findings were fixed in seven phases, each on its own branch and worktree, each green on
+its own before it was merged (a fault stays in the phase that caused it). The merged result was then re-gated.
+
+| # | Feature | Suite result (v0.2.2) | Remaining known bugs |
+|---|---|---|---|
+| F01 | Protocol and transports | 61/61 | none |
+| F02 | Explore | 108/108 | none |
+| F03 | trace_table_dependencies | 86 pass, 1 xfail | F03-1 (read inside UPDATE reported as write) |
+| F04 | get_procedure_call_graph | 46/48 | F04-01 (CALL in a string literal), F04-04 (stub naming) |
+| F05 | execute_query | 99/104 | F05-B3 cancellation, F05-B5 rows_affected, F05-B6 u64 bind, F05-B7 pg-sim `$n` order |
+| F06 | SQL guards / explain | 363/366 | F06-B4/B5/B8 (error-code and next_action polish) |
+| F07 | run_named_tool | 60/60 | none |
+| F08 | Health / workload | 41/43 | F08-08 (pg_stat_statements source), F08-12 (history lost on restart) |
+| F09 | recommend_indexes | 51 pass, 11 xfail | advisor quality items F09-04, F09-06..14 |
+| F10 | Governed changes | 96/96 | none |
+| F11 | Snapshot / diff | 49/51 | F11-07 (summary row contract), F11-08 (empty pattern warning) |
+| F12 | Audit trail | 67/67 | none |
+| F13 | Config, secrets, policy | 79/79 | none |
+| F14 | Install and packaging | 62/62 | none |
+| F15 | Adapters and simulation | 49 pass, 17 known | PostgreSQL/MySQL dialect gaps of the embedded simulation (F15-04..12, F15-14, F15-16..18, F15-20) |
+| F16 | Governed ontology | 16/16, golden 17/17 | none |
+
+Also green: `cargo test --workspace --release`, `npm test` (launcher 8/8, e2e 4/4), `db-mcp selftest` 58/58.
+
+Fixed in this pass:
+
+- **Security.** Sensitive columns could leak through an alias, an expression, a subquery re-alias or a UNION position
+  (F05-B2/F06-B3); output provenance is now tracked and such queries are denied
+  (`SENSITIVE_COLUMN_FORBIDDEN`, `UNPROVENANCED_SENSITIVE_QUERY`). A wildcard is refused only when the live catalog
+  shows that a source table holds a sensitive column. Connection `allowed_roles` can no longer be bypassed by a
+  self-asserted `dba`/`admin` role (F13-B11). `readfile`, `writefile`, `edit` and `set_config` are privileged
+  functions, and bareword `PRAGMA` writes need an admin (F06-B7, F05-B8). `EXPLAIN ANALYZE` through execute_query
+  follows `allow_explain_analyze` (F06-B1).
+- **Governed changes.** `propose_change` and `apply_change` enforce the same connection policy as execute_query
+  (F10-04). An approval is accepted only once, from the `proposed` state (F10-02). Approval records carry an
+  HMAC-SHA256 MAC keyed by `changes.approval_key` or `DB_MCP_APPROVAL_KEY`. On GovernedProduction connections,
+  `apply_change` refuses changes when no key is configured (F10-03).
+- **Config.** Unknown keys are rejected, so a typo such as `read_onli` can no longer silently leave a connection
+  writable (F13-B1). Unresolvable `env:` DSNs fail startup, `file:` secret references work, and further bounds are
+  validated (F13-B2/B3/B6/B7/B9/B10). The `db-mcp init` starter config validates with no environment variables.
+- **Audit.** Concurrent writers keep both hash chains intact (F12-09). GovernedProduction refuses to run without a
+  durable audit sink (F12-07). The new `db-mcp verify-audit --config <file>` command checks both chains (F12-05).
+- **Protocol.** Invalid UTF-8 no longer stops the stdio server (F01-B2). JSON-RPC error codes follow the spec (F01-B4/B5).
+  HTTP notifications return 202, and a 401 carries `WWW-Authenticate` (F01-B3/B6).
+- **Explore, lineage, diagnostics.** Arguments are validated strictly (F02-03/04, F03-4, F04-05, F08-07, F09-15..17).
+  `describe_object` and `name_pattern` fixes (F02-07/09/10). Diagnostics are gated by adapter capability on MySQL
+  (F08-01, F09-19). SQLite health is honest (F08-02). The simulation no longer reports `hypopg_validated` (F09-02).
+  Query-derived index candidates come first (F09-03/05). SQLite index DDL is valid (F09-18). `list_connections`
+  flags simulated connections (F15-01).
+- **Routines and schema diff.** Dollar-quoted and `BEGIN...END` routines split correctly (F04-02). MySQL `DELIMITER`
+  is supported (F04-03). The MySQL simulation no longer contains phantom routines (F02-06). `diff_schema` covers
+  routines, triggers, foreign keys and primary keys, with per-engine DDL (F11-03/04/05/06/09/01).
+- **Named tools.** Duplicate names and placeholder/parameter mismatches are rejected at load (NT-01/02). A
+  non-object `arguments` value is rejected (NT-05).
+- **Ontology.** The planner now refuses instead of guessing. Before this pass, 13 of 51 probe questions got a wrong
+  number. Causes: a filter dropped after a dimension, uncertified filter words ignored, negations and `or`
+  compiled wrongly, `average` answered as a sum, and undeclared measures. All 51 now match direct SQL or are refused
+  with a reason. The golden set grew from 8 to 17 cases.
+- **Install.** The launcher fails closed when a release checksum is missing (F14-02; override with
+  `DB_MCP_ALLOW_UNVERIFIED=1`). The Dockerfile and `rust-version` were aligned with the lock file (1.89). Compose
+  runs only db-mcp (F14-07). `db-mcp --help` works without a binary. New `db-mcp selftest` runs the end-to-end
+  feature check on an isolated copy of the example config.
+
 ## v0.2.0 update (2026-11-15)
 
 Fixed before adding the ontology (they were prerequisites for it):
