@@ -383,7 +383,6 @@ async function main() {
     }
   });
 
-  // KNOWN-BUG: F04-05 - negative / non-integer max_depth is silently coerced to the default (5) instead of being rejected
   await check("max_depth validation: negative or non-integer max_depth is rejected (INVALID_ARGUMENT), not silently defaulted", async () => {
     const neg = await callGraph(a, { connection: PG, procedure_name: "checkout_order", direction: "callees", max_depth: -1 });
     const str = await callGraph(a, { connection: PG, procedure_name: "checkout_order", direction: "callees", max_depth: "abc" });
@@ -391,7 +390,7 @@ async function main() {
       assert.equal(r.envelope.status, "denied", `max_depth=${label} accepted: status=${r.envelope.status}, effective max_depth=${r.data && r.data.max_depth}`);
       assert.equal(r.envelope.code, "INVALID_ARGUMENT");
     }
-  }, "F04-05");
+  });
 
   await check("direction validation: unknown direction -> denied INVALID_ARGUMENT with explanatory message", async () => {
     const r = await callGraph(a, { connection: PG, procedure_name: "checkout_order", direction: "sideways" });

@@ -209,6 +209,46 @@ fn arg_u64(args: &Value, key: &str) -> DbMcpResult<Option<u64>> {
     }
 }
 
+/// Like `arg_u64` but rejects zero (for limits and counts where zero is meaningless).
+fn arg_positive_u64(args: &Value, key: &str) -> DbMcpResult<Option<u64>> {
+    match arg_u64(args, key)? {
+        Some(0) => Err(DbMcpError::InvalidArgument(format!("'{key}' must be a positive integer (>= 1)"))),
+        other => Ok(other),
+    }
+}
+
+/// Optional array-of-strings argument; anything else is rejected instead of silently ignored.
+fn arg_string_array(args: &Value, key: &str) -> DbMcpResult<Option<Vec<String>>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                    DbMcpError::InvalidArgument(format!("'{key}' must be an array of strings"))
+                })
+            })
+            .collect::<DbMcpResult<Vec<_>>>()
+            .map(Some),
+        Some(_) => Err(DbMcpError::InvalidArgument(format!("'{key}' must be an array of strings"))),
+    }
+}
+
+/// Deny a diagnostics tool when the adapter does not advertise the capability behind it.
+fn unsupported_capability(tool: &str, conn: &str, adapter: &dyn DatabaseAdapter, capability: &str) -> DbMcpError {
+    let caps = adapter.capabilities();
+    DbMcpError::PolicyDenied {
+        code: "UNSUPPORTED_CAPABILITY".to_string(),
+        message: format!(
+            "{tool} is not supported on {} connection '{conn}' (capability {capability} is false)",
+            caps.engine.as_str()
+        ),
+        next_action: Some(
+            "list_connections (check capabilities); use a connection whose capability is true".to_string(),
+        ),
+    }
+}
+
 fn definition_touches_restricted(def: &Definition, cfg: &db_mcp_policy::ConnectionPolicyConfig) -> bool {
     def.body.tables().iter().any(|t| cfg.is_restricted_table(t))
 }
@@ -856,11 +896,29 @@ impl DbMcpRuntime {
 
         match tool_name {
             "list_connections" => {
-                let list: Vec<ConnectionSummary> = self
+                let list: Vec<Value> = self
                     .summaries
                     .values()
                     .filter(|c| self.policy.authorize_connection(caller, &c.id).is_allowed())
-                    .cloned()
+                    .map(|c| {
+                        let mut summary: ConnectionSummary = c.clone();
+                        let simulated = self.is_simulated(&c.id);
+                        if simulated {
+                            // An embedded simulation cannot interrupt statements or run real ANALYZE plans.
+                            summary.capabilities.supports_cancellation = false;
+                            summary.capabilities.supports_analyze_explain = false;
+                        }
+                        let mut entry = serde_json::to_value(&summary).unwrap_or_else(|_| json!({}));
+                        entry["simulated"] = json!(simulated);
+                        if simulated {
+                            entry["warnings"] = json!([format!(
+                                "connection '{}' is served by the embedded simulated {} engine (no external server is queried; results are illustrative)",
+                                c.id,
+                                c.engine.as_str()
+                            )]);
+                        }
+                        entry
+                    })
                     .collect();
                 to_json(McpSuccessResponse::with_data(
                     req_id,
@@ -874,8 +932,10 @@ impl DbMcpRuntime {
                 let conn = req_str("connection")?;
                 let adapter = self.get_authorized_adapter(caller, &conn)?;
                 let cfg = self.policy.effective_config(&conn);
-                let detail_level = parse_detail_level(args.get("detail_level"), CatalogDetailLevel::Summary);
-                let object_types = parse_object_types(args.get("object_types"));
+                let detail_level = parse_detail_level(args.get("detail_level"), CatalogDetailLevel::Summary)?;
+                let object_types = parse_object_types(args.get("object_types"))?;
+                let limit = arg_positive_u64(args, "limit")?.unwrap_or(50) as usize;
+                let offset = arg_u64(args, "offset")?.unwrap_or(0) as usize;
                 let _ = &cfg;
                 // Restricted objects are removed BEFORE filtering/pagination so totals never leak them.
                 let (visible, _hidden) = self.discover_allowed(adapter.as_ref(), &conn, None).await?;
@@ -885,8 +945,8 @@ impl DbMcpRuntime {
                     name_pattern: args.get("name_pattern").and_then(|v| v.as_str()).map(ToOwned::to_owned),
                     object_types,
                     detail_level,
-                    limit: args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize,
-                    offset: args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                    limit,
+                    offset,
                 };
                 let mut catalog = filter_and_paginate_objects(&visible, &request);
                 catalog.schema_version = Some(compute_schema_version(&visible));
@@ -911,7 +971,7 @@ impl DbMcpRuntime {
                         next_action: Some("Query an allowed table or view".to_string()),
                     });
                 }
-                let detail_level = parse_detail_level(args.get("detail_level"), CatalogDetailLevel::Full);
+                let detail_level = parse_detail_level(args.get("detail_level"), CatalogDetailLevel::Full)?;
                 let schema = args.get("schema").and_then(|v| v.as_str());
                 let (visible, _) = self
                     .discover_allowed(adapter.as_ref(), &conn, schema.map(ToOwned::to_owned))
@@ -954,10 +1014,7 @@ impl DbMcpRuntime {
                         });
                     }
                 }
-                let max_depth = args
-                    .get("max_depth")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(3) as usize;
+                let max_depth = arg_u64(args, "max_depth")?.unwrap_or(3) as usize;
                 let (visible, _) = self.discover_allowed(adapter.as_ref(), &conn, None).await?;
                 let report = trace_table_dependencies(
                     &visible,
@@ -1003,10 +1060,7 @@ impl DbMcpRuntime {
                     .and_then(|v| v.as_str())
                     .unwrap_or("both")
                     .to_string();
-                let max_depth = args
-                    .get("max_depth")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(5) as usize;
+                let max_depth = arg_u64(args, "max_depth")?.unwrap_or(5) as usize;
                 let (visible, _) = self.discover_allowed(adapter.as_ref(), &conn, None).await?;
                 let report = build_procedure_call_graph(
                     &visible,
@@ -1154,38 +1208,58 @@ impl DbMcpRuntime {
             }
             "database_health" => {
                 let conn = req_str("connection")?;
-                let _adapter = self.get_authorized_adapter(caller, &conn)?;
+                let adapter = self.get_authorized_adapter(caller, &conn)?;
+                if !adapter.capabilities().supports_health_diagnostics {
+                    return Err(unsupported_capability(
+                        "database_health",
+                        &conn,
+                        adapter.as_ref(),
+                        "supports_health_diagnostics",
+                    ));
+                }
                 let report = self.pg_insights.database_health(&conn).await?;
                 let mut val = to_json(PgInsightsEngine::health_report_to_response(
                     req_id,
                     "snapshot_health",
                     &report,
                 ))?;
-                scrub_restricted(&mut val, &self.policy.effective_config(&conn));
+                if scrub_restricted(&mut val, &self.policy.effective_config(&conn)) > 0 {
+                    if let Some(rows) = val.get("rows").and_then(|r| r.as_array()).map(|r| r.len()) {
+                        val["returned_rows"] = json!(rows);
+                    }
+                }
                 Ok(val)
             }
             "analyze_workload" => {
                 let conn = req_str("connection")?;
                 let _adapter = self.get_authorized_adapter(caller, &conn)?;
-                let top_n = args.get("top_n").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+                let top_n = arg_positive_u64(args, "top_n")?.unwrap_or(10) as usize;
                 let workload = self.pg_insights.analyze_workload(&conn, top_n).await?;
                 let mut val = to_json(PgInsightsEngine::workload_to_response(
                     req_id,
                     "snapshot_workload",
                     &workload,
                 ))?;
-                scrub_restricted(&mut val, &self.policy.effective_config(&conn));
+                if scrub_restricted(&mut val, &self.policy.effective_config(&conn)) > 0 {
+                    if let Some(rows) = val.get("rows").and_then(|r| r.as_array()).map(|r| r.len()) {
+                        val["returned_rows"] = json!(rows);
+                    }
+                }
                 Ok(val)
             }
             "recommend_indexes" => {
                 let conn = req_str("connection")?;
-                let _adapter = self.get_authorized_adapter(caller, &conn)?;
-                let queries: Vec<String> = args
-                    .get("queries")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(ToOwned::to_owned)).collect())
-                    .unwrap_or_default();
-                let max_recs = args.get("max_recommendations").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+                let adapter = self.get_authorized_adapter(caller, &conn)?;
+                if !adapter.capabilities().supports_index_advisor {
+                    return Err(unsupported_capability(
+                        "recommend_indexes",
+                        &conn,
+                        adapter.as_ref(),
+                        "supports_index_advisor",
+                    ));
+                }
+                let queries: Vec<String> = arg_string_array(args, "queries")?.unwrap_or_default();
+                let max_recs = arg_positive_u64(args, "max_recommendations")?.unwrap_or(5) as usize;
                 let cfg = self.policy.effective_config(&conn);
                 if let Some(q) = queries.iter().find(|q| mentions_restricted(q, &cfg)) {
                     return Err(DbMcpError::PolicyDenied {
@@ -1866,34 +1940,40 @@ impl Deref for McpProtocolHandler {
     }
 }
 
-fn parse_detail_level(val: Option<&Value>, default: CatalogDetailLevel) -> CatalogDetailLevel {
-    match val.and_then(|v| v.as_str()) {
-        Some("names") => CatalogDetailLevel::Names,
-        Some("summary") => CatalogDetailLevel::Summary,
-        Some("full") => CatalogDetailLevel::Full,
-        _ => default,
+fn parse_detail_level(val: Option<&Value>, default: CatalogDetailLevel) -> DbMcpResult<CatalogDetailLevel> {
+    match val {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+            "names" => Ok(CatalogDetailLevel::Names),
+            "summary" => Ok(CatalogDetailLevel::Summary),
+            "full" => Ok(CatalogDetailLevel::Full),
+            other => Err(DbMcpError::InvalidArgument(format!(
+                "'detail_level' must be one of names|summary|full (got '{other}')"
+            ))),
+        },
+        Some(_) => Err(DbMcpError::InvalidArgument(
+            "'detail_level' must be one of names|summary|full".to_string(),
+        )),
     }
 }
 
-fn parse_object_types(val: Option<&Value>) -> Vec<CatalogObjectType> {
-    val.and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|item| match item.as_str()?.to_ascii_lowercase().as_str() {
-                    "table" => Some(CatalogObjectType::Table),
-                    "view" => Some(CatalogObjectType::View),
-                    "materialized_view" => Some(CatalogObjectType::MaterializedView),
-                    "index" => Some(CatalogObjectType::Index),
-                    "sequence" => Some(CatalogObjectType::Sequence),
-                    "function" => Some(CatalogObjectType::Function),
-                    "procedure" => Some(CatalogObjectType::Procedure),
-                    "trigger" => Some(CatalogObjectType::Trigger),
-                    "schema" => Some(CatalogObjectType::Schema),
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+fn parse_object_types(val: Option<&Value>) -> DbMcpResult<Vec<CatalogObjectType>> {
+    match val {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .ok_or_else(|| {
+                        DbMcpError::InvalidArgument("'object_types' must be an array of strings".to_string())
+                    })
+                    .and_then(|s| s.parse::<CatalogObjectType>())
+            })
+            .collect(),
+        Some(_) => Err(DbMcpError::InvalidArgument(
+            "'object_types' must be an array of strings".to_string(),
+        )),
+    }
 }
 
 #[cfg(test)]

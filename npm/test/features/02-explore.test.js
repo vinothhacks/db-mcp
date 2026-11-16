@@ -225,7 +225,7 @@ async function main() {
     await check(`${P}-07`, `[${conn.id}] prefix pattern 'ord%' returns only objects whose NAME starts with 'ord' (schema says filter on object name)`, async () => {
       const r = namesOf(await so({ name_pattern: "ord%", detail_level: "names" }));
       sortedEq(r, ["order_items", "orders"], `got ${r.join(",")}`);
-    }, "F02-07"); // KNOWN-BUG: F02-07 filter_and_paginate_objects also matches column names (order_id) -> audit_logs, active_user_orders returned
+    });
     await check(`${P}-08`, `[${conn.id}] schema_pattern: '${conn.schema}' and '%' return everything, other schema / nonexistent return 0, case-insensitive`, async () => {
       const all = names.data.objects.length;
       assert.equal((await so({ schema_pattern: conn.schema, detail_level: "names", limit: 1000 })).data.objects.length, all);
@@ -254,11 +254,11 @@ async function main() {
     await check(`${P}-10`, `[${conn.id}] object_types plural/alias spellings ('tables','views','proc') filter like the singular (CatalogObjectType::from_str accepts them)`, async () => {
       sortedEq(namesOf(await so({ object_types: ["tables"], detail_level: "names" })), visibleTables);
       sortedEq(namesOf(await so({ object_types: ["views"], detail_level: "names" })), [VIEW]);
-    }, "F02-04"); // KNOWN-BUG: F02-04 parse_object_types drops unknown spellings -> empty filter -> ALL objects returned
+    });
     await check(`${P}-11`, `[${conn.id}] object_types with only unknown values is rejected (INVALID_ARGUMENT), not silently unfiltered`, async () => {
       const r = await so({ object_types: ["bogus_type"], detail_level: "names" });
       assertDenied(r, "object_types bogus", "INVALID_ARGUMENT");
-    }, "F02-04"); // KNOWN-BUG: F02-04
+    });
     await check(`${P}-12`, `[${conn.id}] pagination limit=3: no dups/gaps, full pages, has_more/next_offset correct, total_count == visible objects`, async () => {
       const expectedAll = namesOf(names);
       const seen = [];
@@ -334,16 +334,16 @@ async function main() {
       const r = (await callTool(agent, "search_objects", { connection: "local-sqlite", limit, detail_level: "names" })).sc;
       assertDenied(r, `limit=${JSON.stringify(limit)}`, "INVALID_ARGUMENT");
     }
-  }, "F02-03"); // KNOWN-BUG: F02-03 args.get("limit").as_u64().unwrap_or(50) and limit==0 -> 50 in filter_and_paginate_objects
+  });
   await check("SO-G-05", "unknown detail_level ('bogus', 'FULL') is rejected (schema enum: names|summary|full) instead of silently using the default", async () => {
     assertDenied((await callTool(agent, "search_objects", { connection: "local-sqlite", detail_level: "bogus" })).sc, "detail bogus", "INVALID_ARGUMENT");
     const upper = (await callTool(agent, "search_objects", { connection: "local-sqlite", detail_level: "FULL" })).sc;
     assert.ok(upper.status === "denied" || upper.data.objects.find((o) => o.name === "orders").definition !== undefined, "'FULL' must either be rejected or honoured as full, not silently downgraded to summary");
-  }, "F02-03"); // KNOWN-BUG: F02-03 parse_detail_level falls back to default for anything unknown
+  });
   await check("SO-G-06", "negative offset is rejected or treated as 0 with a warning (not silently coerced)", async () => {
     const r = (await callTool(agent, "search_objects", { connection: "local-sqlite", offset: -1, detail_level: "names" })).sc;
     assert.ok(r.status === "denied" || r.warnings.length > 0, `offset=-1 silently accepted: ${JSON.stringify(r.warnings)}`);
-  }, "F02-03"); // KNOWN-BUG: F02-03
+  });
 
   // ---------------------------------------------------------------- describe_object per connection
   for (const conn of CONNECTIONS) {
@@ -449,7 +449,7 @@ async function main() {
       const r = await d({ object_name: `${conn.schema}.users`, schema: conn.schema });
       assertSuccessEnvelope(r, "schema+qualified", conn.id);
       assert.equal(r.data.name, "users");
-    }, "F02-09"); // KNOWN-BUG: F02-09 describe_object keeps the full 'schema.name' as target_name when schema is given
+    });
     await check(`${P}-09`, `[${conn.id}] wrong schema / other engine's schema / nonexistent object / LIKE pattern -> denied (not found), never a different object`, async () => {
       const other = CONNECTIONS.find((c) => c.id !== conn.id).schema;
       assertDenied(await d({ object_name: "users", schema: "no_such_schema" }), "wrong schema");
@@ -462,7 +462,7 @@ async function main() {
       const r = await d({ object_name: "does_not_exist" });
       assertDenied(r, "nonexistent");
       assert.equal(typeof r.next_action, "string", `next_action missing on ${r.code}`);
-    }, "F02-10"); // KNOWN-BUG: F02-10 DbMcpError::InvalidArgument has no next_action; not-found is reported as INVALID_ARGUMENT
+    });
     if (conn.restricted) {
       await check(`${P}-11`, `[${conn.id}] restricted internal_secrets -> RESTRICTED_TABLE for bare, qualified, upper-case, quoted and schema-arg forms`, async () => {
         for (const args of [

@@ -165,10 +165,9 @@ async function sectionTruthInAdvertising(s) {
       assert.equal(sel.status, "ok");
       assert.deepEqual(sel.rows, [[1]]);
     });
-    // KNOWN-BUG: F15-01 (list_connections only) list_connections carries no simulated flag or warning
     await check(`${id}: list_connections entry discloses the backend is simulated/embedded`, () => {
       assert.ok(discloses(byId[id]), `no disclosure field in ${JSON.stringify(byId[id]).slice(0, 200)}`);
-    }, { knownBug: "F15-01" });
+    });
     await check(`${id}: execute_query warnings disclose that rows did not come from a live server`, () => {
       assert.ok(Array.isArray(sel.warnings));
       assert.ok(sel.warnings.some((w) => discloses(w)), `warnings=${JSON.stringify(sel.warnings)}`);
@@ -189,18 +188,16 @@ async function sectionTruthInAdvertising(s) {
     assert.equal(health["prod-postgres"].status, "ok");
     assert.ok(discloses(health["prod-postgres"]), `report=${JSON.stringify(health["prod-postgres"].data).slice(0, 160)}`);
   });
-  // KNOWN-BUG: F15-02 supports_health_diagnostics=false for MySQL, yet a fabricated report is returned
   await check("database_health on analytics-mysql is refused (capabilities.supports_health_diagnostics=false)", () => {
     assert.equal(byId["analytics-mysql"].capabilities.supports_health_diagnostics, false);
     assert.ok(isDenied(health["analytics-mysql"]), `got status=${health["analytics-mysql"].status} active_connections=${health["analytics-mysql"].data && health["analytics-mysql"].data.active_connections}`);
-  }, { knownBug: "F15-02" });
-  // KNOWN-BUG: F15-02 SQLite has no dead tuples / buffer cache hit ratio; the numbers are invented
+  });
   await check("database_health on local-sqlite does not report PostgreSQL-only metrics (dead tuples, cache hit ratio)", () => {
     const d = health["local-sqlite"].data;
     assert.equal(d.engine, "sqlite");
     assert.ok(d.dead_tuples_total === undefined || d.dead_tuples_total === null, `dead_tuples_total=${d.dead_tuples_total}`);
     assert.ok(!d.findings.some((f) => f.check_id === "buffer_cache_hit_ratio"), "buffer_cache_hit_ratio finding present for SQLite");
-  }, { knownBug: "F15-02" });
+  });
   info(`database_health numbers: pg active=${health["prod-postgres"].data.active_connections} hit=${health["prod-postgres"].data.cache_hit_ratio} dead=${health["prod-postgres"].data.dead_tuples_total}; mysql active=${health["analytics-mysql"].data && health["analytics-mysql"].data.active_connections}; sqlite dead=${health["local-sqlite"].data.dead_tuples_total}`);
 
   // Disclosure on every remaining tool (v0.2.1 stamps a simulated-engine warning in the envelope).

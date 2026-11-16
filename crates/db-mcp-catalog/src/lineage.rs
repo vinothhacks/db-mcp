@@ -329,7 +329,7 @@ fn find_shortest_join_path(
         });
     }
 
-    let search_depth = max_depth.max(6);
+    let search_depth = max_depth;
     let mut queue: VecDeque<(String, Vec<TableJoinHop>)> = VecDeque::new();
     let mut visited: BTreeSet<String> = BTreeSet::new();
 
