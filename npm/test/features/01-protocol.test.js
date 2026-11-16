@@ -681,19 +681,19 @@ async function httpSuite() {
   });
 
   // ---- Server C: principal restriction proves x-mcp-principal / x-mcp-role reach policy + audit ----
-  const C = await httpServer({ transform: RESTRICT_PRINCIPALS, extraArgs: ["--principal", "default-http", "--role", "agent"] });
+  const C = await httpServer({ env: { DB_MCP_AUTH_TOKEN: "agent-tok", DB_MCP_ADMIN_TOKEN: "admin-tok" }, transform: RESTRICT_PRINCIPALS, extraArgs: ["--principal", "default-http", "--role", "agent"] });
   await check("http: x-mcp-principal / x-mcp-role headers are the identity evaluated by policy; --principal is the fallback", async () => {
     assert.ok(C.up, C.stderr.join(""));
     const q = { jsonrpc: "2.0", id: 1, method: "tools/call", params: callParams("SELECT 1") };
-    const def = await (await post(C.base, q)).json();
+    const def = await (await post(C.base, q, AUTH)).json();
     assert.equal(def.result.structuredContent.code, "UNAUTHORIZED_ROLE");
     assert.match(def.result.structuredContent.message, /'default-http'/);
-    const alice = await (await post(C.base, q, { "x-mcp-principal": "alice", "x-mcp-role": "agent" })).json();
+    const alice = await (await post(C.base, q, { ...AUTH, "x-mcp-principal": "alice", "x-mcp-role": "agent" })).json();
     assert.equal(alice.result.isError, false);
-    const bob = await (await post(C.base, q, { "x-mcp-principal": "bob", "x-mcp-role": "agent" })).json();
+    const bob = await (await post(C.base, q, { ...AUTH, "x-mcp-principal": "bob", "x-mcp-role": "agent" })).json();
     assert.equal(bob.result.isError, true);
     assert.match(bob.result.structuredContent.message, /'bob'/);
-    const viewer = await (await post(C.base, q, { "x-mcp-principal": "alice", "x-mcp-role": "viewer" })).json();
+    const viewer = await (await post(C.base, q, { ...AUTH, "x-mcp-principal": "alice", "x-mcp-role": "viewer" })).json();
     assert.equal(viewer.result.isError, true);
     assert.match(viewer.result.structuredContent.message, /'viewer'/);
   });

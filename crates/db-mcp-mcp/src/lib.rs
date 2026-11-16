@@ -1110,11 +1110,15 @@ impl DbMcpRuntime {
                 let conn = spec.connection.clone();
                 let adapter = self.get_authorized_adapter(caller, &conn)?;
                 let default_limits = self.policy.effective_config(&conn).limits;
-                let args_map: BTreeMap<String, Value> = args
-                    .get("arguments")
-                    .and_then(|v| v.as_object())
-                    .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                    .unwrap_or_default();
+                let args_map: BTreeMap<String, Value> = match args.get("arguments") {
+                    None | Some(Value::Null) => BTreeMap::new(),
+                    Some(Value::Object(m)) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    Some(_) => {
+                        return Err(DbMcpError::InvalidArgument(
+                            "`arguments` must be a JSON object of named parameters".to_string(),
+                        ))
+                    }
+                };
                 let prepared = self.named_tools.validate_and_bind(
                     req_id,
                     &name,

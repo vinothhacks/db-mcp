@@ -179,22 +179,44 @@ function maxRustVersionFromLock() {
 // Mock GitHub release server
 // ---------------------------------------------------------------------------------------------
 function startMockRelease(rootDir) {
-  const hits = new Map();
-  const server = http.createServer((req, res) => {
-    const rel = decodeURIComponent(req.url.split("?")[0]).replace(/^\/+/, "");
-    hits.set(rel, (hits.get(rel) || 0) + 1);
-    const file = path.join(rootDir, rel);
-    if (!rel.includes("..") && exists(file) && fs.statSync(file).isFile()) {
-      const buf = fs.readFileSync(file);
-      res.writeHead(200, { "content-type": "application/octet-stream", "content-length": buf.length });
-      res.end(buf);
-    } else {
-      res.writeHead(404, { "content-type": "text/plain" });
-      res.end("Not Found");
-    }
-  });
+  // The mock must live in a CHILD process: the checks call the launcher with spawnSync, which blocks this
+  // process's event loop, so an in-process http server could never answer (every download timed out).
+  const hitsFile = path.join(TMP, "mock-hits.log");
+  fs.writeFileSync(hitsFile, "");
+  const code = `
+    const http=require("http"),fs=require("fs"),path=require("path");
+    const [root,log]=process.argv.slice(1);
+    http.createServer((req,res)=>{
+      const rel=decodeURIComponent(req.url.split("?")[0]).replace(/^\\/+/,"");
+      fs.appendFileSync(log,rel+"\\n");
+      const file=path.join(root,rel);
+      if(!rel.includes("..")&&fs.existsSync(file)&&fs.statSync(file).isFile()){
+        const buf=fs.readFileSync(file);
+        res.writeHead(200,{"content-type":"application/octet-stream","content-length":buf.length});res.end(buf);
+      }else{res.writeHead(404,{"content-type":"text/plain"});res.end("Not Found");}
+    }).listen(0,"127.0.0.1",function(){console.log(this.address().port)});`;
+  const child = spawn(process.execPath, ["-e", code, rootDir, hitsFile], { stdio: ["ignore", "pipe", "inherit"] });
+  children.add(child);
+  const readHits = () => {
+    const m = new Map();
+    for (const l of fs.readFileSync(hitsFile, "utf8").split("\n").filter(Boolean)) m.set(l, (m.get(l) || 0) + 1);
+    return m;
+  };
+  const hits = {
+    get: (k) => readHits().get(k),
+    keys: () => readHits().keys(),
+    get size() { return readHits().size; },
+  };
   return new Promise((resolve) => {
-    server.listen(0, "127.0.0.1", () => resolve({ server, hits, baseUrl: `http://127.0.0.1:${server.address().port}`, reset: () => hits.clear() }));
+    child.stdout.once("data", (d) => {
+      const port = String(d).trim();
+      resolve({
+        server: { close: (cb) => { child.kill(); cb(); } },
+        hits,
+        baseUrl: `http://127.0.0.1:${port}`,
+        reset: () => fs.writeFileSync(hitsFile, ""),
+      });
+    });
   });
 }
 
@@ -394,7 +416,7 @@ async function main() {
     const r = runLauncher(PACKED_LAUNCHER, ["verify-config", "--config", "db-mcp.toml"], { cwd: userDir, env: strippedEnv({ DB_MCP_SKIP_DOWNLOAD: "1" }) });
     assert.equal(r.status, 1, r.stderr);
     assert.equal(r.stdout, "", "stdout must stay empty on resolution failure");
-    assert.match(r.stderr, /could not obtain db-mcp-server v0\.1\.0/);
+    assert.match(r.stderr, new RegExp(`could not obtain db-mcp-server v${PKG.version.replace(/\./g, "\\.")}`));
     assert.match(r.stderr, /download: skipped \(DB_MCP_SKIP_DOWNLOAD=1\)/);
     assert.match(r.stderr, /cargo is not installed \(https:\/\/rustup\.rs\)/);
     assert.match(r.stderr, /DB_MCP_BINARY_PATH/);
@@ -476,8 +498,8 @@ async function main() {
     }
   });
   await check("cachedBinaryPath honours DB_MCP_CACHE_DIR and is <cache>/bin/v<ver>/<target>/db-mcp-server[.exe]", () => {
-    const p = launcher.cachedBinaryPath("0.1.0", "x86_64-pc-windows-msvc");
-    assert.equal(p, path.join(CACHE_DIR, "bin", "v0.1.0", "x86_64-pc-windows-msvc", BIN_NAME));
+    const p = launcher.cachedBinaryPath(PKG.version, "x86_64-pc-windows-msvc");
+    assert.equal(p, path.join(CACHE_DIR, "bin", `v${PKG.version}`, "x86_64-pc-windows-msvc", BIN_NAME));
   });
 
   const target = launcher.detectTarget();
@@ -502,7 +524,7 @@ async function main() {
       const installEnv = (extra = {}) => strippedEnv({ DB_MCP_RELEASE_BASE_URL: mock.baseUrl, ...extra });
       const expectedCached = path.join(CACHE_DIR, "bin", `v${PKG.version}`, target, BIN_NAME);
 
-      await check("`db-mcp install` downloads from DB_MCP_RELEASE_BASE_URL, verifies sha256, caches at <cache>/bin/v0.1.0/<target>/ and prints the path", () => {
+      await check("`db-mcp install` downloads from DB_MCP_RELEASE_BASE_URL, verifies sha256, caches at <cache>/bin/v<ver>/<target>/ and prints the path", () => {
         mock.reset();
         const r = runLauncher(PACKED_LAUNCHER, ["install"], { cwd: userDir, env: installEnv(), timeout: 120000 });
         assert.equal(r.status, 0, r.stderr);
@@ -604,6 +626,7 @@ async function main() {
     return p;
   };
   const setupRepo = () => {
+    fs.rmSync(path.join(CACHE_DIR, "bin"), { recursive: true, force: true }); // earlier install checks leave a (newer) cached binary that would win the mtime tie-break
     fs.rmSync(fakeRepo, { recursive: true, force: true });
     fs.mkdirSync(path.join(fakeRepo, "crates", "db-mcp-server"), { recursive: true });
     fs.writeFileSync(path.join(fakeRepo, "Cargo.toml"), "[workspace]\n");
@@ -705,7 +728,7 @@ async function main() {
       const { makeIsolatedConfig } = require(path.join(REPO_ROOT, "scripts", "make-isolated-config.js"));
       const { configPath } = makeIsolatedConfig({ dir: path.join(TMP, "iso-http") });
       const port = await getFreePort();
-      const child = spawn(process.execPath, [LAUNCHER, "serve", "--transport", "http", "--bind", `127.0.0.1:${port}`, "--config", configPath], { cwd: REPO_ROOT, env: devEnv, stdio: ["pipe", "pipe", "pipe"] });
+      const child = spawn(process.execPath, [LAUNCHER, "serve", "--transport", "http", "--bind", `127.0.0.1:${port}`, "--config", configPath], { cwd: REPO_ROOT, env: { ...devEnv, DB_MCP_AUTH_TOKEN: "f14-agent-token", DB_MCP_ADMIN_TOKEN: "f14-admin-token" }, stdio: ["pipe", "pipe", "pipe"] });
       children.add(child);
       let stderr = "";
       child.stderr.on("data", (d) => (stderr += d));
@@ -812,9 +835,6 @@ async function main() {
     assert.match(ciYml, /node-version: 20/);
   });
   await check("release.yml: --locked with a committed Cargo.lock; arm runner label ubuntu-22.04-arm; no retired macOS runner label", () => {
-    // KNOWN-BUG: F14-08 - `macos-13` (the x86_64-apple-darwin job) was retired by GitHub on 2025-12-04; the
-    // replacement Intel label is `macos-15-intel`. Without it the Intel macOS asset is never produced and
-    // the launcher's download for darwin-x64 404s.
     assert.match(releaseYml, /cargo build --release --locked -p db-mcp-server --target \$\{\{ matrix\.target \}\}/);
     assert.ok(exists(path.join(REPO_ROOT, "Cargo.lock")));
     assert.ok(matrix.some((m) => m.os === "ubuntu-22.04-arm" && m.target === "aarch64-unknown-linux-gnu"));

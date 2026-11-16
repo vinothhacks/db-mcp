@@ -581,16 +581,16 @@ async function main() {
   const leakSearch = await srv2.call("search_objects", { connection: CONN, name_pattern: "internal" });
   check("baseline: search_objects hides restricted internal_secrets", () =>
     assert.deepEqual((leakSearch.payload.data.objects || []).map((o) => o.name), []));
-  // KNOWN-BUG: F03-2  restricted tables are only checked for table_name/target_table; FK edges, transitive_tables and the
+  // (F03-2 fixed) restricted tables are only checked for table_name/target_table; FK edges, transitive_tables and the
   // mermaid diagram still expose restricted tables (name + FK columns). search_objects/describe_object filter them.
   check("restricted internal_secrets is not exposed in users.inbound_foreign_keys", () =>
-    assert.ok(!leakUsers.inbound_foreign_keys.some((e) => /internal_secrets/i.test(e.from_table))), "F03-2");
+    assert.ok(!leakUsers.inbound_foreign_keys.some((e) => /internal_secrets/i.test(e.from_table))));
   check("restricted internal_secrets is not exposed in transitive_tables (users depth 3, orders depth 2)", () => {
     assert.ok(!leakUsers.transitive_tables.some((t) => /internal_secrets/i.test(t)));
     assert.ok(!leakOrders.transitive_tables.some((t) => /internal_secrets/i.test(t)));
-  }, "F03-2");
+  });
   check("restricted internal_secrets is not exposed in the mermaid diagram", () =>
-    assert.ok(!/internal_secrets/i.test(leakUsers.mermaid_diagram)), "F03-2");
+    assert.ok(!/internal_secrets/i.test(leakUsers.mermaid_diagram)));
   stopServer(srv2);
 
   // -------------------------------------------------------------------------------------------

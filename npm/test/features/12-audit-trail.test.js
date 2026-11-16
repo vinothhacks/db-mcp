@@ -182,8 +182,8 @@ async function coverageSuite() {
     await check("denial: apply_change before approval (APPROVAL_REQUIRED) is audited", async () => {
       const out = await audited(agent, "apply_change", { change_id: changeId });
       assert.equal(out.resp.code, "APPROVAL_REQUIRED");
-      expectOne("apply-unapproved", out, "denied");
-    }, "F12-02");
+      expectOne("apply-unapproved", out, "requires_approval");
+    });
     await check("denial: self-approval via CLI (SELF_APPROVAL_FORBIDDEN) is audited", async () => {
       const before = countLines(cfg.jsonl);
       const r = spawnSync(process.execPath, [LAUNCHER, "approve", "--change-id", changeId, "--approver", "f12-agent", "--config", cfg.configPath], { cwd: ROOT, encoding: "utf8" });

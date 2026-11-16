@@ -252,34 +252,6 @@ timeout_ms = 1
 allowed_roles = ["*"]
 
 [[named_tools]]
-name = "t_two_placeholders"
-description = "?2 referenced but only one parameter declared"
-connection = "local-sqlite"
-statement = "SELECT id FROM orders WHERE id = ?1 AND user_id = ?2"
-read_only = true
-allowed_roles = ["*"]
-[[named_tools.parameters]]
-name = "id"
-param_type = "integer"
-description = "id"
-
-[[named_tools]]
-name = "t_unused_param"
-description = "Declared parameter not referenced by the statement"
-connection = "local-sqlite"
-statement = "SELECT id FROM orders WHERE id = ?1"
-read_only = true
-allowed_roles = ["*"]
-[[named_tools.parameters]]
-name = "id"
-param_type = "integer"
-description = "id"
-[[named_tools.parameters]]
-name = "extra"
-param_type = "string"
-description = "unused"
-
-[[named_tools]]
 name = "t_noroles"
 description = "allowed_roles omitted"
 connection = "local-sqlite"
@@ -287,7 +259,7 @@ statement = "SELECT 1 AS one"
 read_only = true
 `;
 
-const NAMED_TOOL_COUNT = 2 + 14; // 2 example tools + 14 appended above
+const NAMED_TOOL_COUNT = 2 + 12; // 2 example tools + 12 appended above
 
 // ---------------------------------------------------------------------------------------------
 // Minimal config object for the JSON / YAML variants (mirrors the TOML shape)
@@ -452,7 +424,7 @@ async function main() {
     await check("07.22", "json param: null counts as missing for a required param", () =>
       expectInvalid("null json", "t_types", { i: 1, s: "x", f: 1.5, b: true, j: null }, /Missing required parameter 'j'/));
     await check("07.23", "non-object `arguments` (array) is rejected as INVALID_ARGUMENT", async () => {
-      // KNOWN-BUG: NT-05 - crates/db-mcp-mcp/src/lib.rs run_named_tool arm does `.as_object()...unwrap_or_default()`,
+      // FIXED (was NT-05) - crates/db-mcp-mcp/src/lib.rs run_named_tool arm does `.as_object()...unwrap_or_default()`,
       // silently treating a non-object `arguments` as {} (NamedToolInvocation::from_json_args would reject it).
       const p = await S.named("t_all_defaults", [1]);
       denied(p, "INVALID_ARGUMENT", "array arguments");
@@ -527,13 +499,17 @@ async function main() {
       assert.equal(q.rows[0][1], "bob@example.com");
     });
 
-    // ---------------- 6b. statement/param mismatch at call time ----------------------------
-    await check("07.34", "statement referencing ?2 with one declared param fails at call time with ADAPTER_ERROR (config accepted it)", async () => {
-      const p = denied(await S.named("t_two_placeholders", { id: 101 }), "ADAPTER_ERROR", "?2");
-      assert.match(p.message, /parameters/i);
+    // ---------------- 6b. statement/param mismatch ------------------------------------------
+    // NT-02 fixed: such tools are now rejected when the config loads (07.56/07.57), so they never reach call time.
+    await check("07.34", "statement/parameter arity mismatch is rejected at load, not at call time (see 07.56)", async () => {
+      const p = await S.named("t_two_placeholders", { id: 101 });
+      assert.equal(p.status, "denied");
+      assert.match(p.message, /not registered/i);
     });
-    await check("07.35", "declared-but-unused param fails at call time with ADAPTER_ERROR (config accepted it)", async () => {
-      denied(await S.named("t_unused_param", { id: 101, extra: "x" }), "ADAPTER_ERROR", "unused");
+    await check("07.35", "declared-but-unused parameter is rejected at load, not at call time (see 07.57)", async () => {
+      const p = await S.named("t_unused_param", { id: 101, extra: "x" });
+      assert.equal(p.status, "denied");
+      assert.match(p.message, /not registered/i);
     });
 
     // ---------------- 6c. discovery --------------------------------------------------------
@@ -623,7 +599,7 @@ async function main() {
     return "GAP: AuditEvent has no params field at all (sanitize_audit_parameters is unused), so 'redacted params' are simply absent";
   });
   await check("07.47", "pre-execution denials (type/role/unknown-tool) of run_named_tool are audited", async () => {
-    // KNOWN-BUG: NT-03 - crates/db-mcp-mcp/src/lib.rs:577-596 returns `?` errors from named_tools.get()/get_authorized_adapter()/
+    // FIXED (was NT-03) - crates/db-mcp-mcp/src/lib.rs:577-596 returns `?` errors from named_tools.get()/get_authorized_adapter()/
     // validate_and_bind() before execute_governed() is reached, so these denials never produce an AuditEvent.
     const internDenied = auditEvents.filter((e) => e.role === "intern" && e.decision !== "allowed");
     assert.ok(internDenied.length >= 2, `expected audited intern denials, found ${internDenied.length}`);
@@ -661,18 +637,18 @@ async function main() {
   await check("07.54", "verify-config rejects a default_value whose type does not match param_type", () =>
     expectReject("bad default", vcCase("bad_default", tool(`name="x"\ndescription="a"\nconnection="local-sqlite"\nstatement="SELECT ?1"\n[[named_tools.parameters]]\nname="p"\nparam_type="integer"\ndescription="d"\nrequired=false\ndefault_value="zero"`)), /expected type Integer, got string/));
   await check("07.55", "verify-config rejects duplicate named-tool names", () => {
-    // KNOWN-BUG: NT-01 - NamedToolRegistry::register (crates/db-mcp-tools/src/lib.rs:236) does BTreeMap::insert, so a
+    // FIXED (was NT-01) - NamedToolRegistry::register (crates/db-mcp-tools/src/lib.rs:236) does BTreeMap::insert, so a
     // duplicate silently replaces the earlier definition (last one wins, confirmed at call time) instead of failing.
     const dup = tool(`name="dup"\ndescription="a"\nconnection="local-sqlite"\nstatement="SELECT 1 AS a"`) + tool(`name="dup"\ndescription="b"\nconnection="local-sqlite"\nstatement="SELECT 2 AS b"`);
     return expectReject("dup", vcCase("dup", dup), /duplicate/i);
   });
   await check("07.56", "verify-config rejects a statement referencing ?2 with only one declared parameter", () => {
-    // KNOWN-BUG: NT-02 - no placeholder/parameter arity check at registration (crates/db-mcp-tools/src/lib.rs:178-238);
+    // FIXED (was NT-02) - no placeholder/parameter arity check at registration (crates/db-mcp-tools/src/lib.rs:178-238);
     // the mismatch only surfaces at call time as ADAPTER_ERROR (see 07.34/07.35).
     return expectReject("?2", vcCase("ph_mismatch", tool(`name="x"\ndescription="a"\nconnection="local-sqlite"\nstatement="SELECT ?1, ?2"\n[[named_tools.parameters]]\nname="p"\nparam_type="integer"\ndescription="d"`)), /parameter/i);
   });
   await check("07.57", "verify-config rejects a declared parameter that the statement never references", () => {
-    // KNOWN-BUG: NT-02 (same root cause as 07.56)
+    // FIXED (was NT-02) (same root cause as 07.56)
     return expectReject("unused", vcCase("unused_param", tool(`name="x"\ndescription="a"\nconnection="local-sqlite"\nstatement="SELECT ?1"\n[[named_tools.parameters]]\nname="p"\nparam_type="integer"\ndescription="d"\n[[named_tools.parameters]]\nname="q"\nparam_type="integer"\ndescription="d"`)), /parameter/i);
   });
 

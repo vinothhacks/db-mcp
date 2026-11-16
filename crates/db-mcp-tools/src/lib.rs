@@ -233,6 +233,34 @@ impl NamedToolRegistry {
             }
         }
 
+        // Every declared parameter must be bound by exactly one placeholder position and vice versa,
+        // otherwise the mismatch only surfaces as an adapter error at call time.
+        let declared = spec.parameters.len();
+        let (numbered, bare) = placeholder_positions(&spec.statement);
+        let arity_ok = if numbered.is_empty() {
+            bare == declared
+        } else {
+            numbered.iter().copied().eq(1..=declared)
+        };
+        if !arity_ok {
+            let found = if numbered.is_empty() {
+                format!("{bare} positional '?' placeholder(s)")
+            } else {
+                let list: Vec<String> = numbered.iter().map(|n| format!("?{n}")).collect();
+                format!("placeholders {}", list.join(", "))
+            };
+            return Err(DbMcpError::ConfigurationError(format!(
+                "Named tool '{name}' declares {declared} parameter(s) but its statement uses {found}; \
+                 placeholders must be ?1..?{declared} (or {declared} bare '?')"
+            )));
+        }
+
+        if self.tools.contains_key(name) {
+            return Err(DbMcpError::ConfigurationError(format!(
+                "Duplicate named tool '{name}': each named tool must have a unique name"
+            )));
+        }
+
         self.tools.insert(name.to_string(), spec);
         Ok(())
     }
@@ -402,6 +430,57 @@ impl NamedToolRegistry {
             NamedToolInvocation::from_json_args(request_id, tool_name, caller, arguments)?;
         self.execute(adapter, invocation, default_limits).await
     }
+}
+
+/// Positional placeholders used by a statement, ignoring quoted text and comments:
+/// the set of numbered `?N` / `$N` indices and the count of bare `?`.
+fn placeholder_positions(sql: &str) -> (std::collections::BTreeSet<usize>, usize) {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut numbered = std::collections::BTreeSet::new();
+    let mut bare = 0usize;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\'' | '"' | '`' => {
+                i += 1;
+                while i < chars.len() && chars[i] != c {
+                    i += 1;
+                }
+            }
+            '-' if chars.get(i + 1) == Some(&'-') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if chars.get(i + 1) == Some(&'*') => {
+                i += 2;
+                while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                    i += 1;
+                }
+                i += 1;
+            }
+            '?' | '$' => {
+                let start = i + 1;
+                let mut end = start;
+                while end < chars.len() && chars[end].is_ascii_digit() {
+                    end += 1;
+                }
+                if end > start {
+                    if let Ok(n) = chars[start..end].iter().collect::<String>().parse::<usize>() {
+                        numbered.insert(n);
+                    }
+                    i = end;
+                    continue;
+                } else if c == '?' {
+                    bare += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (numbered, bare)
 }
 
 fn analyze_named_tool_statement(statement: &str) -> DbMcpResult<db_mcp_sql::SqlAnalysis> {

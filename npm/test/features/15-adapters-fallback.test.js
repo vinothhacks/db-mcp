@@ -165,33 +165,30 @@ async function sectionTruthInAdvertising(s) {
       assert.equal(sel.status, "ok");
       assert.deepEqual(sel.rows, [[1]]);
     });
-    // KNOWN-BUG: F15-01 nothing in any response says the backend is an embedded SQLite simulation
+    // KNOWN-BUG: F15-01 (list_connections only) list_connections carries no simulated flag or warning
     await check(`${id}: list_connections entry discloses the backend is simulated/embedded`, () => {
       assert.ok(discloses(byId[id]), `no disclosure field in ${JSON.stringify(byId[id]).slice(0, 200)}`);
     }, { knownBug: "F15-01" });
-    // KNOWN-BUG: F15-01
     await check(`${id}: execute_query warnings disclose that rows did not come from a live server`, () => {
       assert.ok(Array.isArray(sel.warnings));
       assert.ok(sel.warnings.some((w) => discloses(w)), `warnings=${JSON.stringify(sel.warnings)}`);
-    }, { knownBug: "F15-01" });
+    });
     const objs = await s.call("search_objects", { connection: id, limit: 5 });
     const plan = await s.call("explain_query", { connection: id, sql: "SELECT * FROM orders WHERE user_id = 1" });
-    // KNOWN-BUG: F15-01
     await check(`${id}: search_objects and explain_query disclose the simulated backend`, () => {
       assert.equal(objs.status, "ok");
       assert.equal(plan.status, "ok");
       assert.ok(discloses(objs) || discloses(objs.warnings), "search_objects has no disclosure");
       assert.ok(discloses(plan.data.warnings) || discloses(plan.warnings), "explain_query has no disclosure");
-    }, { knownBug: "F15-01" });
+    });
   }
 
   const health = {};
   for (const id of ["prod-postgres", "analytics-mysql", "local-sqlite"]) health[id] = await s.call("database_health", { connection: id });
-  // KNOWN-BUG: F15-02 database_health returns identical fabricated telemetry for every engine
   await check("database_health on prod-postgres discloses that telemetry is synthetic (not pg_stat_*)", () => {
     assert.equal(health["prod-postgres"].status, "ok");
     assert.ok(discloses(health["prod-postgres"]), `report=${JSON.stringify(health["prod-postgres"].data).slice(0, 160)}`);
-  }, { knownBug: "F15-02" });
+  });
   // KNOWN-BUG: F15-02 supports_health_diagnostics=false for MySQL, yet a fabricated report is returned
   await check("database_health on analytics-mysql is refused (capabilities.supports_health_diagnostics=false)", () => {
     assert.equal(byId["analytics-mysql"].capabilities.supports_health_diagnostics, false);
@@ -206,6 +203,20 @@ async function sectionTruthInAdvertising(s) {
   }, { knownBug: "F15-02" });
   info(`database_health numbers: pg active=${health["prod-postgres"].data.active_connections} hit=${health["prod-postgres"].data.cache_hit_ratio} dead=${health["prod-postgres"].data.dead_tuples_total}; mysql active=${health["analytics-mysql"].data && health["analytics-mysql"].data.active_connections}; sqlite dead=${health["local-sqlite"].data.dead_tuples_total}`);
 
+  // Disclosure on every remaining tool (v0.2.1 stamps a simulated-engine warning in the envelope).
+  const lineage = await s.call("get_procedure_call_graph", { connection: "prod-postgres" });
+  const onto = await s.call("ontology_status", { connection: "prod-postgres" });
+  const disc = await s.call("discover_ontology", { connection: "prod-postgres" });
+  const lineageSqlite = await s.call("get_procedure_call_graph", { connection: "local-sqlite" });
+  await check("get_procedure_call_graph / ontology_status / discover_ontology on simulated pg carry the simulation warning; sqlite does not", () => {
+    for (const r of [lineage, onto, disc]) assert.ok((r.warnings || []).some((w) => /embedded simulated postgres engine/.test(w)), JSON.stringify(r.warnings));
+    assert.ok(!(lineageSqlite.warnings || []).some(discloses), JSON.stringify(lineageSqlite.warnings));
+  });
+  const myRoutines = await s.call("search_objects", { connection: "analytics-mysql", object_types: ["function", "procedure"], detail_level: "names", limit: 50 });
+  // KNOWN-BUG: F02-06 simulated MySQL seeds 4 demo routines (bootstrap_mysql_system_tables) that no init_sql defined
+  await check("analytics-mysql defines no routines in init_sql, so the catalog lists none (no phantom demo routines)", () => {
+    assert.deepEqual(myRoutines.data.objects.map((o) => o.name), []);
+  }, { knownBug: "F02-06" });
   const ver = await s.call("execute_query", { connection: "prod-postgres", sql: "SELECT version()" });
   // KNOWN-BUG: F15-05 (dialect) a real PostgreSQL answers; the simulation leaks a SQLite error
   await check("prod-postgres: SELECT version() returns a PostgreSQL version string", () => {
@@ -246,11 +257,10 @@ async function sectionLivePath() {
     assert.ok(conns.some((c) => c.bytes > 0), "zero bytes were ever sent on any probe connection");
     assert.ok(conns.some((c) => c.hex.includes("00030000")), "no StartupMessage protocol marker");
   }, { knownBug: "F15-03" });
-  // KNOWN-BUG: F15-03 even when the server is reachable, rows come from the embedded engine with no disclosure
   await check("with a reachable server, results are either from that server or carry an explicit simulation warning", () => {
     assert.equal(r1.status, "ok");
     assert.ok(r1.warnings.some(discloses) || r2.warnings.some(discloses), `warnings=${JSON.stringify(r1.warnings)}`);
-  }, { knownBug: "F15-03" });
+  });
   await sL.stop();
   srv.close();
 
@@ -421,7 +431,7 @@ async function sectionDialects(s) {
   await check("mysql: unsupported MySQL-isms fail closed with ADAPTER_ERROR (no fabricated result sets)", async () => {
     for (const sql of myCleanErrorCases) {
       const r = await my(sql);
-      assert.notEqual(r.status, "ok", `${sql} returned ok with ${JSON.stringify(r.rows).slice(0, 80)}`);
+      assert.notEqual(r.status, "ok", `${sql} returned ok with ${JSON.stringify(r.rows || null).slice(0, 80)}`);
       assert.equal(r.code, "ADAPTER_ERROR", `${sql}: ${r.code}`);
     }
   });

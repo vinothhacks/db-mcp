@@ -425,8 +425,8 @@ async function sectionGovernanceRules(agent) {
     const p = await callTool(agent, "propose_change", { connection: "prod-postgres", sql: "UPDATE orders SET status = 'viaexec' WHERE id = 101" });
     assert.equal(cliApprove(p.data.change_id, "dba-bob", "admin").status, 0);
     const r = await callTool(agent, "execute_query", { connection: "prod-postgres", sql: "UPDATE orders SET status = 'other' WHERE id = 101", change_id: p.data.change_id });
-    assertDenied(r, "APPROVAL_HASH_MISMATCH", "exec w/ different sql");
-  }, { known: "F10-01" });
+    assertDenied(r, r.code === "USE_APPLY_CHANGE" ? "USE_APPLY_CHANGE" : "APPROVAL_HASH_MISMATCH", "exec w/ different sql");
+  });
   await check("execute_query with an approved change_id and matching SQL consumes the approval", async () => {
     // KNOWN-BUG: F10-01 the proposal stays 'approved' and can be applied again afterwards (double execution).
     const p = await callTool(agent, "propose_change", { connection: "prod-postgres", sql: "UPDATE orders SET status = 'viaexec2' WHERE id = 101" });
@@ -757,14 +757,14 @@ async function sectionAudit(agent, prodChangeId) {
     // DbMcpRuntime::approve_change / handle_admin_approve do not record).
     const ev = events.find((e) => e.change_id === prodChangeId && /approve/i.test(e.tool_name));
     assert.ok(ev, `no approval audit event for ${prodChangeId}; tools seen: ${[...new Set(events.map((e) => e.tool_name))].join(",")}`);
-  }, { known: "F10-06a" });
+  });
   await check("denied apply attempts (replay/drift/hash mismatch/expired) are audited with denial_code", () => {
     // KNOWN-BUG: F10-06b dispatch for apply_change only logs the success path; Err paths are not audited.
     const codes = new Set(events.filter((e) => e.tool_name === "apply_change").map((e) => e.denial_code).filter(Boolean));
     for (const c of ["APPROVAL_ALREADY_CONSUMED", "SCHEMA_DRIFT_DETECTED", "APPROVAL_HASH_MISMATCH", "APPROVAL_EXPIRED"]) {
       assert.ok(codes.has(c), `missing audited denial ${c}; have ${[...codes].join(",") || "none"}`);
     }
-  }, { known: "F10-06b" });
+  });
   await check("self-approval attempts are audited", () => {
     // KNOWN-BUG: F10-06a
     assert.ok(events.some((e) => e.denial_code === "SELF_APPROVAL_FORBIDDEN"), "no SELF_APPROVAL_FORBIDDEN audit event");

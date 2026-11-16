@@ -116,7 +116,9 @@ impl DbMcpError {
             Self::SelfApprovalForbidden(_) => Some("db-mcp approve --change-id <id> --approver <admin>"),
             Self::ApprovalAlreadyConsumed(_) | Self::ApprovalExpired(_) => Some("propose_change"),
             Self::ApprovalHashMismatch(_) | Self::SchemaDriftDetected(_) => Some("capture_schema"),
-            Self::ConnectionNotFound(_) => Some("list_connections"),
+            Self::ConnectionNotFound(_) | Self::Unauthorized(_) => Some("list_connections"),
+            Self::InvalidArgument(_) => Some("tools/list"),
+            Self::SqlParseError(_) => Some("explain_query"),
             _ => None,
         }
     }

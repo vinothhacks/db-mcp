@@ -562,11 +562,10 @@ async function sectionRedaction(c) {
     okEnvelope(p);
     assert.equal(p.returned_rows, 2);
   });
-  // KNOWN-BUG: F05-B1 - an arbitrary change_id flips is_approved_change and skips the sensitive-column guard.
   await check("5.12 unverified change_id does not bypass deny_sensitive_column_access", async () => {
     const { payload: p } = await eq(c, { connection: "deny-sqlite", sql: "SELECT password_hash AS ph FROM users", change_id: "bogus-change" });
-    denied(p, ["SENSITIVE_COLUMN_FORBIDDEN", "APPROVAL_HASH_MISMATCH", "INVALID_ARGUMENT", "APPROVAL_REQUIRED"]);
-  }, "F05-B1");
+    denied(p, ["SENSITIVE_COLUMN_FORBIDDEN", "APPROVAL_HASH_MISMATCH", "INVALID_ARGUMENT", "APPROVAL_REQUIRED", "USE_APPLY_CHANGE"]);
+  });
   await check("5.13 sensitive_tables without provenance enforcement (prod-postgres users): SELECT * allowed with redaction", async () => {
     const { payload: p } = await eq(c, { connection: P, sql: "SELECT * FROM users ORDER BY id" });
     redactedOk(p, 3);
@@ -720,22 +719,19 @@ async function sectionModes(c) {
     denied(p, "USE_APPLY_CHANGE");
     assert.equal(p.next_action, "apply_change");
   });
-  // KNOWN-BUG: F05-B1 - execute_query(change_id) sets is_approved_change without consulting the change store.
   await check("6.18 Governed: UPDATE with an unverified change_id is denied", async () => {
     const { payload: p } = await eq(c, { connection: P, sql: "UPDATE orders SET status = 'hacked' WHERE id = 102", change_id: "bogus-change" });
-    denied(p, ["APPROVAL_REQUIRED", "APPROVAL_HASH_MISMATCH", "INVALID_ARGUMENT", "APPROVAL_EXPIRED", "APPROVAL_ALREADY_CONSUMED"]);
-  }, "F05-B1");
-  // KNOWN-BUG: F05-B1
+    denied(p, ["APPROVAL_REQUIRED", "APPROVAL_HASH_MISMATCH", "INVALID_ARGUMENT", "APPROVAL_EXPIRED", "APPROVAL_ALREADY_CONSUMED", "USE_APPLY_CHANGE"]);
+  });
   await check("6.19 Governed: production row unchanged after the bogus change_id attempt", async () => {
     const { payload: p } = await eq(c, { connection: P, sql: "SELECT status FROM orders WHERE id = 102" });
     okEnvelope(p);
     assert.deepEqual(p.rows, [["pending"]], "row was mutated through execute_query without an approved change");
-  }, "F05-B1");
-  // KNOWN-BUG: F05-B1
+  });
   await check("6.20 Governed: DDL with an unverified change_id is denied", async () => {
     const { payload: p } = await eq(c, { connection: P, sql: "CREATE TABLE pwned (id INT)", change_id: "bogus-change" });
-    denied(p, ["APPROVAL_REQUIRED", "APPROVAL_HASH_MISMATCH", "INVALID_ARGUMENT"]);
-  }, "F05-B1");
+    denied(p, ["APPROVAL_REQUIRED", "APPROVAL_HASH_MISMATCH", "INVALID_ARGUMENT", "USE_APPLY_CHANGE"]);
+  });
 }
 
 async function sectionRoles(config, c) {

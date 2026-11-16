@@ -182,11 +182,13 @@ function buildMainConfig() {
       const m = text.match(/id = "local-sqlite"[\s\S]*?init_sql = """([\s\S]*?)"""/);
       assert.ok(m, "could not locate local-sqlite init_sql in example config");
       const init = m[1];
-      const stmts = init.split(";\n").map((s) => s.trim()).filter(Boolean);
-      const drops = stmts.filter((s) => /^DROP /.test(s));
-      const creates = stmts.filter((s) => /^CREATE TABLE/.test(s));
-      const rest = stmts.filter((s) => !/^DROP /.test(s) && !/^CREATE TABLE/.test(s));
-      const reversed = [...drops, ...creates.slice().reverse(), ...rest].join(";\n") + ";\n";
+      // Reverse only the CREATE TABLE blocks in place; leave every other byte (routine bodies' indentation) untouched.
+      const tableRe = /CREATE TABLE[\s\S]*?\);\r?\n/g;
+      const tables = init.match(tableRe) || [];
+      assert.ok(tables.length > 1, "no CREATE TABLE blocks found in fixture init_sql");
+      const rev = tables.slice().reverse();
+      let k = 0;
+      const reversed = init.replace(tableRe, () => rev[k++]);
       const extra =
         sqliteConnectionToml("sqlite-b", path.join(dir, "b.db"), reversed, "same schema, reverse creation order") +
         sqliteConnectionToml("sqlite-c", path.join(dir, "c.db"), "DROP TRIGGER IF EXISTS trg_orders_audit;\n" + init + TRIGGER_SQL, "fixture plus trigger");
@@ -326,7 +328,7 @@ async function main() {
     assert.equal(so.status, "ok");
     assert.equal(so.data.objects.length, 0, "search_objects hides internal_secrets");
     assert.equal(byName(a0.data, "internal_secrets"), undefined, "capture_schema must also hide internal_secrets");
-  }, "F11-02"); // KNOWN-BUG: F11-02 capture_schema arm (db-mcp-mcp lib.rs ~719) does not apply cfg.is_restricted_table
+  });
 
   await check("snapshot content: fixture payload size is modest (< 64 KiB)", () => {
     const bytes = Buffer.byteLength(JSON.stringify(a0.data));
@@ -738,7 +740,7 @@ async function main() {
     const r = await diff({ base_snapshot: pg.data, target_connection: "local-sqlite" });
     assert.equal(r.status, "ok");
     assert.ok(r.warnings.some((w) => /engine/i.test(w)), `expected engine mismatch warning, got ${JSON.stringify(r.warnings)}`);
-  }, "F11-06");
+  });
 
   // ------------------------------------------------------------------ 9. denials
   await check("denials: unknown connection -> CONNECTION_NOT_FOUND with next_action=list_connections for capture_schema and both diff sides", async () => {
@@ -787,7 +789,7 @@ async function main() {
     note(`audit tool_names seen: ${[...tools].join(", ")} (${events.length} events)`);
     assert.ok(tools.has("capture_schema"), "no capture_schema audit events");
     assert.ok(tools.has("diff_schema"), "no diff_schema audit events");
-  }, "F11-10"); // KNOWN-BUG: F11-10 capture_schema/diff_schema arms never call self.log_audit (lineage tools do)
+  });
 
   // ------------------------------------------------------------------ 11. profile gating
   await check("profile gating: without the Schema profile both tools are absent from tools/list and calls return TOOL_NOT_ENABLED", async () => {

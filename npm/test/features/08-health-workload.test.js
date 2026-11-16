@@ -244,12 +244,11 @@ async function main() {
   // HealthTelemetrySnapshot::default() because the live probe (pg_stat_activity,
   // pg_stat_user_tables, current_setting) fails on the embedded simulation and the error is
   // swallowed. The response must say so.
-  // KNOWN-BUG: F08-03
   check("health/pg: response discloses that telemetry is simulated/default, not measured (warning or data.telemetry_source)", () => {
     const text = JSON.stringify(pgH.warnings) + JSON.stringify(pgH.data.telemetry_source || "") + JSON.stringify(pgH.data.source || "");
     assert.match(text, /simulat|synthetic|default|not measured|unavailable|fallback/i,
       `no simulation/default disclosure; warnings=${JSON.stringify(pgH.warnings)}`);
-  }, "KNOWN-BUG: F08-03");
+  });
 
   // ======================= 2. database_health on local-sqlite =======================
   const sqH = await s.call("database_health", { connection: "local-sqlite" });
@@ -365,11 +364,10 @@ async function main() {
   }, "KNOWN-BUG: F08-07");
 
   // Restricted tables must never surface in diagnostics (search_objects / describe_object already hide them).
-  // KNOWN-BUG: F08-06
   check("workload/pg: restricted table internal_secrets never appears in synthesized workload / hot_tables", () => {
     const text = JSON.stringify(wl1000.body);
     assert.ok(!/internal_secrets/.test(text), "restricted table leaked into analyze_workload output");
-  }, "KNOWN-BUG: F08-06");
+  });
 
   // The simulation seeds __pg_stat_statements (q_1001, q_1002) and has_pg_stat_statements=true,
   // yet the engine queries `pg_stat_statements` (unmapped) and silently falls back to a synthetic profile.
@@ -382,14 +380,13 @@ async function main() {
     assert.equal(d.top_queries[0].query_id, "q_1001"); // 4250ms total > 1200ms total
   }, "KNOWN-BUG: F08-08");
 
-  // KNOWN-BUG: F08-08
   check("workload/pg: output never contradicts the connection capability (supports_workload_analysis=true but notes claim pg_stat_statements inactive)", () => {
     const pgCaps = connList.body.data.find((c) => c.id === "prod-postgres").capabilities;
     assert.equal(pgCaps.supports_workload_analysis, true);
     const claimsInactive = (wlDefault.body.data.notes || []).some((n) => /not active/i.test(n));
     assert.ok(!claimsInactive || wlDefault.body.warnings.length > 0,
       `notes say pg_stat_statements inactive while capability says supported, and warnings=[]`);
-  }, "KNOWN-BUG: F08-08");
+  });
 
   // ======================= 3b. analyze_workload on sqlite / mysql (no history yet) =======================
   const sqWl0 = await s.call("analyze_workload", { connection: "local-sqlite" });
@@ -464,13 +461,12 @@ async function main() {
   });
 
   // Literal values (including secrets) must be normalized/redacted in query fingerprints.
-  // KNOWN-BUG: F08-05
   check("telemetry/pg: query fingerprints are normalized - literal secrets from SQL are NOT echoed in analyze_workload output", () => {
     const text = JSON.stringify(wlPg.body);
     assert.ok(!text.includes(SECRET), `secret literal echoed in analyze_workload response`);
     assert.ok(!text.includes("hash_alice_secret"), `password_hash literal echoed`);
     assert.ok(!text.includes("'pending'"), `string literal not parameterized`);
-  }, "KNOWN-BUG: F08-05");
+  });
 
   // ======================= 4. denials: unknown connection / missing argument =======================
   const dUnknownH = await s.call("database_health", { connection: "does-not-exist" });
@@ -514,7 +510,6 @@ async function main() {
 
   // Neither Diagnose tool calls log_audit (crates/db-mcp-mcp/src/lib.rs:614-634), so the audit trail
   // has no trace of the 20+ health/workload calls above.
-  // KNOWN-BUG: F08-04
   check("audit: each database_health / analyze_workload call (allowed and denied) produces an audit record", () => {
     const health = audit.filter((r) => r.tool_name === "database_health");
     const workload = audit.filter((r) => r.tool_name === "analyze_workload");
@@ -522,7 +517,7 @@ async function main() {
     const expectedWorkload = latencies.filter((l) => l.name === "analyze_workload").length;
     assert.equal(health.length, expectedHealth, `database_health audit records: ${health.length} of ${expectedHealth}`);
     assert.equal(workload.length, expectedWorkload, `analyze_workload audit records: ${workload.length} of ${expectedWorkload}`);
-  }, "KNOWN-BUG: F08-04");
+  });
 
   // ======================= 3d. persistence across restart =======================
   s = await openSession(iso.configPath);

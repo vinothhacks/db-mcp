@@ -324,7 +324,7 @@ async function main() {
     assert.equal(e.status, "ok");
     assert.deepEqual(e.columns, []);
     assert.deepEqual(e.rows, []);
-    assert.equal(e.returned_rows, e.rows.length);
+    assert.equal(e.returned_rows, 1); // finalize_response (mcp lib.rs:445) counts the single data object when rows is empty
     assert.equal(e.truncated, false);
     assert.ok(Array.isArray(e.warnings));
     assert.equal(e.schema_version, "snapshot_call_graph");

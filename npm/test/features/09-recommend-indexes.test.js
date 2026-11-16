@@ -199,7 +199,7 @@ async function main() {
   });
   await check("honesty: prod-postgres response warns that backend is simulated / costs synthetic", async () => {
     assert.ok(base.warnings.some((w) => /simulat|synthetic|not (a )?live/i.test(w)), `warnings=${JSON.stringify(base.warnings)}`);
-  }, { knownBug: "F09-01" });
+  });
   await check("honesty: hypopg_validated only true when a hypothetical index was really evaluated", async () => {
     // Correct behaviour: a HypoPG-validated estimate must differ from the pure heuristic estimate
     // (base * 0.08, floor 1.5) that the has_hypopg=false path produces for the same query.
@@ -432,7 +432,7 @@ async function main() {
     else isDenied(p, ["RESTRICTED_TABLE_FORBIDDEN", "RESTRICTED_TABLE"]);
     const w = await ri([]);
     assert.equal(recsFor(w, "internal_secrets").length, 0, "workload fallback lists restricted table");
-  }, { knownBug: "F09-20" });
+  });
 
   // ---- 4. engines ---------------------------------------------------------------------------
   let sqliteRec = null;
@@ -479,7 +479,7 @@ async function main() {
     const jsonl = fs.readFileSync(path.join(auditDir, "audit.jsonl"), "utf8");
     assert.match(jsonl, /"tool_name":"explain_query"/, "audit sink not writing at all");
     assert.match(jsonl, /"tool_name":"recommend_indexes"/, "no recommend_indexes audit event");
-  }, { knownBug: "F09-21" });
+  });
 }
 
 async function shutdown() {
