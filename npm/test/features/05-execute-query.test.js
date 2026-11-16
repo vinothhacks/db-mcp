@@ -529,6 +529,17 @@ async function sectionRedaction(c) {
   await leak("5.06 concatenation with sensitive column does not leak", "SELECT email || ':' || password_hash AS creds FROM users");
   await leak("5.07 sensitive column re-aliased through a subquery does not leak", "SELECT ph FROM (SELECT password_hash AS ph FROM users)");
   await leak("5.07b sensitive column in a later UNION branch does not leak", "SELECT 'x' AS k UNION SELECT password_hash FROM users");
+  // Untracked provenance (wildcard in a later set-operation branch) is only refused when a source table
+  // actually holds a sensitive column; the server checks the live catalog before denying.
+  await check("5.07c wildcard set operation over tables without sensitive columns is allowed (catalog-verified)", async () => {
+    const { payload: p } = await eq(c, { connection: L, sql: "SELECT * FROM orders UNION ALL SELECT * FROM orders" });
+    assert.equal(p.status, "ok", JSON.stringify(p).slice(0, 300));
+  });
+  await check("5.07d wildcard set operation reading a table with a sensitive column is denied", async () => {
+    const { payload: p } = await eq(c, { connection: L, sql: "SELECT * FROM orders UNION ALL SELECT * FROM users" });
+    denied(p, "UNPROVENANCED_SENSITIVE_QUERY", "wildcard over users");
+    assert.ok(!JSON.stringify(p).includes("hash_alice_secret"));
+  });
   await check("5.08 output column named like a sensitive column is redacted even for literals", async () => {
     const { payload: p } = await eq(c, { connection: L, sql: "SELECT 'k' AS api_key" });
     redactedOk(p);

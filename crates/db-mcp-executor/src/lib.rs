@@ -53,6 +53,11 @@ pub struct GovernedQueryRequest {
     pub is_named_tool: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub change_id: Option<String>,
+    /// Set by the caller after a fresh catalog lookup showed that no table the statement reads
+    /// has a sensitive column; untracked result provenance (wildcards in positional contexts,
+    /// column alias lists, whole-row references) can then not expose one.
+    #[serde(default)]
+    pub sources_verified_without_sensitive_columns: bool,
 }
 
 impl GovernedQueryRequest {
@@ -76,6 +81,7 @@ impl GovernedQueryRequest {
             is_approved_change: false,
             is_named_tool: false,
             change_id: None,
+            sources_verified_without_sensitive_columns: false,
         }
     }
 
@@ -112,6 +118,11 @@ impl GovernedQueryRequest {
     pub fn with_approved_change(mut self, change_id: impl Into<String>) -> Self {
         self.is_approved_change = true;
         self.change_id = Some(change_id.into());
+        self
+    }
+
+    pub fn with_sources_verified_without_sensitive_columns(mut self, verified: bool) -> Self {
+        self.sources_verified_without_sensitive_columns = verified;
         self
     }
 
@@ -428,6 +439,13 @@ impl BoundedExecutor {
         };
 
         // 2. Evaluate policy
+        let analysis = if request.sources_verified_without_sensitive_columns {
+            let mut analysis = analysis;
+            analysis.disclosure.untracked_provenance.clear();
+            analysis
+        } else {
+            analysis
+        };
         let evaluation = policy.evaluate_sql_with_context(
             &request.caller,
             &request.connection,

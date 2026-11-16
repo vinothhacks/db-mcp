@@ -578,6 +578,56 @@ impl DbMcpRuntime {
         Ok((objects, hidden))
     }
 
+    /// True when `sql` has untracked result provenance (a wildcard in a positional context, a
+    /// column alias list, a whole-row reference) but a fresh catalog lookup shows that every table
+    /// it references exists and none has a configured sensitive column, so the provenance guard
+    /// has nothing to protect. Any doubt (parse failure, unknown table, discovery error) is false.
+    async fn sources_free_of_sensitive_columns(
+        &self,
+        adapter: &dyn DatabaseAdapter,
+        connection: &str,
+        sql: &str,
+    ) -> bool {
+        let cfg = self.policy.effective_config(connection);
+        if cfg.sensitive_columns.is_empty() {
+            return false;
+        }
+        let Ok(analysis) = parse_and_analyze_sql(adapter.capabilities().engine, sql) else {
+            return false;
+        };
+        if analysis.disclosure.untracked_provenance.is_empty() || analysis.referenced_tables.is_empty() {
+            return false;
+        }
+        let Ok(catalog) = adapter
+            .discover(CatalogRequest {
+                connection: connection.to_string(),
+                schema_pattern: None,
+                name_pattern: None,
+                object_types: Vec::new(),
+                detail_level: CatalogDetailLevel::Full,
+                limit: 10_000,
+                offset: 0,
+            })
+            .await
+        else {
+            return false;
+        };
+        analysis.referenced_tables.iter().all(|table| {
+            let wanted = table.trim_matches(|c| c == '"' || c == '`').to_ascii_lowercase();
+            let base = wanted.rsplit('.').next().unwrap_or(&wanted).to_string();
+            let found = catalog.objects.iter().find(|o| {
+                matches!(
+                    o.object_type,
+                    CatalogObjectType::Table | CatalogObjectType::View | CatalogObjectType::MaterializedView
+                ) && (o.qualified_name().eq_ignore_ascii_case(&wanted) || o.name.eq_ignore_ascii_case(&base))
+            });
+            match found {
+                Some(obj) => !obj.columns.iter().any(|c| cfg.is_sensitive_column(Some(&obj.name), &c.name)),
+                None => false,
+            }
+        })
+    }
+
     /// Capture a schema snapshot over the policy-visible catalog only.
     async fn capture_allowed(
         &self,
@@ -1221,6 +1271,9 @@ impl DbMcpRuntime {
                         message: "execute_query does not accept change_id; approved proposals are executed via apply_change".to_string(),
                         next_action: Some("apply_change".to_string()),
                     });
+                }
+                if self.sources_free_of_sensitive_columns(adapter.as_ref(), &conn, &sql).await {
+                    gov_req = gov_req.with_sources_verified_without_sensitive_columns(true);
                 }
                 let result = self.executor.execute_governed(adapter.as_ref(), gov_req).await?;
                 self.pg_insights.record_query_execution(
