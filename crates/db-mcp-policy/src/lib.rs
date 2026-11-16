@@ -218,15 +218,16 @@ impl ConnectionPolicyConfig {
             return false;
         }
 
+        // The connection allowlist is authoritative: roles are self-asserted by the caller, so an
+        // admin/dba role gets no implicit bypass and must be listed like any other role.
         if !self.allowed_roles.is_empty() && !self.allowed_roles.iter().any(|r| r == "*") {
-            let role_ok = caller.is_admin()
-                || self.allowed_roles.iter().any(|allowed| {
-                    allowed.eq_ignore_ascii_case(&caller.role)
-                        || caller
-                            .roles
-                            .iter()
-                            .any(|cr| cr.eq_ignore_ascii_case(allowed))
-                });
+            let role_ok = self.allowed_roles.iter().any(|allowed| {
+                allowed.eq_ignore_ascii_case(&caller.role)
+                    || caller
+                        .roles
+                        .iter()
+                        .any(|cr| cr.eq_ignore_ascii_case(allowed))
+            });
             if !role_ok {
                 return false;
             }
@@ -1131,6 +1132,32 @@ mod tests {
                 .denial_code(),
             Some(CODE_UNAUTHORIZED_ROLE)
         );
+    }
+
+    #[test]
+    fn test_allowed_roles_has_no_admin_bypass() {
+        let cfg = ConnectionPolicyConfig::development("dev-db")
+            .with_allowed_roles(vec!["developer".to_string()]);
+        let engine = PolicyEngine::with_configs(OperatingMode::Development, vec![cfg]);
+        for role in ["dba", "admin", "DBA"] {
+            let caller = CallerIdentity::new("bob", role, vec!["*".to_string()], "stdio");
+            assert!(caller.is_admin());
+            assert!(!engine.can_access_connection(&caller, "dev-db"), "{role}");
+            assert_eq!(
+                engine.authorize_connection(&caller, "dev-db").denial_code(),
+                Some(CODE_UNAUTHORIZED_ROLE),
+                "{role}"
+            );
+        }
+        let developer = CallerIdentity::new("bob", "Developer", vec!["*".to_string()], "stdio");
+        assert!(engine.can_access_connection(&developer, "dev-db"));
+
+        // Listing an admin role still grants it access.
+        let listed = ConnectionPolicyConfig::development("dev-db")
+            .with_allowed_roles(vec!["developer".to_string(), "dba".to_string()]);
+        let engine = PolicyEngine::with_configs(OperatingMode::Development, vec![listed]);
+        let dba = CallerIdentity::new("bob", "dba", vec!["*".to_string()], "stdio");
+        assert!(engine.can_access_connection(&dba, "dev-db"));
     }
 
     #[test]

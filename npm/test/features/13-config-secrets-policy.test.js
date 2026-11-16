@@ -557,7 +557,7 @@ async function main() {
     const adm = await matrix(devOnly.p, "bob", "admin");
     assert.equal(dba.execute_query, "UNAUTHORIZED_ROLE", "role dba bypasses allowed_roles=[developer]");
     assert.equal(adm.execute_query, "UNAUTHORIZED_ROLE", "role admin bypasses allowed_roles=[developer]");
-  }, "KNOWN-BUG: F13-B11"); // CallerIdentity::is_admin() (admin|dba) short-circuits the allowlist in ConnectionPolicyConfig::can_access_connection (policy lib.rs:222)
+  }); // F13-B11 fixed: ConnectionPolicyConfig::can_access_connection has no admin/dba bypass of allowed_roles
   const aliceOnly = authCfg("auth-alice", ["*"], ["alice"]);
   await check("authz: allowed_principals=[alice] denies bob even with role admin (no admin bypass for principals)", async () => {
     const m = await matrix(aliceOnly.p, "bob", "admin");
