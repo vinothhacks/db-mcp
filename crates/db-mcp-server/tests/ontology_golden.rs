@@ -180,6 +180,42 @@ async fn ontology_end_to_end_golden_flow() {
     let wrong_pin = call(&h, "ask_semantic_question", json!({"connection": "local-sqlite", "question": "total order value by user role", "plan_hash": "deadbeef"}), &agent()).await;
     assert_eq!(wrong_pin["code"], "ONTOLOGY_PLAN_MISMATCH");
 
+    // ---- answers equal direct SQL; unsupported parts of a question are refused, never dropped ----
+    for (question, sql) in [
+        (
+            "total order value by user role for completed orders",
+            "SELECT u.role, SUM(o.total_cents) FROM orders o JOIN users u ON u.id = o.user_id WHERE o.status = 'completed' GROUP BY u.role ORDER BY 2 DESC",
+        ),
+        ("total order value where status is completed", "SELECT SUM(total_cents) FROM orders WHERE status = 'completed'"),
+        (
+            "total quantity by sku for completed orders",
+            "SELECT i.sku, SUM(i.quantity) FROM order_items i JOIN orders o ON o.id = i.order_id WHERE o.status = 'completed' GROUP BY i.sku ORDER BY 2 DESC",
+        ),
+        ("count of completed orders", "SELECT COUNT(*) FROM orders WHERE status = 'completed'"),
+    ] {
+        let ans = call(&h, "ask_semantic_question", json!({"connection": "local-sqlite", "question": question}), &agent()).await;
+        ok(&ans, question);
+        assert_eq!(ans["data"]["answered"], true, "{question}: {ans}");
+        let truth = call(&h, "execute_query", json!({"connection": "local-sqlite", "sql": sql}), &reviewer()).await;
+        ok(&truth, "truth query");
+        assert_eq!(ans["rows"], truth["rows"], "{question}: {ans}");
+    }
+    let filtered = call(&h, "ask_semantic_question", json!({"connection": "local-sqlite", "question": "total order value by user role for completed orders"}), &agent()).await;
+    assert_eq!(filtered["rows"], json!([["admin", 4500]]), "{filtered}");
+    for (question, why) in [
+        ("average order value", "certified metric 'order value' is a sum, not an average"),
+        ("total order value for pending orders", "'pending'"),
+        ("count of orders excluding completed orders", "'excluding'"),
+        ("how many order items", "does not name what certified metric"),
+    ] {
+        let ans = call(&h, "ask_semantic_question", json!({"connection": "local-sqlite", "question": question}), &agent()).await;
+        ok(&ans, question);
+        assert_eq!(ans["data"]["answered"], false, "{question}: {ans}");
+        assert_eq!(ans["data"]["plan"]["status"], "not_answerable", "{question}: {ans}");
+        let missing = ans["data"]["plan"]["missing"].to_string();
+        assert!(missing.contains(why), "{question}: {missing}");
+    }
+
     // ---- search / describe / relationships ----
     let s = call(&h, "search_terms", json!({"connection": "local-sqlite", "query": "revenue"}), &agent()).await;
     ok(&s, "search");

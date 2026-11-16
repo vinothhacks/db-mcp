@@ -61,6 +61,17 @@ Refusals keep `sql` empty and explain themselves in `missing`, for example
 `multiplicative join: main.orders -> main.order_items is one-to-many ...` or
 `'revenue' matches several certified metrics: ...`.
 
+The planner refuses instead of dropping part of a question:
+
+| Question (golden fixture ontology) | Result |
+| --- | --- |
+| `total order value by user role for completed orders` | answerable: dimension `user role`, filter `completed order` |
+| `total order value for pending orders` | `not_answerable`: `no certified filter, dimension or metric covers 'pending' ...` |
+| `count of orders that are not completed` | `not_answerable`: names `'not'` |
+| `average order value` | `not_answerable`: `certified metric 'order value' is a sum, not an average ...` |
+| `how many order items` | `not_answerable`: the sum of `quantity` is not named |
+| `order value by user` | `not_answerable`: `no certified attribute matches dimension 'user' ...` |
+
 ## Admin channel
 
 ```text

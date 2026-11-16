@@ -59,22 +59,37 @@ discovered --> proposed --> in_review --> certified --> published --> stale / de
 1. Authorize the caller on the connection; discover the catalog with restricted objects removed.
 2. Compute the live schema fingerprint and run the drift check (`stale` marking).
 3. Load the latest revision and its published definitions; drop definitions on restricted tables.
-4. Split the question into a metric phrase and dimension phrases (`by`, `per`, `for each`, ...).
+4. Split the question into a metric phrase, dimension phrases (`by`, `per`, `for each`, ...) and
+   trailing filter clauses (`for ...`, `where ...`, `with ...`, `... only`, `in ...`, `not ...`).
+   "total order value by user role for completed orders" has the dimension "user role" and the
+   filter clause "for completed orders". Questions with comparison operators (`!=`, `<>`, `<`,
+   `>`) are refused: filters are matched by name and cannot honour them.
 5. Rank metrics. Refuse when nothing matches, when only generic words match ("number", "total"),
    when two certified metrics both match exactly (ambiguity), or when the best match is stale.
-6. Attach certified filters whose distinctive words appear in the question, plus the metric's
-   default filters.
-7. Resolve dimensions to certified, non-sensitive attributes; prefer the one reachable with the
-   fewest joins among near-ties.
-8. Find the shortest path over published relationships only. Refuse any hop that is one-to-many
+   Also refuse when the question asks for an aggregation the metric does not compute
+   ("average", "mean", "min", "max", "median", "distinct" against a sum metric gives "certified
+   metric 'order value' is a sum, not an average"), and when the measure of a sum/avg/min/max
+   metric is not named ("how many order items" does not ask for the sum of `quantity`).
+6. Attach certified filters whose distinctive words appear in the metric phrase or a filter
+   clause, plus the metric's default filters. Refuse when a matching filter is stale, when filters
+   are joined with "or" (certified filters are always ANDed), or when two filters constrain the
+   same column with `eq`/`in`/`is_null`/`is_not_null`.
+7. Resolve dimensions to certified, non-sensitive attributes using only the dimension phrases.
+   The phrase must name the attribute ("by user" does not name "user role") with no words left
+   over; among near-ties prefer the one reachable with the fewest joins.
+8. Refuse when a word of the metric phrase or the filter clauses is covered by no used definition
+   (metric, filter or dimension) and is not question scaffolding ("show", "total", "sold", ...).
+   Words such as "pending", "2025", "not", "excluding" or "admin" are never dropped silently: the
+   refusal names them, so the caller can certify a filter or rephrase.
+9. Find the shortest path over published relationships only. Refuse any hop that is one-to-many
    relative to the metric grain (double counting).
-9. Emit SQL with aliases, minimal engine quoting, bound parameters (`?N`, `$N`, `?`), `GROUP BY`,
-   `ORDER BY`, `LIMIT`.
-10. Validate: one statement, `SELECT`, read-only, no privileged functions, no analyzer warnings,
+10. Emit SQL with aliases, minimal engine quoting, bound parameters (`?N`, `$N`, `?`), `GROUP BY`,
+    `ORDER BY`, `LIMIT`.
+11. Validate: one statement, `SELECT`, read-only, no privileged functions, no analyzer warnings,
     referenced tables exactly within the plan's allowlist.
-11. Re-verify each used definition's certification; compute `plan_hash` over SQL, params,
+12. Re-verify each used definition's certification; compute `plan_hash` over SQL, params,
     revision and schema fingerprint; record question evidence.
-12. `ask_semantic_question` executes through the governed executor with the caller's identity, so
+13. `ask_semantic_question` executes through the governed executor with the caller's identity, so
     connection policy, limits, redaction and auditing apply unchanged.
 
 ## Storage

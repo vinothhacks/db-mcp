@@ -15,7 +15,7 @@ use crate::model::{
     base_table_name, sha256_hex, slug, Aggregation, Cardinality, Definition, DefinitionBody,
     DefinitionKind, FilterOp, OntologyRevision,
 };
-use crate::retrieval::{normalized_phrase, rank, tokenize, ScoredDefinition};
+use crate::retrieval::{normalized_phrase, rank, stem, tokenize, tokenize_raw, ScoredDefinition};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -156,23 +156,225 @@ pub struct PlanRequest<'a> {
     pub schema_fingerprint: &'a str,
 }
 
-fn split_question(question: &str) -> (String, Vec<String>) {
-    let re = Regex::new(r"(?i)\b(?:grouped by|broken down by|split by|for each|by|per)\b").expect("static regex");
-    let lower = question.trim().trim_end_matches('?').to_string();
-    match re.find(&lower) {
-        Some(m) => {
-            let metric = lower[..m.start()].trim().to_string();
-            let dims_raw = lower[m.end()..].to_string();
-            let dims = Regex::new(r"(?i),|\band\b|&")
-                .expect("static regex")
-                .split(&dims_raw)
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            (metric, dims)
+/// A question split into the parts the compiler resolves separately.
+#[derive(Debug, Default, PartialEq)]
+struct QuestionParts {
+    /// Text before the first grouping marker: the metric plus any inline filter words
+    /// ("count of completed orders").
+    metric: String,
+    /// Grouping phrases after `by` / `per` / `for each` ..., with trailing filter clauses removed.
+    dimensions: Vec<String>,
+    /// Filter clauses that trail the grouping phrases ("for completed orders", "where ...",
+    /// "..., completed orders only"), keyword included so negations stay visible.
+    clauses: Vec<String>,
+}
+
+fn split_question(question: &str) -> QuestionParts {
+    let re = Regex::new(r"(?i)\b(?:grouped by|broken down by|split by|for each|for every|by|per)\b").expect("static regex");
+    let lower = question.trim().trim_end_matches('?').trim().to_string();
+    let Some(m) = re.find(&lower) else {
+        return QuestionParts { metric: lower, ..QuestionParts::default() };
+    };
+    let metric = lower[..m.start()].trim().to_string();
+    let tail = &lower[m.end()..];
+    // The first filter keyword ends the grouping phrases: "by user role for completed orders".
+    // "for each" / "for every" are grouping markers, not filters.
+    let clause_re = Regex::new(
+        r"(?i)\bfor\s+(?:each|every)\b|\b(?:for|where|whose|with|without|having|only|excluding|except|among|from|in|on|during|since|before|after|between|that|which|who|when|while|not)\b",
+    )
+    .expect("static regex");
+    let cut = clause_re
+        .find_iter(tail)
+        .find(|c| {
+            let w = c.as_str().to_ascii_lowercase();
+            !(w.starts_with("for") && w.len() > 3)
+        })
+        .map(|c| c.start());
+    let (dims_raw, mut clauses) = match cut {
+        Some(i) => (&tail[..i], vec![tail[i..].trim().to_string()]),
+        None => (tail, Vec::new()),
+    };
+    let mut dimensions: Vec<String> = Regex::new(
+        r"(?i),|;|&|\band\b|\bfor\s+(?:each|every)\b|\b(?:grouped by|broken down by|split by|by|per)\b",
+    )
+    .expect("static regex")
+    .split(dims_raw)
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+    .collect();
+    // Postfix "only" ("by user role, completed orders only") turns the last phrase into a filter.
+    if clauses.len() == 1 && clauses[0].eq_ignore_ascii_case("only") {
+        if let Some(last) = dimensions.pop() {
+            clauses[0] = format!("{last} only");
         }
-        None => (lower, Vec::new()),
     }
+    QuestionParts { metric, dimensions, clauses }
+}
+
+/// Words that never restrict or redefine an answer: question scaffolding, measure verbs,
+/// filter-clause keywords (their content is still checked) and aggregation words for the
+/// aggregation the metric already has. Compared after stemming.
+const NEUTRAL: &[&str] = &[
+    "total", "sum", "number", "count", "amount", "overall", "altogether", "combined", "grand",
+    "show", "list", "give", "tell", "get", "find", "return", "display", "calculate", "compute",
+    "report", "can", "could", "would", "will", "you", "i", "we", "our", "us", "my", "want", "need",
+    "know", "see", "sold", "placed", "made", "bought", "purchased", "spent", "earned", "generated",
+    "recorded", "have", "has", "had", "been", "being", "exist", "where", "whose", "having", "only",
+    "when", "breakdown",
+];
+
+/// Generic measure words that do not identify WHAT a metric measures.
+const MEASURE_GENERIC: &[&str] = &["total", "sum", "count", "number", "amount"];
+
+/// An aggregation the question explicitly asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AggRequest {
+    Avg,
+    Min,
+    Max,
+    Median,
+    Distinct,
+}
+
+impl AggRequest {
+    fn from_word(word: &str) -> Option<Self> {
+        match word {
+            "average" | "averages" | "avg" | "mean" => Some(Self::Avg),
+            "min" | "minimum" | "lowest" | "smallest" => Some(Self::Min),
+            "max" | "maximum" | "highest" | "largest" | "biggest" => Some(Self::Max),
+            "median" => Some(Self::Median),
+            "distinct" | "unique" => Some(Self::Distinct),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Avg => "an average",
+            Self::Min => "a minimum",
+            Self::Max => "a maximum",
+            Self::Median => "a median",
+            Self::Distinct => "a distinct count",
+        }
+    }
+
+    fn satisfied_by(self, agg: Aggregation) -> bool {
+        match self {
+            Self::Avg => agg == Aggregation::Avg,
+            Self::Min => agg == Aggregation::Min,
+            Self::Max => agg == Aggregation::Max,
+            Self::Median => false,
+            Self::Distinct => agg == Aggregation::CountDistinct,
+        }
+    }
+}
+
+fn aggregation_label(agg: Aggregation) -> &'static str {
+    match agg {
+        Aggregation::Sum => "a sum",
+        Aggregation::Count => "a count",
+        Aggregation::CountDistinct => "a distinct count",
+        Aggregation::Avg => "an average",
+        Aggregation::Min => "a minimum",
+        Aggregation::Max => "a maximum",
+    }
+}
+
+fn is_neutral(token: &str) -> bool {
+    NEUTRAL.iter().any(|w| stem(w) == token) || AggRequest::from_word(token).is_some()
+}
+
+/// Every word a certified definition stands for: name, synonyms, table, column and (for
+/// filters) the literal value. Free-text descriptions are not semantics and do not count.
+fn definition_terms(def: &Definition) -> BTreeSet<String> {
+    let mut texts: Vec<String> = std::iter::once(def.name.clone()).chain(def.synonyms.iter().cloned()).collect();
+    match &def.body {
+        DefinitionBody::Entity { table } => texts.push(base_table_name(table)),
+        DefinitionBody::Attribute { table, column, .. } => {
+            texts.push(base_table_name(table));
+            texts.push(column.clone());
+        }
+        DefinitionBody::Filter { table, column, value, .. } => {
+            texts.push(base_table_name(table));
+            texts.push(column.clone());
+            let values = match value {
+                Value::Array(items) => items.clone(),
+                other => vec![other.clone()],
+            };
+            for v in values {
+                match v {
+                    Value::String(s) => texts.push(s),
+                    Value::Number(n) => texts.push(n.to_string()),
+                    Value::Bool(b) => texts.push(b.to_string()),
+                    _ => {}
+                }
+            }
+        }
+        DefinitionBody::Metric { base_table, column, .. } => {
+            texts.push(base_table_name(base_table));
+            if let Some(c) = column {
+                texts.push(c.clone());
+            }
+        }
+        DefinitionBody::Relationship { from_table, to_table, .. } => {
+            texts.push(base_table_name(from_table));
+            texts.push(base_table_name(to_table));
+        }
+    }
+    texts.iter().flat_map(|t| tokenize(t)).collect()
+}
+
+/// Words that identify what a definition is about beyond its table and generic measure words
+/// (`role` for "user role", `quantity` for "order item quantity").
+fn identifying_terms(def: &Definition) -> BTreeSet<String> {
+    let table_tokens: BTreeSet<String> = def.body.tables().iter().flat_map(|t| tokenize(&base_table_name(t))).collect();
+    let mut texts: Vec<String> = std::iter::once(def.name.clone()).chain(def.synonyms.iter().cloned()).collect();
+    match &def.body {
+        DefinitionBody::Attribute { column, .. } | DefinitionBody::Filter { column, .. } => texts.push(column.clone()),
+        DefinitionBody::Metric { column: Some(c), .. } => texts.push(c.clone()),
+        _ => {}
+    }
+    texts
+        .iter()
+        .flat_map(|t| tokenize(t))
+        .filter(|t| !table_tokens.contains(t) && !MEASURE_GENERIC.iter().any(|g| stem(g) == *t))
+        .collect()
+}
+
+/// The text names the definition: a name/synonym phrase appears verbatim, or one of its
+/// identifying words does.
+fn names_definition(def: &Definition, text_norm: &str, text_tokens: &BTreeSet<String>) -> bool {
+    exact_phrase(def, text_norm) || identifying_terms(def).iter().any(|t| text_tokens.contains(t))
+}
+
+/// Original words of `text` whose stems are in `stems`, in order, deduplicated.
+fn original_words(text: &str, stems: &BTreeSet<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in tokenize_raw(text) {
+        let s = stem(&w);
+        if stems.contains(&s) && !out.contains(&w) {
+            out.push(w);
+        }
+    }
+    out
+}
+
+fn quoted(words: &[String]) -> String {
+    words.iter().map(|w| format!("'{w}'")).collect::<Vec<_>>().join(", ")
+}
+
+/// A certified filter matches when all distinctive words of its name (beyond the table name)
+/// appear, or one of its synonyms appears verbatim.
+fn filter_matches(f: &Definition, text_norm: &str, text_tokens: &BTreeSet<String>) -> bool {
+    let DefinitionBody::Filter { table, .. } = &f.body else { return false };
+    let entity_tokens: BTreeSet<String> = tokenize(&base_table_name(table)).into_iter().collect();
+    let distinctive: BTreeSet<String> = tokenize(&f.name).into_iter().filter(|t| !entity_tokens.contains(t)).collect();
+    let by_name = !distinctive.is_empty() && distinctive.iter().all(|t| text_tokens.contains(t));
+    let by_synonym = f.synonyms.iter().any(|s| {
+        let p = normalized_phrase(s);
+        !p.is_empty() && text_norm.contains(&p)
+    });
+    by_name || by_synonym
 }
 
 fn is_simple_ident(part: &str) -> bool {
@@ -326,10 +528,28 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
             revision.revision_id, revision.schema_fingerprint, req.schema_fingerprint
         ));
     }
-    let (metric_part, dim_parts) = split_question(req.question);
+    // Comparison operators carry semantics (`!=`, `<`) that name-based filter matching cannot honour.
+    if let Some(op) = ["!=", "<>", "≠", "<=", ">=", "≤", "≥", "<", ">"].iter().find(|op| req.question.contains(**op)) {
+        return plan.refuse(
+            PlanStatus::NotAnswerable,
+            format!(
+                "the question uses the comparison operator '{op}'; certified filters are matched by name, so comparisons and negations cannot be honoured (name a certified filter instead)"
+            ),
+        );
+    }
+    let parts = split_question(req.question);
+    let metric_part = parts.metric.clone();
+    let dim_parts = parts.dimensions;
     let metric_query = if tokenize(&metric_part).is_empty() { req.question.to_string() } else { metric_part.clone() };
     let question_norm = normalized_phrase(&metric_query);
-    let q_tokens: BTreeSet<String> = tokenize(&metric_query).into_iter().collect();
+    // Everything that can restrict the answer: the metric phrase plus trailing filter clauses.
+    // Certified filters are matched against all of it; dimension phrases are resolved on their own.
+    let restrict_text = std::iter::once(metric_query.clone())
+        .chain(parts.clauses.iter().cloned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let restrict_norm = normalized_phrase(&restrict_text);
+    let q_tokens: BTreeSet<String> = tokenize(&restrict_text).into_iter().collect();
 
     let by_kind = |defs: &[Definition], kind: DefinitionKind| -> Vec<Definition> {
         defs.iter().filter(|d| d.kind == kind).cloned().collect()
@@ -401,6 +621,45 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
     };
     let base = table_key(base_table);
 
+    // ---- the metric must compute what was asked ----
+    // An explicit aggregation word ("average", "max", "distinct", ...) must match the certified
+    // aggregation, unless the word is part of the metric's own certified name or synonyms.
+    let metric_words: BTreeSet<String> =
+        std::iter::once(&metric.name).chain(metric.synonyms.iter()).flat_map(|t| tokenize_raw(t)).collect();
+    for word in tokenize_raw(&restrict_text) {
+        if metric_words.contains(&word) {
+            continue;
+        }
+        if let Some(want) = AggRequest::from_word(&word) {
+            if !want.satisfied_by(*aggregation) {
+                return plan.refuse(
+                    PlanStatus::NotAnswerable,
+                    format!(
+                        "certified metric '{}' is {}, not {} ('{word}' in the question); refusing instead of returning a different aggregation",
+                        metric.name,
+                        aggregation_label(*aggregation),
+                        want.label()
+                    ),
+                );
+            }
+        }
+    }
+    // A column measure must be named: "how many order items" or "total orders" says nothing about
+    // summing quantity or order totals.
+    if matches!(aggregation, Aggregation::Sum | Aggregation::Avg | Aggregation::Min | Aggregation::Max)
+        && !names_definition(&metric, &restrict_norm, &q_tokens)
+    {
+        return plan.refuse(
+            PlanStatus::NotAnswerable,
+            format!(
+                "the question does not name what certified metric '{}' measures ({} of {}); refusing instead of guessing the measure",
+                metric.name,
+                aggregation_label(*aggregation),
+                column.clone().unwrap_or_default()
+            ),
+        );
+    }
+
     // ---- relationship graph (live only) ----
     let live_rels: Vec<&Definition> = req.published.iter().filter(|d| d.kind == DefinitionKind::Relationship).collect();
     let stale_rels: Vec<&Definition> = req.stale.iter().filter(|d| d.kind == DefinitionKind::Relationship).collect();
@@ -444,20 +703,60 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
             }
         }
     }
+    let mut asked_filters = 0usize;
     for f in req.published.iter().filter(|d| d.kind == DefinitionKind::Filter) {
         if filters.iter().any(|x| x.def_id == f.def_id) {
             continue;
         }
-        let DefinitionBody::Filter { table, .. } = &f.body else { continue };
-        let entity_tokens: BTreeSet<String> = tokenize(&base_table_name(table)).into_iter().collect();
-        let distinctive: BTreeSet<String> = tokenize(&f.name).into_iter().filter(|t| !entity_tokens.contains(t)).collect();
-        let by_name = !distinctive.is_empty() && distinctive.iter().all(|t| q_tokens.contains(t));
-        let by_synonym = f.synonyms.iter().any(|s| {
-            let p = normalized_phrase(s);
-            !p.is_empty() && question_norm.contains(&p)
-        });
-        if by_name || by_synonym {
+        if filter_matches(f, &restrict_norm, &q_tokens) {
             filters.push(f.clone());
+            asked_filters += 1;
+        }
+    }
+    if let Some(s) = req.stale.iter().find(|d| {
+        d.kind == DefinitionKind::Filter
+            && !filters.iter().any(|x| x.def_id == d.def_id)
+            && filter_matches(d, &restrict_norm, &q_tokens)
+    }) {
+        return plan.refuse(
+            PlanStatus::Stale,
+            format!("filter '{}' ({} v{}) is stale after a schema change and needs re-certification", s.name, s.def_id, s.version),
+        );
+    }
+    // Certified filters are always ANDed: "completed or pending" must not become "completed and pending".
+    let certified_words: BTreeSet<String> = std::iter::once(&metric)
+        .chain(filters.iter())
+        .flat_map(|d| std::iter::once(&d.name).chain(d.synonyms.iter()))
+        .flat_map(|t| tokenize_raw(t))
+        .collect();
+    let disjunction = tokenize_raw(&restrict_text)
+        .into_iter()
+        .find(|w| matches!(w.as_str(), "or" | "either" | "nor") && !certified_words.contains(w));
+    if let (Some(word), true) = (disjunction, asked_filters > 0) {
+        return plan.refuse(
+            PlanStatus::NotAnswerable,
+            format!("the question combines filters with '{word}'; certified filters are always combined with AND, so ask for each filter separately"),
+        );
+    }
+    for (i, a) in filters.iter().enumerate() {
+        for b in &filters[i + 1..] {
+            let (
+                DefinitionBody::Filter { table: ta, column: ca, operator: oa, .. },
+                DefinitionBody::Filter { table: tb, column: cb, operator: ob, .. },
+            ) = (&a.body, &b.body)
+            else {
+                continue;
+            };
+            let exclusive = |op: &FilterOp| matches!(op, FilterOp::Eq | FilterOp::In | FilterOp::IsNull | FilterOp::IsNotNull);
+            if table_key(ta) == table_key(tb) && ca.eq_ignore_ascii_case(cb) && (exclusive(oa) || exclusive(ob)) {
+                return plan.refuse(
+                    PlanStatus::NotAnswerable,
+                    format!(
+                        "certified filters '{}' and '{}' both constrain {}.{}; combining them with AND would answer a different question, so refusing",
+                        a.name, b.name, base_table_name(ta), ca
+                    ),
+                );
+            }
         }
     }
     for f in &filters {
@@ -485,16 +784,49 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
             }
             return plan.refuse(PlanStatus::NotAnswerable, format!("no certified attribute matches dimension '{phrase}'"));
         };
+        let phrase_norm = normalized_phrase(phrase);
+        let phrase_tokens: BTreeSet<String> = tokenize(phrase).into_iter().collect();
+        let uncovered = |d: &Definition| -> BTreeSet<String> {
+            let terms = definition_terms(d);
+            phrase_tokens.iter().filter(|t| !terms.contains(*t) && !is_neutral(t)).cloned().collect()
+        };
+        // Prefer an attribute the phrase names with no words left over.
         // Among near-ties prefer the attribute reachable with the fewest joins.
         let close: Vec<&ScoredDefinition> = ranked.iter().filter(|r| r.score >= best.score * 0.9).collect();
         let chosen = close
             .iter()
             .min_by_key(|r| {
+                let named = names_definition(&r.definition, &phrase_norm, &phrase_tokens);
                 let t = r.definition.body.tables().first().map(|t| table_key(t)).unwrap_or_default();
-                shortest_path(&graph, &base, &t).map(|p| p.len()).unwrap_or(usize::MAX)
+                (
+                    !named,
+                    uncovered(&r.definition).len(),
+                    shortest_path(&graph, &base, &t).map(|p| p.len()).unwrap_or(usize::MAX),
+                )
             })
             .copied()
             .unwrap_or(best);
+        // "by user" must not silently become "by user role"; "by user role for x" must not drop x.
+        if !names_definition(&chosen.definition, &phrase_norm, &phrase_tokens) {
+            return plan.refuse(
+                PlanStatus::NotAnswerable,
+                format!(
+                    "no certified attribute matches dimension '{phrase}' (closest is '{}', which the phrase does not name)",
+                    chosen.definition.name
+                ),
+            );
+        }
+        let rest = uncovered(&chosen.definition);
+        if !rest.is_empty() {
+            return plan.refuse(
+                PlanStatus::NotAnswerable,
+                format!(
+                    "no certified attribute covers {} in dimension '{phrase}' (closest is '{}'); refusing instead of grouping by something else",
+                    quoted(&original_words(phrase, &rest)),
+                    chosen.definition.name
+                ),
+            );
+        }
         if stale_attrs.iter().any(|s| s.def_id == chosen.definition.def_id && s.version == chosen.definition.version) {
             return plan.refuse(PlanStatus::Stale, format!("dimension '{}' is stale after a schema change", chosen.definition.name));
         }
@@ -502,6 +834,24 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
             needed.push((table_key(table), format!("dimension {}", chosen.definition.name)));
         }
         dims.push(chosen.definition.clone());
+    }
+
+    // ---- every restricting word must be covered by a used definition ----
+    // A word no certified metric, filter or dimension accounts for ("pending", "2025", "not",
+    // "admin") would otherwise be dropped silently and the answer would cover all rows.
+    let mut covered: BTreeSet<String> = definition_terms(&metric);
+    for d in filters.iter().chain(dims.iter()) {
+        covered.extend(definition_terms(d));
+    }
+    let leftover: BTreeSet<String> = q_tokens.iter().filter(|t| !covered.contains(*t) && !is_neutral(t)).cloned().collect();
+    if !leftover.is_empty() {
+        return plan.refuse(
+            PlanStatus::NotAnswerable,
+            format!(
+                "no certified filter, dimension or metric covers {} in the question; refusing instead of answering without it",
+                quoted(&original_words(&restrict_text, &leftover))
+            ),
+        );
     }
 
     // ---- join paths ----
@@ -649,9 +999,219 @@ mod tests {
 
     #[test]
     fn splits_metric_and_dimensions() {
-        let (m, d) = split_question("Total order value by user role and status?");
-        assert_eq!(m, "Total order value");
-        assert_eq!(d, vec!["user role", "status"]);
+        let p = split_question("Total order value by user role and status?");
+        assert_eq!(p.metric, "Total order value");
+        assert_eq!(p.dimensions, vec!["user role", "status"]);
+        assert!(p.clauses.is_empty());
+    }
+
+    #[test]
+    fn trailing_filter_clauses_are_not_dimensions() {
+        let p = split_question("total order value by user role for completed orders");
+        assert_eq!(p.metric, "total order value");
+        assert_eq!(p.dimensions, vec!["user role"]);
+        assert_eq!(p.clauses, vec!["for completed orders"]);
+
+        let p = split_question("order value by user role where status is completed and created in 2025");
+        assert_eq!(p.dimensions, vec!["user role"]);
+        assert_eq!(p.clauses, vec!["where status is completed and created in 2025"]);
+
+        let p = split_question("order value by user role, completed orders only");
+        assert_eq!(p.dimensions, vec!["user role"]);
+        assert_eq!(p.clauses, vec!["completed orders only"]);
+
+        // "for each" groups; it does not start a filter clause.
+        let p = split_question("order value per user role for each sku");
+        assert_eq!(p.dimensions, vec!["user role", "sku"]);
+        assert!(p.clauses.is_empty());
+
+        // No grouping marker: the whole question is the metric phrase (filters matched inside it).
+        let p = split_question("count of completed orders");
+        assert_eq!(p.metric, "count of completed orders");
+        assert!(p.dimensions.is_empty() && p.clauses.is_empty());
+    }
+
+    fn def(def_id: &str, kind: &str, name: &str, synonyms: &[&str], body: Value) -> Definition {
+        serde_json::from_value(serde_json::json!({
+            "def_id": def_id, "version": 1, "tenant_id": "default", "connection": "c", "kind": kind,
+            "name": name, "synonyms": synonyms, "body": body, "strength": "declared", "status": "published",
+            "content_hash": format!("h-{def_id}"), "schema_fingerprint": "fp", "proposed_by": "agent",
+            "created_at": "2025-01-01T00:00:00Z", "updated_at": "2025-01-01T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    /// Mirrors the golden fixture ontology (research/ontology/golden-local-sqlite.json).
+    fn golden_defs() -> Vec<Definition> {
+        use serde_json::json;
+        vec![
+            def("metric:order_value", "metric", "order value", &["order total", "sales", "revenue"],
+                json!({"type": "metric", "base_table": "main.orders", "aggregation": "sum", "column": "total_cents", "unit": "cents", "grain": "order"})),
+            def("metric:main.orders.count", "metric", "order count", &["number of orders", "count of orders", "orders count"],
+                json!({"type": "metric", "base_table": "main.orders", "aggregation": "count", "unit": "rows", "grain": "order"})),
+            def("metric:main.order_items.quantity.sum", "metric", "order item quantity", &["total quantity", "sum of quantity", "quantity"],
+                json!({"type": "metric", "base_table": "main.order_items", "aggregation": "sum", "column": "quantity", "grain": "order item"})),
+            def("filter:completed_order", "filter", "completed order", &["fulfilled order"],
+                json!({"type": "filter", "table": "main.orders", "column": "status", "operator": "eq", "value": "completed"})),
+            def("attribute:main.users.role", "attribute", "user role", &["role", "users.role"],
+                json!({"type": "attribute", "table": "main.users", "column": "role"})),
+            def("attribute:main.order_items.sku", "attribute", "order item sku", &["sku", "order_items.sku"],
+                json!({"type": "attribute", "table": "main.order_items", "column": "sku"})),
+            def("relationship:main.orders(user_id)->main.users", "relationship", "order user", &[],
+                json!({"type": "relationship", "from_table": "main.orders", "to_table": "main.users", "column_pairs": [["user_id", "id"]], "cardinality": "many_to_one", "source": "declared_fk"})),
+            def("relationship:main.order_items(order_id)->main.orders", "relationship", "order item order", &[],
+                json!({"type": "relationship", "from_table": "main.order_items", "to_table": "main.orders", "column_pairs": [["order_id", "id"]], "cardinality": "many_to_one", "source": "declared_fk"})),
+        ]
+    }
+
+    fn revision() -> OntologyRevision {
+        serde_json::from_value(serde_json::json!({
+            "revision_id": "rev_1", "tenant_id": "default", "connection": "c", "seq": 1, "content_hash": "x",
+            "schema_fingerprint": "fp", "def_refs": [], "published_by": "reviewer", "published_at": "2025-01-01T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    fn plan_with(defs: &[Definition], question: &str) -> SemanticPlan {
+        let rev = revision();
+        plan(&PlanRequest {
+            question,
+            engine: DatabaseEngine::Sqlite,
+            max_rows: 200,
+            revision: Some(&rev),
+            published: defs,
+            stale: &[],
+            schema_fingerprint: "fp",
+        })
+    }
+
+    fn ask(question: &str) -> SemanticPlan {
+        plan_with(&golden_defs(), question)
+    }
+
+    #[test]
+    fn filter_clause_after_dimension_is_applied() {
+        for q in [
+            "total order value by user role for completed orders",
+            "total order value by user role where status is completed",
+            "total order value by user role with completed orders",
+            "total order value by user role, completed orders only",
+            "total order value by user role for fulfilled orders?",
+        ] {
+            let p = ask(q);
+            assert!(p.is_answerable(), "{q}: {:?}", p.missing);
+            let sql = p.sql.clone().unwrap();
+            assert!(sql.contains("WHERE t0.status = ?1") && sql.contains("GROUP BY t1.role"), "{q}: {sql}");
+            assert_eq!(p.params, vec![Value::from("completed")], "{q}");
+            assert_eq!(p.filters.iter().map(|f| f.def_id.as_str()).collect::<Vec<_>>(), vec!["filter:completed_order"]);
+            assert_eq!(p.dimensions.iter().map(|d| d.def_id.as_str()).collect::<Vec<_>>(), vec!["attribute:main.users.role"]);
+        }
+        // Filter on a joined table, grouped by a base-table attribute.
+        let p = ask("total quantity by sku for completed orders");
+        assert!(p.is_answerable(), "{:?}", p.missing);
+        let sql = p.sql.unwrap();
+        assert!(sql.contains("JOIN main.orders t1 ON t1.id = t0.order_id"), "{sql}");
+        assert!(sql.contains("WHERE t1.status = ?1") && sql.contains("GROUP BY t0.sku"), "{sql}");
+    }
+
+    #[test]
+    fn existing_answerable_questions_still_answer() {
+        for q in [
+            "total order value by user role",
+            "count of completed orders",
+            "count of fulfilled orders",
+            "quantity sold by sku",
+            "total order value for completed orders",
+            "what is the order value for orders with status completed",
+            "total quantity sold for completed orders",
+            "order value by role of user",
+            "count of completed orders by user role",
+        ] {
+            let p = ask(q);
+            assert!(p.is_answerable(), "{q}: {:?}", p.missing);
+        }
+    }
+
+    #[test]
+    fn unmatched_filter_words_refuse_instead_of_answering_all_rows() {
+        for (q, word) in [
+            ("total order value for pending orders", "'pending'"),
+            ("count of pending orders", "'pending'"),
+            ("total order value by user role for pending orders", "'pending'"),
+            ("count of orders that are not completed", "'not'"),
+            ("count of non-completed orders", "'non'"),
+            ("count of orders excluding completed orders", "'excluding'"),
+            ("total order value in 2025", "'2025'"),
+            ("total order value by user role for completed orders in 2025", "'2025'"),
+            ("total order value of admin users", "'admin'"),
+            ("top 5 order value", "'top', '5'"),
+        ] {
+            let p = ask(q);
+            assert_eq!(p.status, PlanStatus::NotAnswerable, "{q}: {:?}", p.sql);
+            assert!(p.sql.is_none(), "{q}");
+            assert!(p.missing.iter().any(|m| m.contains(word)), "{q}: {:?}", p.missing);
+        }
+        let p = ask("count of orders where status != completed");
+        assert_eq!(p.status, PlanStatus::NotAnswerable);
+        assert!(p.missing[0].contains("'!='"), "{:?}", p.missing);
+    }
+
+    #[test]
+    fn aggregation_mismatch_refuses() {
+        for (q, why) in [
+            ("average order value", "certified metric 'order value' is a sum, not an average"),
+            ("mean order value by user role", "is a sum, not an average"),
+            ("avg order value for completed orders", "is a sum, not an average"),
+            ("max order value", "is a sum, not a maximum"),
+            ("lowest order value", "is a sum, not a minimum"),
+            ("median order value", "is a sum, not a median"),
+            ("count of distinct orders", "is a count, not a distinct count"),
+        ] {
+            let p = ask(q);
+            assert_eq!(p.status, PlanStatus::NotAnswerable, "{q}: {:?}", p.sql);
+            assert!(p.missing.iter().any(|m| m.contains(why)), "{q}: {:?}", p.missing);
+        }
+        // The certified aggregation itself is fine.
+        let mut defs = golden_defs();
+        defs[0] = def("metric:order_value", "metric", "order value", &["order total"],
+            serde_json::json!({"type": "metric", "base_table": "main.orders", "aggregation": "avg", "column": "total_cents"}));
+        let p = plan_with(&defs, "average order value");
+        assert!(p.is_answerable(), "{:?}", p.missing);
+        assert!(p.sql.unwrap().contains("AVG(t0.total_cents)"));
+        let p = plan_with(&defs, "max order value");
+        assert!(p.missing.iter().any(|m| m.contains("is an average, not a maximum")), "{:?}", p.missing);
+    }
+
+    #[test]
+    fn unnamed_measures_and_dimensions_refuse() {
+        // Sum of quantity is not "how many order items"; sum of totals is not "total orders".
+        for q in ["how many order items", "total orders by user role"] {
+            let p = ask(q);
+            assert_eq!(p.status, PlanStatus::NotAnswerable, "{q}: {:?}", p.sql);
+            assert!(p.missing[0].contains("does not name what certified metric"), "{q}: {:?}", p.missing);
+        }
+        // "by user" is not "by user role"; an extra grouping must not be dropped.
+        let p = ask("order value by user");
+        assert_eq!(p.status, PlanStatus::NotAnswerable, "{:?}", p.sql);
+        assert!(p.missing[0].contains("no certified attribute"), "{:?}", p.missing);
+        let p = ask("order count per user role for each sku");
+        assert_eq!(p.status, PlanStatus::NotAnswerable, "{:?}", p.sql);
+    }
+
+    #[test]
+    fn disjunctive_or_conflicting_filters_refuse() {
+        let mut defs = golden_defs();
+        defs.push(def("filter:pending_order", "filter", "pending order", &[],
+            serde_json::json!({"type": "filter", "table": "main.orders", "column": "status", "operator": "eq", "value": "pending"})));
+        let p = plan_with(&defs, "count of pending orders");
+        assert!(p.is_answerable(), "{:?}", p.missing);
+        assert_eq!(p.params, vec![Value::from("pending")]);
+        let p = plan_with(&defs, "total order value for completed or pending orders");
+        assert_eq!(p.status, PlanStatus::NotAnswerable, "{:?}", p.sql);
+        assert!(p.missing[0].contains("'or'"), "{:?}", p.missing);
+        let p = plan_with(&defs, "total order value for completed and pending orders");
+        assert_eq!(p.status, PlanStatus::NotAnswerable, "{:?}", p.sql);
+        assert!(p.missing[0].contains("both constrain orders.status"), "{:?}", p.missing);
     }
 
     #[test]

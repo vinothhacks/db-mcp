@@ -5,7 +5,8 @@
  *
  * Covers: tool surface (8 agent tools, no review tool), deterministic discovery, typed proposals,
  * separation of duties on /admin/ontology/review (401/403/400/200), publish, certified planning,
- * governed execution, plan pinning, refusal cases, restricted/sensitive handling, role denial,
+ * governed execution, plan pinning, refusal cases, answers equal to direct SQL (trailing filter
+ * clauses, uncertified filters and aggregation mismatches refused), restricted/sensitive handling, role denial,
  * simulation disclosure, schema drift -> stale, audit trail, and `db-mcp ontology eval` gates.
  *
  * Run from the repo root: node npm/test/features/16-ontology.test.js   (exit 0 when every check passes)
@@ -218,6 +219,33 @@ const CURATED = [
       assert.equal((await q("revenue")).status, "ambiguous");
       assert.equal((await q("how many late arrivals per service")).status, "not_answerable");
       assert.equal((await q("order count by warehouse region")).status, "not_answerable");
+    });
+
+    await check("answers equal direct SQL: trailing filter clauses applied; unmatched filters and aggregation mismatches refused", async () => {
+      const ask = async (question) => agent("ask_semantic_question", { connection: "local-sqlite", question });
+      const truth = async (sql) => (await agent("execute_query", { connection: "local-sqlite", sql })).rows;
+      for (const [question, sql] of [
+        ["total order value by user role for completed orders", "SELECT u.role, SUM(o.total_cents) FROM orders o JOIN users u ON u.id = o.user_id WHERE o.status = 'completed' GROUP BY u.role ORDER BY 2 DESC"],
+        ["total order value where status is completed", "SELECT SUM(total_cents) FROM orders WHERE status = 'completed'"],
+        ["total quantity by sku for completed orders", "SELECT i.sku, SUM(i.quantity) FROM order_items i JOIN orders o ON o.id = i.order_id WHERE o.status = 'completed' GROUP BY i.sku ORDER BY 2 DESC"],
+      ]) {
+        const a = await ask(question);
+        assert.equal(a.status, "ok", JSON.stringify(a));
+        assert.equal(a.data.answered, true, `${question}: ${JSON.stringify(a.data.plan.missing)}`);
+        assert.deepEqual(a.rows, await truth(sql), question);
+      }
+      assert.deepEqual((await ask("total order value by user role for completed orders")).rows, [["admin", 4500]]);
+      for (const [question, why] of [
+        ["average order value", /certified metric 'order value' is a sum, not an average/],
+        ["total order value for pending orders", /'pending'/],
+        ["count of orders that are not completed", /'not'/],
+        ["how many order items", /does not name what certified metric/],
+      ]) {
+        const a = await ask(question);
+        assert.equal(a.data.answered, false, `${question}: ${JSON.stringify(a.rows)}`);
+        assert.equal(a.data.plan.status, "not_answerable", question);
+        assert.match(a.data.plan.missing.join(" "), why, question);
+      }
     });
 
     await check("roles and disclosure: intern denied on prod-postgres; simulated backend disclosed", async () => {
