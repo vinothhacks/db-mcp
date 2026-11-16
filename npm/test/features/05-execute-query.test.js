@@ -754,10 +754,11 @@ async function sectionRoles(config, c) {
     denied((await eq(c, { connection: "principal-sqlite", sql: "SELECT 1" })).payload, ["UNAUTHORIZED_ROLE", "UNAUTHORIZED_CONNECTION", "UNAUTHORIZED"]);
     okEnvelope((await eq(intern, { connection: "principal-sqlite", sql: "SELECT 1 AS ok" })).payload);
   });
-  await check("7.04 allowed_roles=[dba]: agent denied, dba and admin allowed", async () => {
+  // allowed_roles is authoritative (F13-B11): a self-asserted admin role is not implicitly allowed.
+  await check("7.04 allowed_roles=[dba]: agent and unlisted admin denied, dba allowed", async () => {
     denied((await eq(c, { connection: "role-sqlite", sql: "SELECT 1" })).payload, "UNAUTHORIZED_ROLE");
     okEnvelope((await eq(dba, { connection: "role-sqlite", sql: "SELECT 1 AS ok" })).payload);
-    okEnvelope((await eq(admin, { connection: "role-sqlite", sql: "SELECT 1 AS ok" })).payload);
+    denied((await eq(admin, { connection: "role-sqlite", sql: "SELECT 1" })).payload, "UNAUTHORIZED_ROLE");
   });
   await check("7.05 admin may run literal PRAGMA writes in Development, non-admin may not", async () => {
     okEnvelope((await eq(admin, { connection: L, sql: "PRAGMA journal_mode = 'delete'" })).payload);
