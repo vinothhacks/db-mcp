@@ -18,7 +18,7 @@ use std::sync::Mutex;
 use db_mcp_audit::{build_audit_sink, create_audit_event, AuditFilter, AuditSink};
 use db_mcp_catalog::{
     build_procedure_call_graph, capture_schema, compute_schema_version, describe_object,
-    diff_schema, filter_and_paginate_objects, trace_table_dependencies,
+    diff_schema, filter_and_paginate_objects, schema_diff_warnings, verify_snapshot_hash, trace_table_dependencies,
 };
 use db_mcp_changes::ChangeManager;
 use db_mcp_ontology::{
@@ -1384,13 +1384,23 @@ impl DbMcpRuntime {
                     self.capture_allowed(adapter.as_ref(), &conn, schema_pattern).await?
                 };
                 let diff = diff_schema(&base, &target);
-                to_json(McpSuccessResponse::with_data(
+                let mut warnings = Vec::new();
+                if args.get("base_snapshot").is_some() {
+                    warnings.extend(verify_snapshot_hash("base", &base));
+                }
+                if args.get("target_snapshot").is_some() {
+                    warnings.extend(verify_snapshot_hash("target", &target));
+                }
+                warnings.extend(schema_diff_warnings(&base, &target, &diff));
+                let mut resp = McpSuccessResponse::with_data(
                     req_id,
                     &base.connection,
-                    target.schema_version,
+                    target.schema_version.clone(),
                     "schema_diff",
                     diff,
-                ))
+                );
+                resp.warnings.extend(warnings);
+                to_json(resp)
             }
             "ontology_status" => {
                 let conn = req_str("connection")?;

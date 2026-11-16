@@ -210,10 +210,9 @@ async function sectionTruthInAdvertising(s) {
     assert.ok(!(lineageSqlite.warnings || []).some(discloses), JSON.stringify(lineageSqlite.warnings));
   });
   const myRoutines = await s.call("search_objects", { connection: "analytics-mysql", object_types: ["function", "procedure"], detail_level: "names", limit: 50 });
-  // KNOWN-BUG: F02-06 simulated MySQL seeds 4 demo routines (bootstrap_mysql_system_tables) that no init_sql defined
-  await check("analytics-mysql defines no routines in init_sql, so the catalog lists none (no phantom demo routines)", () => {
-    assert.deepEqual(myRoutines.data.objects.map((o) => o.name), []);
-  }, { knownBug: "F02-06" });
+  await check("analytics-mysql lists exactly the routines its init_sql defines (no phantom seeded routines)", () => {
+    assert.deepEqual(myRoutines.data.objects.map((o) => o.name).sort(), ["calculate_order_discount", "checkout_order", "record_order_audit", "reserve_inventory"]);
+  });
   const ver = await s.call("execute_query", { connection: "prod-postgres", sql: "SELECT version()" });
   // KNOWN-BUG: F15-05 (dialect) a real PostgreSQL answers; the simulation leaks a SQLite error
   await check("prod-postgres: SELECT version() returns a PostgreSQL version string", () => {
@@ -454,14 +453,13 @@ async function sectionDialects(s) {
 
 async function sectionDelimiterStartup() {
   const cfgD = makeConfig("mysql_delimiter");
-  // KNOWN-BUG: F15-13 a MySQL `DELIMITER` block in init_sql aborts server startup with a raw SQLite syntax error
   await check("mysql: init_sql containing a DELIMITER block does not prevent the server from starting", async () => {
     let s;
     try { s = await startServer(cfgD.configPath, 8000); } catch (e) { assert.fail(short(e.message)); }
     const r = await s.call("execute_query", { connection: "analytics-mysql", sql: "SELECT 1" });
     await s.stop();
     assert.equal(r.status, "ok");
-  }, { knownBug: "F15-13" });
+  });
 }
 
 async function sectionSqlite(s, cfgDir) {

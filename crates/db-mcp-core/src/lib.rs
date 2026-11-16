@@ -1171,6 +1171,16 @@ pub enum DiffOperationKind {
     AddView,
     DropView,
     AlterView,
+    AddRoutine,
+    DropRoutine,
+    AlterRoutine,
+    AddTrigger,
+    DropTrigger,
+    AlterTrigger,
+    AddForeignKey,
+    DropForeignKey,
+    AlterForeignKey,
+    AlterColumnPrimaryKey,
 }
 
 /// Recovery and rollback safety classification for schema changes.

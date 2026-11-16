@@ -397,6 +397,17 @@ fn ensure_sqlite_routines_table(conn: &Connection) -> DbMcpResult<()> {
     .map_err(map_rusqlite_error)
 }
 
+/// A `$tag$` body belongs to the current routine header only when no statement
+/// terminator or `BEGIN` keyword precedes it; otherwise it is the next statement's.
+fn dollar_quote_in_header(prefix: &str) -> bool {
+    if prefix.contains(';') {
+        return false;
+    }
+    !prefix
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|w| w.eq_ignore_ascii_case("begin"))
+}
+
 fn find_sqlite_routine_ddl_end(sql: &str, after_open_paren: usize) -> usize {
     let bytes = sql.as_bytes();
     let len = bytes.len();
@@ -446,7 +457,7 @@ fn find_sqlite_routine_ddl_end(sql: &str, after_open_paren: usize) -> usize {
 
     let dollar_re = Regex::new(r"\$([A-Za-z0-9_]*)\$").unwrap();
     let rest = &sql[i..];
-    if let Some(m) = dollar_re.find(rest) {
+    if let Some(m) = dollar_re.find(rest).filter(|m| dollar_quote_in_header(&rest[..m.start()])) {
         let tag = m.as_str();
         let after_open_tag = i + m.end();
         if let Some(close_rel) = sql[after_open_tag..].find(tag) {
@@ -1844,5 +1855,25 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("JOIN users"));
+    }
+
+    #[test]
+    fn test_dollar_quoted_routine_after_begin_end_routine_does_not_swallow_it() {
+        let sql = r#"
+CREATE PROCEDURE first_proc(x INTEGER)
+BEGIN
+    INSERT INTO t VALUES (x);
+END;
+CREATE FUNCTION dollar_fn(x INTEGER) RETURNS INTEGER AS $$
+BEGIN
+    RETURN x;
+END;
+$$ LANGUAGE plpgsql;
+"#;
+        let out = rewrite_sqlite_sql_for_routines(sql, "main").0;
+        assert!(out.contains("'first_proc'"), "{out}");
+        assert!(out.contains("'dollar_fn'"), "{out}");
+        let first = out.split("'dollar_fn'").next().unwrap();
+        assert!(!first.contains("RETURNS INTEGER AS $$"), "first_proc swallowed dollar_fn: {out}");
     }
 }
