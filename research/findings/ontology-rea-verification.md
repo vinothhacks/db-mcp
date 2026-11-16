@@ -45,3 +45,19 @@ cargo build --release -p db-mcp-server
 node scripts/ontology-demo.js --keep      # prints the kept ontology.db path
 # then, from an MCP client with REA: inspect_pe_imports / inspect_sqlite_database on those paths
 ```
+
+## 3. Egress note for live database clients (v0.3.0, SQL Server track)
+
+The binary now links a TDS (SQL Server) client, `tiberius` 0.12, with `rustls` 0.21 / `ring` for
+TLS (no OpenSSL, no SChannel). Consequences for the checks above:
+
+- `Cargo.lock` now contains `tiberius`, `rustls`, `tokio-rustls`, `rustls-native-certs` and
+  `ring`; the "no TLS stack" row no longer holds. The TLS client is only used inside the TDS
+  login/session to a SQL Server named in a configured `engine = "sqlserver"` DSN.
+- Connections go only to the configured DSN host and port, or, for a named instance without a
+  port, to the SQL Server Browser on that same host (UDP 1434). Nothing else is contacted.
+- Still no HTTP client crate (`reqwest`, `ureq`, `hyper` client, `isahc`, `surf`) and no model SDK
+  (`openai`, `anthropic`). The ontology still cannot send schema or data to a model service.
+- `rustls-native-certs` reads the OS certificate store only when `trustServerCertificate=false`.
+
+Re-run the REA import/lockfile inspection on the v0.3.0 release binary before publishing.

@@ -1629,3 +1629,34 @@ mod tests {
         }
     }
 }
+#[cfg(test)]
+mod tsql_read_coverage {
+    use super::*;
+    #[test]
+    fn common_tsql_reads_classify_as_read() {
+        for sql in [
+            "SELECT u.id, x.n FROM dbo.users u CROSS APPLY (SELECT COUNT(*) AS n FROM dbo.orders o WHERE o.user_id = u.id) x",
+            "SELECT u.id FROM dbo.users u OUTER APPLY (SELECT TOP 1 o.id FROM dbo.orders o WHERE o.user_id = u.id) x",
+            "SELECT id, email FROM dbo.users FOR JSON PATH",
+            "SELECT id FROM dbo.orders ORDER BY id OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY",
+            "SELECT TRY_CAST(total_cents AS decimal(10,2)) FROM dbo.orders",
+            "SELECT IIF(total_cents > 2000, 'big', 'small') FROM dbo.orders",
+            "SELECT DATEADD(day, 1, created_at) FROM dbo.orders",
+            "SELECT STRING_AGG(email, ',') WITHIN GROUP (ORDER BY email) FROM dbo.users",
+            "SELECT id FROM dbo.orders WHERE created_at > GETDATE() - 30",
+            "SELECT CONVERT(varchar(10), created_at, 120) FROM dbo.orders",
+            "SELECT * FROM dbo.orders PIVOT (SUM(total_cents) FOR status IN ([completed], [pending])) p",
+            "SELECT N'unicode' AS s",
+            "SELECT id FROM dbo.orders WITH (NOLOCK) WHERE status = N'completed'",
+            "SELECT ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at) FROM dbo.orders",
+            "SELECT #t.id FROM #t",
+            "SELECT id FROM dbmcp_fixture.dbo.orders",
+        ] {
+            let a = parse_and_analyze_sql(DatabaseEngine::SqlServer, sql).unwrap();
+            assert_eq!(a.overall_class, SqlStatementClass::Read, "{sql}");
+        }
+        // Known gap: sqlparser cannot represent some query hints; they fail closed, never read.
+        let hinted = "WITH r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT n FROM r OPTION (MAXRECURSION 10)";
+        assert_ne!(parse_and_analyze_sql(DatabaseEngine::SqlServer, hinted).unwrap().overall_class, SqlStatementClass::Read);
+    }
+}
