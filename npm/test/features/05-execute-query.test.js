@@ -373,13 +373,11 @@ async function sectionLimits(c) {
     assert.equal(p.returned_rows, 500);
     assert.equal(p.truncated, true);
   });
-  // KNOWN-BUG: F05-B4 - max_rows=0 is clamped to 0 which the adapter/executor treat as "unlimited".
+  // F05-B4 fixed: a zero budget override is rejected instead of disabling the cap.
   await check("3.05 request max_rows=0 cannot exceed the connection cap", async () => {
     const { payload: p } = await eq(c, { connection: L, sql: "SELECT id FROM big ORDER BY id", max_rows: 0 });
-    if (p.status === "denied") { denied(p, "INVALID_ARGUMENT"); return; }
-    okEnvelope(p);
-    assert.ok(p.returned_rows <= 500, `max_rows=0 returned ${p.returned_rows} rows (cap is 500)`);
-  }, "F05-B4");
+    denied(p, "INVALID_ARGUMENT");
+  });
   await check("3.06 negative / string / huge max_rows never exceed the cap", async () => {
     for (const v of [-1, "5", 1e18]) {
       const { payload: p } = await eq(c, { connection: L, sql: "SELECT id FROM big ORDER BY id", max_rows: v });
@@ -408,13 +406,10 @@ async function sectionLimits(c) {
     assert.equal(p.truncated, true);
     assert.ok(p.returned_rows < 50, `returned ${p.returned_rows}`);
   });
-  // KNOWN-BUG: F05-B4 - max_bytes=0 disables the byte budget entirely.
   await check("3.10 request max_bytes=0 cannot exceed the connection byte budget", async () => {
     const { payload: p } = await eq(c, { connection: "slow-sqlite", sql: "SELECT id, payload FROM big ORDER BY id", max_bytes: 0 });
-    if (p.status === "denied") { denied(p, "INVALID_ARGUMENT"); return; }
-    okEnvelope(p);
-    assert.ok(p.returned_rows < 50, `max_bytes=0 returned all ${p.returned_rows} rows past the 300-byte budget`);
-  }, "F05-B4");
+    denied(p, "INVALID_ARGUMENT");
+  });
   await check("3.11 timeout_ms=1 against a slow recursive CTE -> EXECUTION_TIMEOUT (retryable)", async () => {
     const t0 = Date.now();
     const { payload: p, raw } = await eq(c, { connection: L, sql: SLOW_1S, timeout_ms: 1 });
@@ -443,14 +438,12 @@ async function sectionLimits(c) {
     denied(p, "EXECUTION_TIMEOUT");
     assert.ok(Date.now() - t0 < 2500);
   });
-  // KNOWN-BUG: F05-B4 - timeout_ms=0 is clamped to 0, which execute_bounded replaces with a 10 s default.
   await check("3.15 request timeout_ms=0 cannot exceed the connection timeout", async () => {
     const t0 = Date.now();
     const { payload: p } = await eq(c, { connection: "slow-sqlite", sql: SLOW_3S, timeout_ms: 0 });
-    if (p.status === "denied" && p.code === "INVALID_ARGUMENT") return;
-    denied(p, "EXECUTION_TIMEOUT", `(took ${Date.now() - t0}ms)`);
+    denied(p, "INVALID_ARGUMENT", `(took ${Date.now() - t0}ms)`);
     assert.ok(Date.now() - t0 < 2500, `ran ${Date.now() - t0}ms past the 1000ms connection cap`);
-  }, "F05-B4");
+  });
   await check("3.16 negative timeout_ms is ignored or rejected, never a hang", async () => {
     const { payload: p } = await eq(c, { connection: L, sql: "SELECT 1 AS ok", timeout_ms: -5 });
     if (p.status === "denied") { denied(p, "INVALID_ARGUMENT"); return; }

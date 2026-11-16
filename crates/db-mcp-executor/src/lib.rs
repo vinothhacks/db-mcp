@@ -462,9 +462,11 @@ impl BoundedExecutor {
             return Err(err);
         }
 
-        // 3. Construct AuthorizedQuery with bounded limits
+        // 3. Construct AuthorizedQuery with bounded limits. A zero override would mean "no limit"
+        //    downstream, so it falls back to the connection limit instead of disabling it.
         let timeout_ms = request
             .timeout_ms_override
+            .filter(|t| *t > 0)
             .map(|t| {
                 if cfg.limits.timeout_ms > 0 {
                     t.min(cfg.limits.timeout_ms)
@@ -476,6 +478,7 @@ impl BoundedExecutor {
 
         let max_rows = request
             .max_rows_override
+            .filter(|r| *r > 0)
             .map(|r| {
                 if cfg.limits.max_rows > 0 {
                     r.min(cfg.limits.max_rows)
@@ -487,6 +490,7 @@ impl BoundedExecutor {
 
         let max_bytes = request
             .max_bytes_override
+            .filter(|b| *b > 0)
             .map(|b| {
                 if cfg.limits.max_bytes > 0 {
                     b.min(cfg.limits.max_bytes)
@@ -1026,6 +1030,38 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("max_bytes=90")));
+    }
+
+    #[tokio::test]
+    async fn test_zero_overrides_do_not_disable_connection_caps() {
+        let adapter = MockAdapter::new("dev-conn", 0, 10);
+        let policy = PolicyEngine::with_configs(
+            OperatingMode::Development,
+            vec![ConnectionPolicyConfig::development("dev-conn").with_limits(
+                db_mcp_core::ExecutionLimits {
+                    timeout_ms: 1000,
+                    max_rows: 3,
+                    max_bytes: 1_048_576,
+                    allow_multi_statement: false,
+                },
+            )],
+        );
+        let audit = InMemoryAuditStore::new();
+        let executor = BoundedExecutor::new();
+        let req = GovernedQueryRequest::new(
+            "req_zero",
+            "dev-conn",
+            CallerIdentity::local_agent("agent"),
+            "SELECT id, email FROM users",
+        )
+        .with_max_rows(0)
+        .with_max_bytes(0)
+        .with_timeout_ms(0);
+        let result = execute_governed_query(&executor, &adapter, &policy, &audit, req)
+            .await
+            .unwrap();
+        assert_eq!(result.returned_rows, 3);
+        assert!(result.truncated);
     }
 
     #[tokio::test]

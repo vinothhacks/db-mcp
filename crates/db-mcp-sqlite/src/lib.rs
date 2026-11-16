@@ -25,10 +25,10 @@ use db_mcp_core::{
     SchemaSnapshot, TransactionalDdlProvider,
 };
 use db_mcp_secrets::redact_sensitive_text;
-use db_mcp_sql::{parse_and_analyze_sql, split_sql_statements};
+use db_mcp_sql::{normalize_sql, parse_and_analyze_sql, split_sql_statements};
 use regex::Regex;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
-use rusqlite::{ params_from_iter, Connection, Error as RusqliteError, ErrorCode, InterruptHandle, OpenFlags};
+use rusqlite::{ params_from_iter, Batch, Connection, Error as RusqliteError, ErrorCode, InterruptHandle, OpenFlags};
 use serde::{Deserialize, Serialize};
 
 /// Configuration for a `SqliteAdapter` connection.
@@ -1361,76 +1361,47 @@ fn execute_sqlite_query_inner(
     };
     let max_bytes = request.max_bytes;
 
+    // `Connection::prepare` compiles only the first statement of a string and ignores the rest.
+    // A batch that policy allowed (allow_multi_statement = true) is executed statement by
+    // statement instead of silently dropping its tail.
+    let statement_count = split_sql_statements(DatabaseEngine::Sqlite, &rewritten_sql)
+        .iter()
+        .filter(|piece| !normalize_sql(piece).is_empty())
+        .count();
+    if statement_count > 1 {
+        return execute_sqlite_batch(
+            conn,
+            request,
+            &rewritten_sql,
+            &params,
+            max_rows,
+            max_bytes,
+            default_schema,
+            started,
+        );
+    }
+
     let mut stmt = conn.prepare(&rewritten_sql).map_err(map_rusqlite_error)?;
-    let col_count = stmt.column_count();
 
-    if col_count > 0 {
-        let mut columns: Vec<ColumnMetadata> = stmt
-            .column_names()
-            .into_iter()
-            .map(|name| ColumnMetadata::new(name, "ANY"))
-            .collect();
-
-        let mut rows_out: Vec<Vec<serde_json::Value>> = Vec::new();
-        let mut bytes_used = 0usize;
-        let mut truncated = false;
-        let mut warnings = Vec::new();
-
-        let mut rows = stmt
-            .query(params_from_iter(params.iter()))
-            .map_err(map_rusqlite_error)?;
-
-        while let Some(row) = rows.next().map_err(map_rusqlite_error)? {
-            if rows_out.len() >= max_rows {
-                truncated = true;
-                warnings.push(format!(
-                    "Result truncated at max_rows={max_rows}"
-                ));
-                break;
-            }
-
-            let mut row_vals = Vec::with_capacity(col_count);
-            let mut row_bytes = 0usize;
-            for i in 0..col_count {
-                let val_ref = row.get_ref(i).map_err(map_rusqlite_error)?;
-                let (json_val, inferred_type, val_bytes) = sqlite_value_ref_to_json(val_ref);
-                if columns[i].data_type == "ANY" && inferred_type != "NULL" {
-                    columns[i].data_type = inferred_type.to_string();
-                }
-                row_bytes += val_bytes;
-                row_vals.push(json_val);
-            }
-
-            if max_bytes > 0 && bytes_used + row_bytes > max_bytes && !rows_out.is_empty() {
-                truncated = true;
-                warnings.push(format!(
-                    "Result truncated at max_bytes={max_bytes} budget"
-                ));
-                break;
-            }
-
-            bytes_used += row_bytes;
-            rows_out.push(row_vals);
-        }
-
-        drop(rows);
+    if stmt.column_count() > 0 {
+        let set = collect_sqlite_rows(&mut stmt, &params, max_rows, max_bytes)?;
         drop(stmt);
 
         let schema_version = introspect_sqlite_catalog(conn, default_schema)
             .ok()
             .map(|objs| compute_schema_version(&objs));
 
-        let returned_rows = rows_out.len();
+        let returned_rows = set.rows.len();
         Ok(QueryResult {
             execution_id: request.execution_id.clone(),
-            columns,
-            rows: rows_out,
+            columns: set.columns,
+            rows: set.rows,
             returned_rows,
             rows_affected: None,
-            truncated,
-            bytes_used,
+            truncated: set.truncated,
+            bytes_used: set.bytes_used,
             execution_time_ms: started.elapsed().as_millis() as u64,
-            warnings,
+            warnings: set.warnings,
             schema_version,
         })
     } else {
@@ -1455,6 +1426,175 @@ fn execute_sqlite_query_inner(
             warnings: Vec::new(),
             schema_version,
         })
+    }
+}
+
+/// Rows read from one row-returning SQLite statement, bounded by `max_rows` / `max_bytes`.
+struct SqliteRowSet {
+    columns: Vec<ColumnMetadata>,
+    rows: Vec<Vec<serde_json::Value>>,
+    bytes_used: usize,
+    truncated: bool,
+    warnings: Vec<String>,
+}
+
+fn collect_sqlite_rows(
+    stmt: &mut rusqlite::Statement<'_>,
+    params: &[SqliteValue],
+    max_rows: usize,
+    max_bytes: usize,
+) -> DbMcpResult<SqliteRowSet> {
+    let col_count = stmt.column_count();
+    let mut columns: Vec<ColumnMetadata> = stmt
+        .column_names()
+        .into_iter()
+        .map(|name| ColumnMetadata::new(name, "ANY"))
+        .collect();
+
+    let mut rows_out: Vec<Vec<serde_json::Value>> = Vec::new();
+    let mut bytes_used = 0usize;
+    let mut truncated = false;
+    let mut warnings = Vec::new();
+
+    let mut rows = stmt
+        .query(params_from_iter(params.iter()))
+        .map_err(map_rusqlite_error)?;
+
+    while let Some(row) = rows.next().map_err(map_rusqlite_error)? {
+        if rows_out.len() >= max_rows {
+            truncated = true;
+            warnings.push(format!(
+                "Result truncated at max_rows={max_rows}"
+            ));
+            break;
+        }
+
+        let mut row_vals = Vec::with_capacity(col_count);
+        let mut row_bytes = 0usize;
+        for i in 0..col_count {
+            let val_ref = row.get_ref(i).map_err(map_rusqlite_error)?;
+            let (json_val, inferred_type, val_bytes) = sqlite_value_ref_to_json(val_ref);
+            if columns[i].data_type == "ANY" && inferred_type != "NULL" {
+                columns[i].data_type = inferred_type.to_string();
+            }
+            row_bytes += val_bytes;
+            row_vals.push(json_val);
+        }
+
+        if max_bytes > 0 && bytes_used + row_bytes > max_bytes && !rows_out.is_empty() {
+            truncated = true;
+            warnings.push(format!(
+                "Result truncated at max_bytes={max_bytes} budget"
+            ));
+            break;
+        }
+
+        bytes_used += row_bytes;
+        rows_out.push(row_vals);
+    }
+
+    Ok(SqliteRowSet {
+        columns,
+        rows: rows_out,
+        bytes_used,
+        truncated,
+        warnings,
+    })
+}
+
+/// Execute every statement of a multi-statement batch in order. The result set is the one of
+/// the last row-returning statement; `rows_affected` sums the data-changing statements.
+#[allow(clippy::too_many_arguments)]
+fn execute_sqlite_batch(
+    conn: &Connection,
+    request: &AuthorizedQuery,
+    sql: &str,
+    params: &[SqliteValue],
+    max_rows: usize,
+    max_bytes: usize,
+    default_schema: &str,
+    started: Instant,
+) -> DbMcpResult<QueryResult> {
+    if !params.is_empty() {
+        return Err(DbMcpError::InvalidArgument(
+            "Bound parameters are not supported in a multi-statement batch; send one statement per call"
+                .to_string(),
+        ));
+    }
+
+    let mut batch = Batch::new(conn, sql);
+    let mut executed = 0usize;
+    let mut rows_affected: Option<u64> = None;
+    let mut last_set: Option<(usize, SqliteRowSet)> = None;
+    loop {
+        let next = batch
+            .next()
+            .map_err(|err| batch_statement_error(map_rusqlite_error(err), executed))?;
+        let Some(mut stmt) = next else {
+            break;
+        };
+        if stmt.column_count() > 0 {
+            let set = collect_sqlite_rows(&mut stmt, &[], max_rows, max_bytes)
+                .map_err(|err| batch_statement_error(err, executed))?;
+            executed += 1;
+            last_set = Some((executed, set));
+        } else {
+            let changed = stmt
+                .execute([])
+                .map_err(|err| batch_statement_error(map_rusqlite_error(err), executed))?;
+            executed += 1;
+            *rows_affected.get_or_insert(0) += changed as u64;
+        }
+    }
+
+    let schema_version = introspect_sqlite_catalog(conn, default_schema)
+        .ok()
+        .map(|objs| compute_schema_version(&objs));
+
+    let mut warnings = Vec::new();
+    let (columns, rows, bytes_used, truncated) = match last_set {
+        Some((index, set)) => {
+            if executed > 1 {
+                warnings.push(format!(
+                    "Executed {executed} statements as one batch; the result set is from statement {index}."
+                ));
+            }
+            warnings.extend(set.warnings);
+            (set.columns, set.rows, set.bytes_used, set.truncated)
+        }
+        None => {
+            if executed > 1 {
+                warnings.push(format!(
+                    "Executed {executed} statements as one batch; no statement returned rows."
+                ));
+            }
+            (Vec::new(), Vec::new(), 0, false)
+        }
+    };
+
+    let returned_rows = rows.len();
+    Ok(QueryResult {
+        execution_id: request.execution_id.clone(),
+        columns,
+        rows,
+        returned_rows,
+        rows_affected,
+        truncated,
+        bytes_used,
+        execution_time_ms: started.elapsed().as_millis() as u64,
+        warnings,
+        schema_version,
+    })
+}
+
+/// Name the failing statement of a batch; the statements before it were already applied.
+fn batch_statement_error(err: DbMcpError, applied: usize) -> DbMcpError {
+    match err {
+        DbMcpError::AdapterError(msg) => DbMcpError::AdapterError(format!(
+            "Statement {} of the batch failed ({applied} earlier statement(s) already applied): {msg}",
+            applied + 1
+        )),
+        other => other,
     }
 }
 
@@ -1682,6 +1822,70 @@ mod tests {
         ro_write.read_only = true;
         let err = adapter.execute(ro_write).await.unwrap_err();
         assert_eq!(err.code(), "READONLY_VIOLATION");
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_multi_statement_batch_executes_every_statement() {
+        let adapter =
+            SqliteAdapter::open_memory_with_seed("sqlite-sample", SAMPLE_SEED).unwrap();
+        let limits = ExecutionLimits {
+            allow_multi_statement: true,
+            ..ExecutionLimits::default()
+        };
+        let write = |id: &str, sql: &str, params: Vec<serde_json::Value>| {
+            let mut q = AuthorizedQuery::new_read(
+                id,
+                "sqlite-sample",
+                CallerIdentity::local_agent("agent"),
+                sql,
+                params,
+                &limits,
+            );
+            q.statement_class = SqlStatementClass::Write;
+            q.read_only = false;
+            q
+        };
+
+        let result = adapter
+            .execute(write(
+                "req_batch",
+                "SELECT 1 AS a; INSERT INTO users (id, email) VALUES (9, 'z@example.com'); SELECT count(*) AS b FROM users;",
+                vec![],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result.columns[0].name, "b");
+        assert_eq!(result.rows[0][0], serde_json::json!(4));
+        assert_eq!(result.rows_affected, Some(1));
+        assert!(result.warnings.iter().any(|w| w.contains("Executed 3 statements")), "{:?}", result.warnings);
+
+        // Parameters cannot be bound across a batch: rejected before any statement runs.
+        let err = adapter
+            .execute(write(
+                "req_batch_params",
+                "INSERT INTO users (id, email) VALUES (?1, 'p@example.com'); SELECT 1",
+                vec![serde_json::json!(10)],
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "INVALID_ARGUMENT");
+
+        // A failing statement names its position; earlier statements stay applied.
+        let err = adapter
+            .execute(write(
+                "req_batch_fail",
+                "INSERT INTO users (id, email) VALUES (11, 'q@example.com'); SELECT * FROM no_such_table",
+                vec![],
+            ))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Statement 2 of the batch failed"), "{err}");
+
+        let count = adapter
+            .execute(write("req_count", "SELECT count(*) FROM users WHERE id IN (10, 11)", vec![]))
+            .await
+            .unwrap();
+        assert_eq!(count.rows[0][0], serde_json::json!(1));
     }
 
     #[tokio::test]

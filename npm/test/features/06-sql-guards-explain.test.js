@@ -508,17 +508,16 @@ async function runMultiStatementAllowed() {
       const res = await s[MYSQL].call("explain_query", { connection: MYSQL, sql: "SELECT 1; SELECT 2", format: "text" });
       expectOutcome("explain-multi-allowed", res, [INV, M]);
     });
-    // Adapters prepare only the first statement (e.g. crates/db-mcp-sqlite/src/lib.rs:1364 conn.prepare) and
-    // silently discard the tail: no warning, no error, no second result set.
-    await check(`${SQLITE} multi allowed: trailing statements are executed or explicitly reported`, async () => { // KNOWN-BUG: F06-B2
+    // F06-B2 fixed: the SQLite adapter executes every statement of an allowed batch and reports it.
+    await check(`${SQLITE} multi allowed: trailing statements are executed or explicitly reported`, async () => {
       const res = await s[SQLITE].call("execute_query", { connection: SQLITE, sql: "SELECT 1 AS a; SELECT 2 AS b" });
       expectOutcome("tail", res, OK);
       const names = (res.columns || []).map((c) => c.name);
       const secondExecuted = names.includes("b");
       const reported = (res.warnings || []).some((w) => /statement/i.test(w));
       assert.ok(secondExecuted || reported, `second statement silently dropped: columns=${names} warnings=${JSON.stringify(res.warnings)}`);
-    }, "F06-B2");
-    await check(`${SQLITE} multi allowed: DML in the middle of a batch is applied or explicitly reported`, async () => { // KNOWN-BUG: F06-B2
+    });
+    await check(`${SQLITE} multi allowed: DML in the middle of a batch is applied or explicitly reported`, async () => {
       const n = async () => (await s[SQLITE].call("execute_query", { connection: SQLITE, sql: "SELECT COUNT(*) FROM orders" })).rows[0][0];
       const before = await n();
       const res = await s[SQLITE].call("execute_query", { connection: SQLITE, sql: `SELECT 1; INSERT INTO orders (id, user_id, status, total_cents, created_at) VALUES (${900 + before}, 1, 'f06', 1, 'now'); SELECT 2` });
@@ -526,7 +525,7 @@ async function runMultiStatementAllowed() {
       const after = await n();
       const reported = (res.warnings || []).some((w) => /statement/i.test(w));
       assert.ok(after === before + 1 || reported, `INSERT silently dropped (before=${before} after=${after}) warnings=${JSON.stringify(res.warnings)}`);
-    }, "F06-B2");
+    });
   } finally {
     for (const c of CONNS) await s[c].close();
   }

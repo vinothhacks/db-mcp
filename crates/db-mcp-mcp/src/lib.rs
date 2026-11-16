@@ -209,6 +209,21 @@ fn arg_u64(args: &Value, key: &str) -> DbMcpResult<Option<u64>> {
     }
 }
 
+/// Optional execution-budget override (`timeout_ms`, `max_rows`, `max_bytes`). When present it must
+/// be a positive integer: zero, negative, fractional or non-numeric values are rejected instead of
+/// silently disabling or ignoring the connection cap.
+fn positive_budget_arg(args: &Value, key: &str) -> DbMcpResult<Option<u64>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => match v.as_u64() {
+            Some(n) if n > 0 => Ok(Some(n)),
+            _ => Err(DbMcpError::InvalidArgument(format!(
+                "'{key}' must be a positive integer (got {v}); omit it to use the connection limit"
+            ))),
+        },
+    }
+}
+
 fn definition_touches_restricted(def: &Definition, cfg: &db_mcp_policy::ConnectionPolicyConfig) -> bool {
     def.body.tables().iter().any(|t| cfg.is_restricted_table(t))
 }
@@ -1042,14 +1057,14 @@ impl DbMcpRuntime {
                 let mut gov_req = GovernedQueryRequest::new(req_id, &conn, caller.clone(), &sql)
                     .with_tool_name("execute_query")
                     .with_params(params);
-                if let Some(ms) = args.get("timeout_ms").and_then(|v| v.as_u64()) {
+                if let Some(ms) = positive_budget_arg(args, "timeout_ms")? {
                     gov_req = gov_req.with_timeout_ms(ms);
                 }
-                if let Some(rows) = args.get("max_rows").and_then(|v| v.as_u64()) {
-                    gov_req = gov_req.with_max_rows(rows as usize);
+                if let Some(rows) = positive_budget_arg(args, "max_rows")? {
+                    gov_req = gov_req.with_max_rows(usize::try_from(rows).unwrap_or(usize::MAX));
                 }
-                if let Some(bytes) = args.get("max_bytes").and_then(|v| v.as_u64()) {
-                    gov_req = gov_req.with_max_bytes(bytes as usize);
+                if let Some(bytes) = positive_budget_arg(args, "max_bytes")? {
+                    gov_req = gov_req.with_max_bytes(usize::try_from(bytes).unwrap_or(usize::MAX));
                 }
                 if args.get("change_id").is_some() {
                     // Approved changes must be executed through apply_change, which verifies the
@@ -1952,6 +1967,25 @@ mod tests {
             .await;
         assert_eq!(nt["status"], "ok");
         assert_eq!(nt["returned_rows"], 1);
+    }
+
+    #[tokio::test]
+    async fn execute_query_rejects_non_positive_budget_overrides() {
+        let handler = McpProtocolHandler::default_demo().expect("demo handler");
+        let caller = CallerIdentity::local_agent("local-agent");
+        for key in ["max_rows", "max_bytes", "timeout_ms"] {
+            for bad in [json!(0), json!(-1), json!("5"), json!(1.5)] {
+                let mut args = json!({ "connection": "local-sqlite", "sql": "SELECT id FROM users" });
+                args[key] = bad.clone();
+                let r = handler.call_tool("execute_query", args, &caller).await;
+                assert_eq!(r["status"], "denied", "{key}={bad}: {r}");
+                assert_eq!(r["code"], "INVALID_ARGUMENT", "{key}={bad}: {r}");
+            }
+            let mut args = json!({ "connection": "local-sqlite", "sql": "SELECT id FROM users" });
+            args[key] = json!(1000);
+            let r = handler.call_tool("execute_query", args, &caller).await;
+            assert_eq!(r["status"], "ok", "{key}=1000: {r}");
+        }
     }
 
     #[tokio::test]

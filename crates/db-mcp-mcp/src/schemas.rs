@@ -174,9 +174,9 @@ pub fn build_tool_definitions(active_profiles: &[ToolProfile]) -> Vec<McpToolDef
                     "connection": { "type": "string" },
                     "sql": { "type": "string" },
                     "params": { "type": "array", "items": {} },
-                    "timeout_ms": { "type": "integer" },
-                    "max_rows": { "type": "integer" },
-                    "max_bytes": { "type": "integer" },
+                    "timeout_ms": { "type": "integer", "minimum": 1 },
+                    "max_rows": { "type": "integer", "minimum": 1 },
+                    "max_bytes": { "type": "integer", "minimum": 1 },
                     "change_id": { "type": "string" }
                 },
                 "required": ["connection", "sql"]
