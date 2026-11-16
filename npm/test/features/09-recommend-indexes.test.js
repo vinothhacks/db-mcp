@@ -214,7 +214,7 @@ async function main() {
         `hypopg_validated=true but projected cost ${withExt.evidence.projected_index_cost} is exactly the heuristic formula`);
       assert.ok(Object.keys(withExt.evidence).some((k) => /hypopg|hypothetical/i.test(k) && k !== "hypopg_validated"), "no HypoPG measurement in evidence");
     }
-  }, { knownBug: "F09-02" });
+  });
   await check("has_hypopg=false: hypopg_validated is false on every recommendation", async () => {
     const p = okEnvelope(await n.call("recommend_indexes", { connection: PG, queries: ["SELECT * FROM users WHERE email = 'a'"] }), "noext");
     assert.ok(p.data.length > 0);
@@ -245,7 +245,7 @@ async function main() {
     const [o] = recsFor(await ri(["SELECT status, count(*) FROM orders GROUP BY status"]), "orders");
     assert.ok(o, "no orders recommendation");
     assert.deepEqual(o.columns, ["status"]);
-  }, { knownBug: "F09-05" });
+  });
   await check("JOIN key: orders.user_id recommended; users side not (id is PK)", async () => {
     const p = await ri(["SELECT o.id FROM orders o JOIN users u ON u.id = o.user_id WHERE u.email = 'a'"]);
     const [o] = recsFor(p, "orders");
@@ -364,12 +364,12 @@ async function main() {
   await check("explicit queries: every recommendation is backed by a submitted query (no FK-only noise)", async () => {
     const p = await ri(["SELECT * FROM users WHERE email = 'a'"]);
     assert.ok(p.data.every((r) => r.relevant_queries.some((q) => !q.startsWith("/*"))), `FK-only rows: ${p.data.filter((r) => r.relevant_queries.every((q) => q.startsWith("/*"))).map((r) => r.table_name)}`);
-  }, { knownBug: "F09-03" });
+  });
   await check("max_recommendations=1 keeps the query-driven candidate", async () => {
     const p = await ri(["SELECT * FROM users WHERE email = 'a'"], { max_recommendations: 1 });
     assert.equal(p.returned_rows, 1);
     assert.equal(shortTable(p.data[0]), "users", `kept ${p.data[0].table_name} instead of users`);
-  }, { knownBug: "F09-03" });
+  });
   await check("max_recommendations=3 and =100 honoured", async () => {
     const p3 = await ri(["SELECT * FROM users WHERE email = 'a'"], { max_recommendations: 3 });
     assert.ok(p3.returned_rows <= 3);
@@ -379,14 +379,14 @@ async function main() {
   await check("max_recommendations=0 -> zero recommendations or INVALID_ARGUMENT (not silently 10)", async () => {
     const p = await ri([], { max_recommendations: 0 });
     assert.ok(p.status === "denied" || p.returned_rows === 0, `returned ${p.returned_rows}`);
-  }, { knownBug: "F09-15" });
+  });
   await check("max_recommendations negative / non-integer -> INVALID_ARGUMENT", async () => {
     for (const v of [-1, 2.7, "abc"]) {
       const p = await ri(["SELECT * FROM users WHERE email = 'a'"], { max_recommendations: v });
       assert.equal(p.status, "denied", `max_recommendations=${JSON.stringify(v)} accepted (rows=${p.returned_rows})`);
       assert.equal(p.code, "INVALID_ARGUMENT");
     }
-  }, { knownBug: "F09-16" });
+  });
   await check("queries omitted / empty -> ok envelope (workload fallback)", async () => {
     okEnvelope(await d.call("recommend_indexes", { connection: PG }), "omitted");
     okEnvelope(await ri([]), "empty");
@@ -405,7 +405,7 @@ async function main() {
     assert.equal(p1.status, "denied", "string queries accepted");
     const p2 = await d.call("recommend_indexes", { connection: PG, queries: [1, null, { a: 1 }] });
     assert.equal(p2.status, "denied", "non-string array accepted");
-  }, { knownBug: "F09-17" });
+  });
   await check("50 queries processed under 5s", async () => {
     const qs = []; for (let i = 0; i < 50; i++) qs.push(`SELECT * FROM users WHERE role = 'r${i % 5}' AND created_at > '2025-0${(i % 9) + 1}' ORDER BY email`);
     const t0 = Date.now();
@@ -450,7 +450,7 @@ async function main() {
     assert.ok(sqliteRec, "no sqlite recommendation captured");
     const r = await d.call("execute_query", { connection: "local-sqlite", sql: sqliteRec.suggested_ddl });
     assert.equal(r.status, "ok", `${sqliteRec.suggested_ddl} -> ${r.code}: ${r.message}`);
-  }, { knownBug: "F09-18" });
+  });
   await check("prod-postgres: suggested DDL accepted by propose_change (parses as DDL, compensating DROP)", async () => {
     const [o] = recsFor(base, "orders");
     const r = await d.call("propose_change", { connection: PG, sql: o.suggested_ddl });
@@ -463,7 +463,7 @@ async function main() {
     assert.equal(p.status, "denied", `got ${p.status} with ${p.returned_rows} rows`);
     assert.match(String(p.code), /UNSUPPORTED|CAPABILITY|NOT_SUPPORTED/);
     assert.equal(typeof p.next_action, "string");
-  }, { knownBug: "F09-19" });
+  });
   await check("unknown connection -> CONNECTION_NOT_FOUND with next_action", async () => {
     const p = isDenied(await d.call("recommend_indexes", { connection: "nope", queries: ["SELECT 1"] }), ["CONNECTION_NOT_FOUND"]);
     assert.equal(typeof p.next_action, "string");

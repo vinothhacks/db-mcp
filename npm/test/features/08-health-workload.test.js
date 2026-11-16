@@ -271,19 +271,17 @@ async function main() {
     ]);
   });
 
-  // KNOWN-BUG: F08-02
   check("health/sqlite: no fabricated PostgreSQL-only metrics (buffer cache / pg connections / dead tuples) reported for SQLite", () => {
     const ids = sqH.body.data.findings.map((f) => f.check_id);
     const pgOnly = ids.filter((id) => ["buffer_cache_hit_ratio", "connection_saturation", "dead_tuple_bloat"].includes(id));
     assert.deepEqual(pgOnly, [], `PostgreSQL-only checks reported for SQLite with hardcoded values: ${pgOnly.join(",")}`);
     assert.equal(sqH.body.data.cache_hit_ratio, undefined, "cache_hit_ratio must not be reported for SQLite");
-  }, "KNOWN-BUG: F08-02");
+  });
 
-  // KNOWN-BUG: F08-02
   check("health/sqlite: provides engine-appropriate checks (page_count/db size, journal_mode, integrity/quick_check, foreign_key_check)", () => {
     const ids = sqH.body.data.findings.map((f) => f.check_id).join(" ");
     assert.match(ids, /page|size|journal|integrity|quick_check|foreign_key_check/i, `only generic checks present: ${ids}`);
-  }, "KNOWN-BUG: F08-02");
+  });
 
   // ======================= 2b. database_health on analytics-mysql =======================
   const myH = await s.call("database_health", { connection: "analytics-mysql" });
@@ -295,14 +293,13 @@ async function main() {
     assert.equal(mysqlCaps.supports_workload_analysis, false);
   });
 
-  // KNOWN-BUG: F08-01
   check("health/mysql: structured unsupported-capability denial with next_action (not a fabricated report)", () => {
     assert.ok(!myH.rpcError, "must not crash the transport");
     assert.equal(myH.isError, true, `database_health executed on MySQL and returned ${myH.body.returned_rows} fabricated checks (cache_hit_ratio=${myH.body.data && myH.body.data.cache_hit_ratio})`);
     assert.equal(myH.body.status, "denied");
     assert.match(myH.body.code, /UNSUPPORTED|CAPABILITY|NOT_SUPPORTED/i);
     assert.equal(typeof myH.body.next_action, "string");
-  }, "KNOWN-BUG: F08-01");
+  });
 
   check("health/mysql: no transport crash (either denial or envelope is structured JSON)", () => {
     assert.ok(!myH.rpcError);
@@ -354,14 +351,13 @@ async function main() {
   });
 
   // The JSON schema declares top_n as integer; 0/negative/non-integer are currently coerced to 10 silently.
-  // KNOWN-BUG: F08-07
   check("workload/pg: top_n = 0 / -3 / \"5\" are rejected with INVALID_ARGUMENT (or accepted with an explicit warning), never silently replaced by 10", () => {
     for (const [label, r] of [["0", wl0], ["-3", wlNeg], ['"5"', wlStr]]) {
       const denied = r.isError && r.body.code === "INVALID_ARGUMENT";
       const warned = !r.isError && r.body.warnings.some((w) => /top_n/i.test(w));
       assert.ok(denied || warned, `top_n=${label} silently coerced: rows=${r.body.returned_rows} warnings=${JSON.stringify(r.body.warnings)}`);
     }
-  }, "KNOWN-BUG: F08-07");
+  });
 
   // Restricted tables must never surface in diagnostics (search_objects / describe_object already hide them).
   check("workload/pg: restricted table internal_secrets never appears in synthesized workload / hot_tables", () => {
@@ -406,13 +402,12 @@ async function main() {
     assert.match(sqCaps.unavailable_reasons.workload_analysis, /query history fallback/i);
   });
 
-  // KNOWN-BUG: F08-09
   check("workload/sqlite+mysql: fallback note is engine-appropriate (does not talk about pg_stat_statements on SQLite/MySQL)", () => {
     for (const r of [sqWl0, myWl0]) {
       const notes = JSON.stringify(r.body.data.notes);
       assert.ok(!/pg_stat_statements/.test(notes), `${r.body.connection}: ${notes}`);
     }
-  }, "KNOWN-BUG: F08-09");
+  });
 
   // ======================= 3c. runtime telemetry via execute_query =======================
   const SECRET = "TOPSECRET_TOKEN_123";

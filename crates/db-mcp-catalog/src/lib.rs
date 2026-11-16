@@ -129,16 +129,9 @@ pub fn filter_and_paginate_objects(
             if !matches_pattern(request.schema_pattern.as_deref(), &obj.schema) {
                 return false;
             }
-            if let Some(name_pat) = request.name_pattern.as_deref() {
-                let matches_name = matches_pattern(Some(name_pat), &obj.name)
-                    || matches_pattern(Some(name_pat), &obj.qualified_name())
-                    || obj
-                        .columns
-                        .iter()
-                        .any(|col| matches_pattern(Some(name_pat), &col.name));
-                if !matches_name {
-                    return false;
-                }
+            // name_pattern filters on the object name only (not columns / qualified name).
+            if !matches_pattern(request.name_pattern.as_deref(), &obj.name) {
+                return false;
             }
             true
         })
@@ -188,7 +181,14 @@ pub fn describe_object(
     }
 
     let (target_schema, target_name) = match (schema, trimmed.split_once('.')) {
-        (Some(s), _) if !s.trim().is_empty() => (Some(s.trim()), trimmed),
+        (Some(s), split) if !s.trim().is_empty() => {
+            let s = s.trim();
+            // An already-qualified name whose prefix equals the schema argument resolves to the bare name.
+            match split {
+                Some((prefix, n)) if prefix.trim().eq_ignore_ascii_case(s) => (Some(s), n.trim()),
+                _ => (Some(s), trimmed),
+            }
+        }
         (None, Some((s, n))) => (Some(s.trim()), n.trim()),
         _ => (None, trimmed),
     };
@@ -203,10 +203,11 @@ pub fn describe_object(
             name_match && schema_match
         })
         .ok_or_else(|| {
-            DbMcpError::InvalidArgument(format!(
-                "Catalog object '{}' was not found",
-                object_name
-            ))
+            DbMcpError::PolicyDenied {
+                code: "OBJECT_NOT_FOUND".to_string(),
+                message: format!("Catalog object '{}' was not found", object_name),
+                next_action: Some("search_objects".to_string()),
+            }
         })?;
 
     Ok(found.project(detail_level))
@@ -818,6 +819,34 @@ mod tests {
         .unwrap();
         assert_eq!(described.columns.len(), 2);
         assert_eq!(described.indexes.len(), 1);
+    }
+
+    #[test]
+    fn describe_object_accepts_schema_with_qualified_name_and_not_found_has_next_action() {
+        let objects = sample_objects();
+        let d = describe_object(&objects, Some("public"), "public.users", CatalogDetailLevel::Names).unwrap();
+        assert_eq!(d.name, "users");
+        let err = describe_object(&objects, None, "missing_thing", CatalogDetailLevel::Names).unwrap_err();
+        assert_eq!(err.next_action(), Some("search_objects"));
+    }
+
+    #[test]
+    fn name_pattern_matches_object_name_only() {
+        let objects = sample_objects();
+        let req = CatalogRequest {
+            connection: "app-dev".to_string(),
+            schema_pattern: None,
+            name_pattern: Some("email".to_string()),
+            object_types: Vec::new(),
+            detail_level: CatalogDetailLevel::Names,
+            limit: 50,
+            offset: 0,
+        };
+        // `email` is a column of users, not an object name.
+        assert!(!filter_and_paginate_objects(&objects, &req)
+            .objects
+            .iter()
+            .any(|o| o.name == "users"));
     }
 
     #[test]

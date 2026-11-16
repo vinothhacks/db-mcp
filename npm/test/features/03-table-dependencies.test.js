@@ -326,9 +326,8 @@ async function main() {
     assert.equal(d0.max_depth, 3);
     assert.deepEqual(d0.transitive_tables, d3.transitive_tables);
   });
-  // KNOWN-BUG: F03-4  negative / non-integer max_depth is silently coerced to the default (3) instead of INVALID_ARGUMENT.
-  check("max_depth=-1 is rejected with INVALID_ARGUMENT", () => assertDenied(dNeg.payload, "INVALID_ARGUMENT", "neg"), "F03-4");
-  check("max_depth=\"2\" (string) is rejected with INVALID_ARGUMENT", () => assertDenied(dStr.payload, "INVALID_ARGUMENT", "str"), "F03-4");
+  check("max_depth=-1 is rejected with INVALID_ARGUMENT", () => assertDenied(dNeg.payload, "INVALID_ARGUMENT", "neg"));
+  check("max_depth=\"2\" (string) is rejected with INVALID_ARGUMENT", () => assertDenied(dStr.payload, "INVALID_ARGUMENT", "str"));
   check("transitive_tables never contains the root table and is sorted/unique", () => {
     for (const r of [d1, d2, d3, d10, orders, orderItems]) {
       assert.ok(!r.transitive_tables.includes(r.table_name));
@@ -380,10 +379,8 @@ async function main() {
     assert.deepEqual(lonely.dependent_objects, []);
   });
   const d1Join = (await trace({ table_name: "users", target_table: "inventory", max_depth: 1 })).payload.data;
-  // KNOWN-BUG: F03-3  find_shortest_join_path uses max(max_depth, 6); a 3-hop path is returned for max_depth=1 although the
-  // tool schema documents max_depth as the bound for join paths.
   check("join users->inventory with max_depth=1: path longer than max_depth is not returned", () =>
-    assert.equal(d1Join.join_path, null), "F03-3");
+    assert.equal(d1Join.join_path, null));
 
   for (const [label, sql] of [
     ["users->inventory", uInv.join_path.synthesized_join_sql],

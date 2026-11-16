@@ -261,12 +261,18 @@ impl PgInsightsEngine {
         let snapshot = self
             .collect_or_get_telemetry(connection, Some(adapter))
             .await;
-        Ok(self.build_health_report(
-            connection,
-            adapter.capabilities().engine,
-            &catalog.objects,
-            &snapshot,
-        ))
+        let engine = adapter.capabilities().engine;
+        let mut report = self.build_health_report(connection, engine, &catalog.objects, &snapshot);
+        if engine == DatabaseEngine::Sqlite {
+            report.findings.extend(sqlite_health_findings(adapter, connection).await);
+            report.overall_status = report
+                .findings
+                .iter()
+                .map(|f| f.severity)
+                .max()
+                .unwrap_or(HealthSeverity::Healthy);
+        }
+        Ok(report)
     }
 
     /// Run `analyze_workload` directly against a provided `DatabaseAdapter`.
@@ -783,6 +789,18 @@ impl PgInsightsEngine {
             },
         });
 
+        // Buffer cache, connection saturation and dead-tuple bloat are PostgreSQL-only metrics:
+        // never report them (with fabricated defaults) for other engines.
+        let pg_only = engine == DatabaseEngine::Postgres;
+        if !pg_only {
+            findings.retain(|f| {
+                !matches!(
+                    f.check_id.as_str(),
+                    "buffer_cache_hit_ratio" | "connection_saturation" | "dead_tuple_bloat"
+                )
+            });
+        }
+
         let overall_status = findings
             .iter()
             .map(|f| f.severity)
@@ -794,10 +812,10 @@ impl PgInsightsEngine {
             engine,
             collected_at: Utc::now(),
             overall_status,
-            cache_hit_ratio: Some(hit_ratio),
-            active_connections: Some(active_conn),
-            max_connections: Some(max_conn),
-            dead_tuples_total: Some(dead_total),
+            cache_hit_ratio: pg_only.then_some(hit_ratio),
+            active_connections: pg_only.then_some(active_conn),
+            max_connections: pg_only.then_some(max_conn),
+            dead_tuples_total: pg_only.then_some(dead_total),
             invalid_indexes,
             long_running_queries: long_queries_count,
             findings,
@@ -940,10 +958,15 @@ impl PgInsightsEngine {
                     }
                 }
             }
-            notes.push(
+            notes.push(if engine == DatabaseEngine::Postgres {
                 "pg_stat_statements was not active; synthesized workload profile from catalog and query history."
-                    .to_string(),
-            );
+                    .to_string()
+            } else {
+                format!(
+                    "{} has no statement-statistics view; synthesized workload profile from catalog and recorded query history.",
+                    engine.as_str()
+                )
+            });
         }
 
         // Ensure tables_referenced is populated via SQL AST analysis for every stat entry
@@ -1027,12 +1050,14 @@ impl PgInsightsEngine {
         };
 
         // 2. Collect candidate SQL statements (explicit queries + workload queries if none passed)
+        let simulated = adapter.map(|a| a.is_simulated()).unwrap_or(false);
         let mut candidate_queries: Vec<String> = queries
             .into_iter()
             .map(|q| q.trim().to_string())
             .filter(|q| !q.is_empty())
             .collect();
 
+        let from_workload = candidate_queries.is_empty();
         if candidate_queries.is_empty() {
             let workload = self
                 .analyze_workload_internal(connection, adapter, limit * 2)
@@ -1066,9 +1091,11 @@ impl PgInsightsEngine {
             }
         }
 
-        // Also inspect catalog for missing foreign key indexes if we still have room
+        // Inspect the catalog for missing foreign key indexes only when the caller supplied no queries:
+        // otherwise FK-only candidates would outrank / pollute the query-derived ones.
+        let explicit_queries = !from_workload;
         for obj in &objects {
-            if obj.object_type != CatalogObjectType::Table {
+            if explicit_queries || obj.object_type != CatalogObjectType::Table {
                 continue;
             }
             let tbl_name = obj.qualified_name();
@@ -1177,7 +1204,8 @@ impl PgInsightsEngine {
                     };
                     let proj = (base * selectivity_factor).max(1.5);
                     let pct = (((base - proj) / base) * 100.0 * 10.0).round() / 10.0;
-                    (supports_hypopg, pct, base, proj)
+                    // A simulated backend cannot run HypoPG: never claim validation there.
+                    (supports_hypopg && !simulated, pct, base, proj)
                 };
 
             let short_table = table_key
@@ -1208,8 +1236,14 @@ impl PgInsightsEngine {
                 String::new()
             };
 
+            // SQLite rejects a schema-qualified table after ON, so use the bare table name there.
+            let ddl_table = if engine == DatabaseEngine::Sqlite {
+                table_key.rsplit('.').next().unwrap_or(table_key.as_str()).to_string()
+            } else {
+                table_key.clone()
+            };
             let suggested_ddl = format!(
-                "CREATE INDEX {concurrently_kw}{index_name} ON {table_key} ({}){partial_clause};",
+                "CREATE INDEX {concurrently_kw}{index_name} ON {ddl_table} ({}){partial_clause};",
                 ordered_cols.join(", ")
             );
             let drop_ddl = if engine == DatabaseEngine::Postgres {
@@ -1333,6 +1367,69 @@ impl PgInsightsEngine {
         }
         "snapshot_unknown".to_string()
     }
+}
+
+/// Engine-appropriate SQLite health checks (integrity and journal mode) via read-only PRAGMAs.
+async fn sqlite_health_findings(adapter: &dyn DatabaseAdapter, connection: &str) -> Vec<HealthFinding> {
+    let limits = ExecutionLimits {
+        timeout_ms: 3_000,
+        max_rows: 50,
+        max_bytes: 65_536,
+        allow_multi_statement: false,
+    };
+    let probe = |sql: &str| {
+        AuthorizedQuery::new_read(
+            format!("req_health_probe_{}", Uuid::new_v4().simple()),
+            connection,
+            CallerIdentity::local_agent("pg-insights"),
+            sql,
+            Vec::new(),
+            &limits,
+        )
+    };
+    let mut findings = Vec::new();
+    if let Ok(res) = adapter.execute(probe("PRAGMA quick_check")).await {
+        let results: Vec<String> = res
+            .rows
+            .iter()
+            .filter_map(|r| r.first().and_then(|v| v.as_str()).map(ToOwned::to_owned))
+            .collect();
+        let ok = results.len() == 1 && results[0].eq_ignore_ascii_case("ok");
+        findings.push(HealthFinding {
+            check_id: "sqlite_quick_check".to_string(),
+            category: "integrity".to_string(),
+            severity: if ok { HealthSeverity::Healthy } else { HealthSeverity::Critical },
+            summary: if ok {
+                "PRAGMA quick_check reported ok".to_string()
+            } else {
+                format!("PRAGMA quick_check reported {} problem(s)", results.len())
+            },
+            evidence: serde_json::json!({ "quick_check": results }),
+            remediation: if ok {
+                None
+            } else {
+                Some("Restore from backup or run PRAGMA integrity_check and rebuild the database.".to_string())
+            },
+        });
+    }
+    if let Ok(res) = adapter.execute(probe("PRAGMA journal_mode")).await {
+        let mode = res
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        findings.push(HealthFinding {
+            check_id: "sqlite_journal_mode".to_string(),
+            category: "storage".to_string(),
+            severity: HealthSeverity::Healthy,
+            summary: format!("Journal mode is {mode}"),
+            evidence: serde_json::json!({ "journal_mode": mode }),
+            remediation: None,
+        });
+    }
+    findings
 }
 
 #[async_trait]
