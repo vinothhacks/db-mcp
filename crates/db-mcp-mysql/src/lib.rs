@@ -40,6 +40,7 @@ use tokio::net::TcpStream;
 use url::Url;
 
 pub mod catalog;
+pub mod diagnostics;
 pub mod live;
 
 pub use live::{
@@ -2213,6 +2214,41 @@ INSERT INTO t VALUES (1);
         assert_eq!(f.object_type, CatalogObjectType::Function);
         assert!(f.definition.as_deref().unwrap().contains("RETURNS decimal(12,2)"));
         assert!(!adapter.live().unwrap().catalog_warnings().iter().any(|w| w.contains("SHOW_ROUTINE")));
+    }
+
+    #[tokio::test]
+    async fn live_diagnostics_degrade_without_grants_and_use_them_when_granted() {
+        let Some(ro) = live_adapter("DB_MCP_MYSQL_TEST_DSN") else { return };
+        let live = ro.live().unwrap().clone();
+        let objects = ro.collect_all_catalog_objects().await.unwrap();
+        let report = live.database_health(&objects).await.unwrap();
+        let ids: Vec<&str> = report.findings.iter().map(|f| f.check_id.as_str()).collect();
+        assert!(ids.contains(&"tables_without_primary_key") && ids.contains(&"redundant_indexes"), "{ids:?}");
+        assert!(ids.contains(&"process_visibility") && ids.contains(&"workload_visibility"), "{ids:?}");
+        assert!(report.active_connections.is_some() && report.max_connections.is_some());
+        let no_pk = report.findings.iter().find(|f| f.check_id == "tables_without_primary_key").unwrap();
+        assert!(no_pk.evidence.to_string().contains("event_log_nopk"));
+        let w = live.analyze_workload(10).await.unwrap();
+        assert!(w.unwrap_err().contains("GRANT SELECT ON performance_schema"));
+
+        let Some(diag) = live_adapter("DB_MCP_MYSQL_TEST_DSN_DIAG") else { return };
+        let q = AuthorizedQuery::new_read(
+            "r",
+            "live",
+            CallerIdentity::local_agent("t"),
+            "SELECT id, total_cents FROM orders WHERE total_cents > 1000",
+            vec![],
+            &ExecutionLimits::default(),
+        );
+        diag.execute(q).await.unwrap();
+        let live = diag.live().unwrap().clone();
+        let w = live.analyze_workload(20).await.unwrap().expect("digests readable with the grant");
+        assert_eq!(w.source, "performance_schema.events_statements_summary_by_digest");
+        assert!(w.top_queries.iter().any(|q| q.normalized_query.to_ascii_lowercase().contains("total_cents")), "{:?}", w.top_queries);
+        assert!(!w.top_queries.iter().any(|q| q.normalized_query.to_ascii_lowercase().contains("information_schema")));
+        let objects = diag.collect_all_catalog_objects().await.unwrap();
+        let report = live.database_health(&objects).await.unwrap();
+        assert!(!report.findings.iter().any(|f| f.check_id == "process_visibility" || f.check_id == "workload_visibility"));
     }
 
     #[test]

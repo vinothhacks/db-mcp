@@ -1423,7 +1423,14 @@ impl DbMcpRuntime {
                         "supports_health_diagnostics",
                     ));
                 }
-                let report = self.pg_insights.database_health(&conn).await?;
+                let report = match self.mysql_live.get(&conn).and_then(|m| m.live().cloned()) {
+                    // Live MySQL: server counters + catalog checks over the policy-visible catalog.
+                    Some(live) => {
+                        let (visible, _) = self.discover_allowed(adapter.as_ref(), &conn, None).await?;
+                        live.database_health(&visible).await?
+                    }
+                    None => self.pg_insights.database_health(&conn).await?,
+                };
                 let mut val = to_json(PgInsightsEngine::health_report_to_response(
                     req_id,
                     "snapshot_health",
@@ -1440,7 +1447,18 @@ impl DbMcpRuntime {
                 let conn = req_str("connection")?;
                 let _adapter = self.get_authorized_adapter(caller, &conn)?;
                 let top_n = arg_positive_u64(args, "top_n")?.unwrap_or(10) as usize;
-                let workload = self.pg_insights.analyze_workload(&conn, top_n).await?;
+                let workload = match self.mysql_live.get(&conn).and_then(|m| m.live().cloned()) {
+                    Some(live) => match live.analyze_workload(top_n).await? {
+                        Ok(w) => w,
+                        // Missing optional grant: session history, plus a note naming the GRANT.
+                        Err(note) => {
+                            let mut w = self.pg_insights.analyze_workload(&conn, top_n).await?;
+                            w.notes.push(note);
+                            w
+                        }
+                    },
+                    None => self.pg_insights.analyze_workload(&conn, top_n).await?,
+                };
                 let mut val = to_json(PgInsightsEngine::workload_to_response(
                     req_id,
                     "snapshot_workload",
@@ -1477,7 +1495,25 @@ impl DbMcpRuntime {
                         next_action: Some("Remove restricted tables from the workload".to_string()),
                     });
                 }
-                let recs = self.pg_insights.recommend_indexes(&conn, queries, max_recs).await?;
+                let recs = match self.mysql_live.get(&conn).and_then(|m| m.live().cloned()) {
+                    Some(live) => {
+                        // Without explicit queries, prefer the server's statement digests.
+                        let mut queries = queries;
+                        if queries.is_empty() {
+                            if let Ok(Ok(w)) = live.analyze_workload(max_recs.max(10) * 2).await {
+                                queries = w
+                                    .top_queries
+                                    .into_iter()
+                                    .map(|q| q.normalized_query)
+                                    .filter(|q| !mentions_restricted(q, &cfg))
+                                    .collect();
+                            }
+                        }
+                        let recs = self.pg_insights.recommend_indexes(&conn, queries, max_recs).await?;
+                        live.finish_index_recommendations(recs).await
+                    }
+                    None => self.pg_insights.recommend_indexes(&conn, queries, max_recs).await?,
+                };
                 let mut val = to_json(PgInsightsEngine::recommendations_to_response(
                     req_id,
                     &conn,
