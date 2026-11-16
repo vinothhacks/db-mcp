@@ -42,3 +42,30 @@ jobs:
         run: for f in npm/test/features/*.test.js; do echo "== $f"; node "$f" || true; done
       - name: npm pack dry run
         run: npm pack --dry-run
+
+  mysql-live:
+    name: live MySQL 8 (read-only login)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build release binary
+        run: cargo build --release -p db-mcp-server
+      - name: Start mysql:8.0, seed the fixture, create read-only logins
+        shell: bash
+        run: |
+          bash scripts/live-db-up.sh mysql > "$RUNNER_TEMP/mysql-env.sh"
+          sed -n 's#.*://[^:]*:\([^@]*\)@.*##p' "$RUNNER_TEMP/mysql-env.sh" | while read -r pw; do echo "::add-mask::$pw"; done
+          sed -e 's/^export //' -e "s/'//g" "$RUNNER_TEMP/mysql-env.sh" >> "$GITHUB_ENV"
+      - name: Gated Rust live tests (db-mcp-mysql)
+        run: cargo test --release -p db-mcp-mysql
+      - name: Suite 17 (every tool on the live server)
+        run: node npm/test/features/17-mysql-live.test.js
+      - name: Remove the container
+        if: always()
+        run: bash scripts/live-db-up.sh mysql --down

@@ -412,7 +412,11 @@ function printLauncherHelp() {
       `Server commands (forwarded to db-mcp-server):\n` +
       `  serve --transport stdio|http [--bind host:port] --config <file> [--principal id] [--role role]\n` +
       `  approve --change-id <chg_id> --approver <principal> [--role admin] [--comment text] --config <file>\n` +
-      `  verify-config --config <file>
+      `  verify-config --config <file> [--live]   (--live also runs check-connection on every connection)
+` +
+      `  check-connection --config <file> [--connection <id>]   read-only smoke test: version, SELECT 1, grants,
+` +
+      `                                 object count, can_write warning (never prints the DSN)
 ` +
       `  verify-audit --config <file>   (verify audit hash chains; non-zero exit on tamper)
 

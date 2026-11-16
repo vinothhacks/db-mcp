@@ -45,3 +45,16 @@ cargo build --release -p db-mcp-server
 node scripts/ontology-demo.js --keep      # prints the kept ontology.db path
 # then, from an MCP client with REA: inspect_pe_imports / inspect_sqlite_database on those paths
 ```
+
+## 3. Egress note for live MySQL (v0.3.0, Track M)
+
+The binary now links a MySQL wire-protocol client: `mysql_async` 0.37 with
+`default-features = false, features = ["minimal-rust"]` (pure-Rust deflate, no TLS). `cargo tree -p
+db-mcp-mysql` contains no `rustls`, `native-tls`, `openssl`, `ring`, `hyper`, `reqwest` or other
+HTTP/TLS crate from this dependency. The client opens TCP connections only to the `host:port` of a
+configured `engine = "MySql"` connection whose `backend` is `live` (pool of at most 4 per
+connection, opened lazily on the first tool call, never at startup); simulated connections never
+open a socket. `caching_sha2_password` full authentication uses the server's RSA public key over the
+same connection. There is still no HTTP client or model SDK, so ontology discovery and planning
+cannot send schema or data to an external service. (SQL Server's TDS client and its TLS stack are
+documented by the SQL Server track.)
