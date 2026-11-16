@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use url::Url;
 
+pub mod catalog;
 pub mod live;
 
 pub use live::{
@@ -285,15 +286,17 @@ pub fn parse_mysql_explain_json(raw_json: &str) -> DbMcpResult<ParsedMySqlPlan> 
     let mut seq_scans = Vec::new();
     let mut index_scans = Vec::new();
     let mut rows_examined_total = 0.0_f64;
+    let mut notes = Vec::new();
 
     walk_mysql_plan_node(
-        qb,
+        &parsed,
         &mut seq_scans,
         &mut index_scans,
         &mut rows_examined_total,
+        &mut notes,
     );
 
-    let mut warnings = Vec::new();
+    let mut warnings = notes;
     for tbl in &seq_scans {
         warnings.push(format!(
             "Full table scan (access_type=ALL) detected on MySQL table '{tbl}'"
@@ -315,37 +318,56 @@ fn walk_mysql_plan_node(
     seq_scans: &mut Vec<String>,
     index_scans: &mut Vec<String>,
     rows_examined: &mut f64,
+    notes: &mut Vec<String>,
 ) {
-    if let Some(tbl_obj) = node.get("table") {
-        let table_name = tbl_obj
-            .get("table_name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown");
-        let access_type = tbl_obj
-            .get("access_type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("ALL");
-        let rows = tbl_obj
-            .get("rows_examined_per_scan")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(1.0);
-        *rows_examined += rows;
-
-        if access_type.eq_ignore_ascii_case("ALL") {
-            if !seq_scans.contains(&table_name.to_string()) {
-                seq_scans.push(table_name.to_string());
+    match node {
+        serde_json::Value::Object(map) => {
+            if let Some(tbl_obj) = map.get("table").filter(|t| t.is_object()) {
+                let table_name = tbl_obj
+                    .get("table_name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                let access_type = tbl_obj
+                    .get("access_type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("ALL");
+                let rows = tbl_obj
+                    .get("rows_examined_per_scan")
+                    .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                    .unwrap_or(1.0);
+                *rows_examined += rows;
+                if access_type.eq_ignore_ascii_case("ALL") {
+                    if !seq_scans.contains(&table_name.to_string()) {
+                        seq_scans.push(table_name.to_string());
+                    }
+                } else if let Some(key) = tbl_obj.get("key").and_then(serde_json::Value::as_str) {
+                    if !index_scans.contains(&key.to_string()) {
+                        index_scans.push(key.to_string());
+                    }
+                }
             }
-        } else if let Some(key) = tbl_obj.get("key").and_then(serde_json::Value::as_str) {
-            if !index_scans.contains(&key.to_string()) {
-                index_scans.push(key.to_string());
+            if map.get("using_filesort").and_then(serde_json::Value::as_bool) == Some(true) {
+                let n = "Plan sorts rows with a filesort (no index provides the ORDER BY / GROUP BY order)".to_string();
+                if !notes.contains(&n) {
+                    notes.push(n);
+                }
+            }
+            if map.get("using_temporary_table").and_then(serde_json::Value::as_bool) == Some(true) {
+                let n = "Plan materializes an internal temporary table".to_string();
+                if !notes.contains(&n) {
+                    notes.push(n);
+                }
+            }
+            for child in map.values() {
+                walk_mysql_plan_node(child, seq_scans, index_scans, rows_examined, notes);
             }
         }
-    }
-
-    if let Some(nested) = node.get("nested_loop").and_then(serde_json::Value::as_array) {
-        for child in nested {
-            walk_mysql_plan_node(child, seq_scans, index_scans, rows_examined);
+        serde_json::Value::Array(items) => {
+            for child in items {
+                walk_mysql_plan_node(child, seq_scans, index_scans, rows_examined, notes);
+            }
         }
+        _ => {}
     }
 }
 
@@ -562,15 +584,32 @@ impl MySqlAdapter {
         self.live.as_ref()
     }
 
-    /// A live backend is never served by the simulation: live catalog and plan reads are not
-    /// part of this build yet, so they fail closed here (after the reachability check).
+    /// Simulated backends need no connectivity; live calls go to the server directly.
     async fn ensure_connectivity(&self) -> DbMcpResult<()> {
+        Ok(())
+    }
+
+    /// Live catalog (cached for `catalog::CATALOG_CACHE_TTL`) merged with registered objects.
+    async fn live_catalog_objects(&self, live: &live::LiveMySql, force: bool) -> DbMcpResult<Vec<CatalogObject>> {
+        let cached = live.catalog(force).await?;
+        let mut objects: Vec<CatalogObject> = cached.objects.as_ref().clone();
+        for entry in self.custom_catalog.iter() {
+            if let Some(existing) = objects
+                .iter_mut()
+                .find(|o| o.qualified_name().to_ascii_lowercase() == *entry.key())
+            {
+                *existing = entry.value().clone();
+            } else {
+                objects.push(entry.value().clone());
+            }
+        }
+        Ok(objects)
+    }
+
+    /// Re-read the live catalog now (capture_schema / diff_schema / drift checks).
+    pub async fn refresh_catalog(&self) -> DbMcpResult<()> {
         if let Some(live) = &self.live {
-            live.checkout().await?;
-            return Err(DbMcpError::UnsupportedCapability(format!(
-                "live MySQL catalog discovery and EXPLAIN are not available in this build for '{}'",
-                self.config.connection_id
-            )));
+            live.catalog(true).await?;
         }
         Ok(())
     }
@@ -599,6 +638,9 @@ impl MySqlAdapter {
     }
 
     async fn collect_all_catalog_objects(&self) -> DbMcpResult<Vec<CatalogObject>> {
+        if let Some(live) = &self.live {
+            return self.live_catalog_objects(live, false).await;
+        }
         self.ensure_connectivity().await?;
         let conn = Arc::clone(&self.engine_conn);
         let default_schema = self.config.default_schema.clone();
@@ -628,6 +670,12 @@ impl MySqlAdapter {
         .await
         .map_err(|e| DbMcpError::InternalError(format!("MySQL catalog join error: {e}")))?
     }
+}
+
+fn is_ddl_statement(sql: &str) -> bool {
+    parse_and_analyze_sql(DatabaseEngine::MySql, sql)
+        .map(|a| a.overall_class == SqlStatementClass::Ddl || a.has_ddl)
+        .unwrap_or(false)
 }
 
 fn bootstrap_mysql_system_tables(conn: &Connection) -> DbMcpResult<()> {
@@ -1317,7 +1365,11 @@ impl DatabaseAdapter for MySqlAdapter {
 
     async fn discover(&self, request: CatalogRequest) -> DbMcpResult<CatalogResponse> {
         let all_objects = self.collect_all_catalog_objects().await?;
-        Ok(filter_and_paginate_objects(&all_objects, &request))
+        let mut response = filter_and_paginate_objects(&all_objects, &request);
+        if self.live.is_some() {
+            response.schema_version = Some(compute_schema_version(&all_objects));
+        }
+        Ok(response)
     }
 
     async fn execute(&self, request: AuthorizedQuery) -> DbMcpResult<QueryResult> {
@@ -1333,7 +1385,21 @@ impl DatabaseAdapter for MySqlAdapter {
                     log.push(live::build_mysql_session_setup(true, timeout_ms));
                 }
             }
-            return live.execute(&request, read_only, timeout_ms).await;
+            let mutating = !read_only
+                && parse_and_analyze_sql(DatabaseEngine::MySql, &request.sql)
+                    .map(|a| a.overall_class != SqlStatementClass::Read || a.has_ddl || a.has_cte_write)
+                    .unwrap_or(true);
+            let outcome = live.execute(&request, read_only, timeout_ms).await;
+            if mutating {
+                // Writes and DDL (implicit commit) may change the schema: re-read it next time.
+                live.invalidate_catalog();
+            }
+            let mut result = outcome?;
+            if is_ddl_statement(&request.sql) {
+                result.warnings.push(MYSQL_NON_TRANSACTIONAL_DDL_WARNING.to_string());
+            }
+            result.schema_version = live.cached_schema_version();
+            return Ok(result);
         }
 
         let exec_id = request.execution_id.clone();
@@ -1520,6 +1586,9 @@ impl DatabaseAdapter for MySqlAdapter {
     }
 
     async fn explain(&self, request: ExplainRequest) -> DbMcpResult<ExplainPlan> {
+        if let Some(live) = &self.live {
+            return live.explain(&request).await;
+        }
         self.ensure_connectivity().await?;
 
         let stmts = split_sql_statements(DatabaseEngine::MySql, &request.sql);
@@ -1704,6 +1773,7 @@ impl SchemaDiffProvider for MySqlAdapter {
         connection: &str,
         schema_pattern: Option<String>,
     ) -> DbMcpResult<SchemaSnapshot> {
+        self.refresh_catalog().await?;
         let req = CatalogRequest {
             connection: connection.to_string(),
             schema_pattern,
@@ -2013,6 +2083,136 @@ INSERT INTO t VALUES (1);
         assert!(out.contains("END ;"), "{out}");
         let adapter = MySqlAdapter::simulated_with_seed("m", sql).unwrap();
         adapter.execute_batch("SELECT 1;").unwrap();
+    }
+
+    fn live_adapter(var: &str) -> Option<MySqlAdapter> {
+        let dsn = std::env::var(var).ok().filter(|v| !v.trim().is_empty());
+        let Some(dsn) = dsn else {
+            eprintln!("skipped: {var} not set (run `eval \"$(bash scripts/live-db-up.sh mysql)\"`)");
+            return None;
+        };
+        Some(MySqlAdapter::new(MySqlConfig::new("live", dsn).with_read_only(true)).unwrap())
+    }
+
+    fn catalog_req(types: Vec<CatalogObjectType>) -> CatalogRequest {
+        CatalogRequest {
+            connection: "live".to_string(),
+            schema_pattern: None,
+            name_pattern: None,
+            object_types: types,
+            detail_level: CatalogDetailLevel::Full,
+            limit: 1000,
+            offset: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn live_catalog_discovery_and_explain() {
+        let Some(adapter) = live_adapter("DB_MCP_MYSQL_TEST_DSN") else { return };
+        assert!(!adapter.is_simulated());
+        assert!(adapter.capabilities().supports_health_diagnostics);
+        let resp = adapter.discover(catalog_req(vec![CatalogObjectType::Table, CatalogObjectType::View])).await.unwrap();
+        let names: Vec<&str> = resp.objects.iter().map(|o| o.name.as_str()).collect();
+        for t in ["users", "orders", "order_items", "inventory", "audit_logs", "internal_secrets", "active_user_orders"] {
+            assert!(names.contains(&t), "{t} missing from {names:?}");
+        }
+        assert!(resp.schema_version.as_deref().unwrap().starts_with("snapshot_"));
+        let orders = resp.objects.iter().find(|o| o.name == "orders").unwrap();
+        assert_eq!(orders.schema, "appdb");
+        assert!(orders.foreign_keys.iter().any(|f| f.referenced_table == "users" && f.columns == vec!["user_id"]));
+        assert!(orders.indexes.iter().any(|i| i.name == "idx_orders_status_created" && i.columns == vec!["status", "created_at"]));
+        let view = resp.objects.iter().find(|o| o.name == "active_user_orders").unwrap();
+        assert!(view.definition.as_deref().unwrap().contains("`appdb`.`orders`"));
+        // The minimal login cannot see routines; the catalog says so instead of failing.
+        let warnings = adapter.live().unwrap().catalog_warnings();
+        assert!(warnings.iter().any(|w| w.contains("SHOW_ROUTINE")), "{warnings:?}");
+
+        let described = adapter.describe_object(Some("appdb"), "users", CatalogDetailLevel::Full).await.unwrap();
+        assert!(described.columns.iter().any(|c| c.name == "password_hash"));
+
+        let plan = adapter
+            .explain(ExplainRequest {
+                request_id: "e1".to_string(),
+                connection: "live".to_string(),
+                sql: "SELECT * FROM orders WHERE total_cents > ?".to_string(),
+                params: vec![serde_json::json!(1000)],
+                analyze: false,
+                format: ExplainFormat::Json,
+                timeout_ms: 5_000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(plan.seq_scans, vec!["orders".to_string()], "{plan:?}");
+        assert!(plan.estimated_cost.is_some());
+        let plan = adapter
+            .explain(ExplainRequest {
+                request_id: "e2".to_string(),
+                connection: "live".to_string(),
+                sql: "SELECT o.id FROM orders o JOIN users u ON u.id = o.user_id WHERE o.user_id = 1".to_string(),
+                params: vec![],
+                analyze: true,
+                format: ExplainFormat::Text,
+                timeout_ms: 5_000,
+            })
+            .await
+            .unwrap();
+        assert!(plan.raw_plan.contains("actual time"), "{}", plan.raw_plan);
+        assert!(!plan.index_scans.is_empty(), "{plan:?}");
+        let err = adapter
+            .explain(ExplainRequest {
+                request_id: "e3".to_string(),
+                connection: "live".to_string(),
+                sql: "SELECT * FROM no_such_table".to_string(),
+                params: vec![],
+                analyze: false,
+                format: ExplainFormat::Json,
+                timeout_ms: 5_000,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "ADAPTER_ERROR");
+        let err = adapter
+            .explain(ExplainRequest {
+                request_id: "e4".to_string(),
+                connection: "live".to_string(),
+                sql: "DELETE FROM orders".to_string(),
+                params: vec![],
+                analyze: false,
+                format: ExplainFormat::Json,
+                timeout_ms: 5_000,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "READONLY_VIOLATION");
+
+        let snap = adapter.capture_schema("live", None).await.unwrap();
+        let q = AuthorizedQuery::new_read(
+            "r",
+            "live",
+            CallerIdentity::local_agent("t"),
+            "SELECT COUNT(*) FROM orders",
+            vec![],
+            &ExecutionLimits::default(),
+        );
+        let res = adapter.execute(q).await.unwrap();
+        assert_eq!(res.schema_version.as_deref(), Some(snap.schema_version.as_str()));
+    }
+
+    #[tokio::test]
+    async fn live_catalog_with_show_routine_lists_routines() {
+        let Some(adapter) = live_adapter("DB_MCP_MYSQL_TEST_DSN_DIAG") else { return };
+        let resp = adapter
+            .discover(catalog_req(vec![CatalogObjectType::Procedure, CatalogObjectType::Function]))
+            .await
+            .unwrap();
+        let checkout = resp.objects.iter().find(|o| o.name == "checkout_order").expect("checkout_order");
+        let def = checkout.definition.as_deref().unwrap();
+        assert!(def.starts_with("CREATE PROCEDURE `appdb`.`checkout_order`(IN p_order_id bigint)"), "{def}");
+        assert!(def.contains("CALL reserve_inventory"));
+        let f = resp.objects.iter().find(|o| o.name == "calculate_order_discount").unwrap();
+        assert_eq!(f.object_type, CatalogObjectType::Function);
+        assert!(f.definition.as_deref().unwrap().contains("RETURNS decimal(12,2)"));
+        assert!(!adapter.live().unwrap().catalog_warnings().iter().any(|w| w.contains("SHOW_ROUTINE")));
     }
 
     #[test]

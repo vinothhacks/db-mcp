@@ -170,6 +170,8 @@ pub struct DbMcpRuntime {
     pg_insights: PgInsightsEngine,
     changes: ChangeManager,
     ontology: OntologyService,
+    /// Live MySQL adapters (typed handles for catalog refresh and MySQL diagnostics).
+    mysql_live: BTreeMap<String, Arc<MySqlAdapter>>,
 }
 
 /// Build the ontology service from configuration (shared by the runtime and the admin CLI).
@@ -347,6 +349,7 @@ impl DbMcpRuntime {
         let mut adapters: BTreeMap<String, Arc<dyn DatabaseAdapter>> = BTreeMap::new();
         let mut summaries = BTreeMap::new();
         let mut policy_configs = Vec::new();
+        let mut mysql_live: BTreeMap<String, Arc<MySqlAdapter>> = BTreeMap::new();
 
         for conn in &config.connections {
             let resolved_dsn = conn.resolve_dsn(&secrets)?;
@@ -398,7 +401,11 @@ impl DbMcpRuntime {
                     if let Some(init_sql) = &conn.init_sql {
                         cfg = cfg.with_init_sql(init_sql.clone());
                     }
-                    Arc::new(MySqlAdapter::new(cfg)?)
+                    let mysql = Arc::new(MySqlAdapter::new(cfg)?);
+                    if mysql.live().is_some() {
+                        mysql_live.insert(conn.id.clone(), mysql.clone());
+                    }
+                    mysql
                 }
             };
 
@@ -456,6 +463,7 @@ impl DbMcpRuntime {
             pg_insights,
             changes,
             ontology,
+            mysql_live,
         })
     }
 
@@ -636,6 +644,41 @@ impl DbMcpRuntime {
         })
     }
 
+    /// Re-read a live MySQL catalog now (snapshots, diffs and change drift checks must not use
+    /// the short-lived discovery cache).
+    async fn refresh_live_catalog(&self, connection: &str) -> DbMcpResult<()> {
+        if let Some(mysql) = self.mysql_live.get(connection) {
+            mysql.refresh_catalog().await?;
+        }
+        Ok(())
+    }
+
+    /// Catalog visibility warnings (missing optional grants) for live MySQL catalog tools.
+    fn add_live_catalog_warnings(&self, tool_name: &str, val: &mut Value, args: &Value) {
+        if !matches!(
+            tool_name,
+            "search_objects" | "describe_object" | "trace_table_dependencies" | "get_procedure_call_graph" | "capture_schema" | "discover_ontology"
+        ) {
+            return;
+        }
+        let Some(conn) = args.get("connection").and_then(|v| v.as_str()) else { return };
+        let Some(mysql) = self.mysql_live.get(conn) else { return };
+        let notes = mysql.live().map(|l| l.catalog_warnings()).unwrap_or_default();
+        if notes.is_empty() {
+            return;
+        }
+        if let Some(obj) = val.as_object_mut() {
+            let warnings = obj.entry("warnings").or_insert_with(|| json!([]));
+            if let Some(arr) = warnings.as_array_mut() {
+                for n in notes {
+                    if !arr.iter().any(|w| w.as_str() == Some(n.as_str())) {
+                        arr.push(Value::String(n));
+                    }
+                }
+            }
+        }
+    }
+
     /// Capture a schema snapshot over the policy-visible catalog only.
     async fn capture_allowed(
         &self,
@@ -643,6 +686,7 @@ impl DbMcpRuntime {
         connection: &str,
         schema_pattern: Option<String>,
     ) -> DbMcpResult<SchemaSnapshot> {
+        self.refresh_live_catalog(connection).await?;
         let (objects, _) = self.discover_allowed(adapter, connection, schema_pattern).await?;
         Ok(capture_schema(connection, adapter.capabilities().engine, objects))
     }
@@ -965,6 +1009,7 @@ impl DbMcpRuntime {
         match outcome {
             Ok(mut val) => {
                 self.finalize_response(&mut val, &arguments);
+                self.add_live_catalog_warnings(tool_name, &mut val, &arguments);
                 if !already_audited {
                     self.audit_call_outcome(&req_id, tool_name, caller, conn_hint.as_deref(), Ok(&val), started);
                     self.audit_tracker.take_seen(&req_id);
@@ -1461,6 +1506,7 @@ impl DbMcpRuntime {
                 // Same connection policy execute_query enforces (restricted tables, multi-statement,
                 // ReadOnly, privileged/admin statements); reads are not changes.
                 self.authorize_change_sql(caller, &conn, adapter.capabilities().engine, &sql)?;
+                self.refresh_live_catalog(&conn).await?;
                 let proposal = self
                     .changes
                     .propose_change_with_adapter(caller, adapter.as_ref(), sql, params, constraints, ttl)
@@ -1498,6 +1544,7 @@ impl DbMcpRuntime {
                 let adapter = self.get_authorized_adapter(caller, &existing.connection)?;
                 // Re-check the connection policy: it may have changed since the proposal.
                 self.authorize_change_sql(caller, &existing.connection, adapter.capabilities().engine, &existing.sql)?;
+                self.refresh_live_catalog(&existing.connection).await?;
                 let mode = self.policy.effective_config(&existing.connection).mode;
                 let options = ApplyChangeOptions {
                     // Fail closed: production changes only run on keyed (unforgeable) approvals.

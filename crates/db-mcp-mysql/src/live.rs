@@ -257,6 +257,7 @@ pub struct LiveMySql {
     pool: Pool,
     active: DashMap<ExecutionId, u32>,
     server_version: std::sync::Mutex<Option<String>>,
+    catalog_cache: std::sync::Mutex<Option<crate::catalog::CachedCatalog>>,
 }
 
 impl std::fmt::Debug for LiveMySql {
@@ -308,7 +309,37 @@ impl LiveMySql {
             pool: Pool::new(Opts::from(opts)),
             active: DashMap::new(),
             server_version: std::sync::Mutex::new(None),
+            catalog_cache: std::sync::Mutex::new(None),
         })
+    }
+
+    pub(crate) fn cached_catalog(&self) -> Option<crate::catalog::CachedCatalog> {
+        self.catalog_cache.lock().ok().and_then(|c| c.clone())
+    }
+
+    pub(crate) fn store_catalog(&self, catalog: crate::catalog::CachedCatalog) {
+        if let Ok(mut c) = self.catalog_cache.lock() {
+            *c = Some(catalog);
+        }
+    }
+
+    /// Forget the cached catalog (after DDL, or before capture/diff/drift checks).
+    pub fn invalidate_catalog(&self) {
+        if let Ok(mut c) = self.catalog_cache.lock() {
+            *c = None;
+        }
+    }
+
+    /// Schema version of the cached catalog, when one was read recently.
+    pub fn cached_schema_version(&self) -> Option<String> {
+        self.cached_catalog()
+            .filter(|c| c.at.elapsed() < crate::catalog::CATALOG_CACHE_TTL)
+            .map(|c| c.schema_version)
+    }
+
+    /// Visibility warnings (missing optional grants) of the last catalog read.
+    pub fn catalog_warnings(&self) -> Vec<String> {
+        self.cached_catalog().map(|c| c.warnings).unwrap_or_default()
     }
 
     pub fn read_only(&self) -> bool {
