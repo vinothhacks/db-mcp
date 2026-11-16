@@ -326,17 +326,25 @@ async function runSensitiveProjectionBypass(s) {
     expectOutcome("baseline", res, OK);
     assert.equal(leaks(res), false, "password_hash values leaked without alias");
   });
-  // Redaction keys on result column *names* only (crates/db-mcp-policy/src/lib.rs:800-836); aliasing or UNION hides the name.
-  await check(`${MYSQL} alias bypass: SELECT password_hash AS x must still be redacted`, async () => { // KNOWN-BUG: F06-B3
+  // Redaction keys on result column *names*; aliasing or UNION would hide the name, so policy denies
+  // a sensitive column that is renamed before it can reach the result (fail closed).
+  await check(`${MYSQL} alias bypass: SELECT password_hash AS x is denied, never returned raw`, async () => {
     const res = await s.call("execute_query", { connection: MYSQL, sql: "SELECT password_hash AS x FROM users" });
-    expectOutcome("alias", res, OK);
     assert.equal(leaks(res), false, `raw hashes returned: ${JSON.stringify(res.rows)}`);
-  }, "F06-B3");
-  await check(`${MYSQL} UNION bypass: SELECT 1 UNION SELECT password_hash must still be redacted`, async () => { // KNOWN-BUG: F06-B3
+    expectOutcome("alias", res, "SENSITIVE_COLUMN_FORBIDDEN");
+  });
+  await check(`${MYSQL} UNION bypass: SELECT 1 UNION SELECT password_hash is denied, never returned raw`, async () => {
     const res = await s.call("execute_query", { connection: MYSQL, sql: "SELECT 1 UNION SELECT password_hash FROM users" });
-    expectOutcome("union", res, OK);
     assert.equal(leaks(res), false, `raw hashes returned: ${JSON.stringify(res.rows)}`);
-  }, "F06-B3");
+    expectOutcome("union", res, "SENSITIVE_COLUMN_FORBIDDEN");
+  });
+  await check(`${PG} alias / expression bypass on the pg simulation is denied`, async () => {
+    for (const sql of ["SELECT password_hash AS x FROM users", "SELECT upper(password_hash) AS u FROM users"]) {
+      const res = await s.call("execute_query", { connection: PG, sql });
+      assert.equal(leaks(res), false, `raw hashes returned: ${JSON.stringify(res.rows)}`);
+      expectOutcome(sql, res, "SENSITIVE_COLUMN_FORBIDDEN");
+    }
+  });
 }
 
 async function runExplain(sessions) {

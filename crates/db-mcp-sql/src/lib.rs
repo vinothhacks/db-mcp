@@ -23,7 +23,9 @@ use sqlparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
 
+pub mod disclosure;
 pub mod routine;
+pub use disclosure::*;
 pub use routine::*;
 
 /// Privileged or side-effecting SQL functions that must be flagged and restricted.
@@ -125,6 +127,9 @@ pub struct StatementAnalysis {
     pub referenced_columns: Vec<ColumnReference>,
     pub predicates: Vec<PredicateColumn>,
     pub is_transactional_ddl_safe: bool,
+    /// How column values reach the statement's output (result-disclosure provenance).
+    #[serde(default)]
+    pub disclosure: DisclosureAnalysis,
 }
 
 /// Full analysis result for a SQL string (single or multi-statement).
@@ -148,6 +153,9 @@ pub struct SqlAnalysis {
     pub statements: Vec<StatementAnalysis>,
     #[serde(default)]
     pub parse_warnings: Vec<String>,
+    /// Result-disclosure provenance merged across all statements.
+    #[serde(default)]
+    pub disclosure: DisclosureAnalysis,
 }
 
 /// Deterministically normalize SQL by collapsing whitespace, stripping comments, and trimming trailing semicolons.
@@ -382,8 +390,10 @@ pub fn parse_and_analyze_sql(engine: DatabaseEngine, sql: &str) -> DbMcpResult<S
     let mut has_writes = false;
     let mut has_ddl = false;
     let mut has_cte_write = false;
+    let mut disclosure = DisclosureAnalysis::default();
 
     for st in &statement_analyses {
+        disclosure.merge(&st.disclosure);
         if st.statement_class == SqlStatementClass::Write {
             has_writes = true;
         }
@@ -435,6 +445,7 @@ pub fn parse_and_analyze_sql(engine: DatabaseEngine, sql: &str) -> DbMcpResult<S
         predicates: predicates.into_iter().collect(),
         statements: statement_analyses,
         parse_warnings,
+        disclosure,
     })
 }
 
@@ -981,6 +992,12 @@ fn analyze_ast_statement(
         DatabaseEngine::MySql => final_class != SqlStatementClass::Ddl,
     };
 
+    let mut disclosure = analyze_statement_disclosure(engine, stmt);
+    if kind == "UNKNOWN" {
+        // Unclassified statements may embed queries the AST walk does not understand.
+        disclosure.opaque_sql.push(raw_sql.to_string());
+    }
+
     StatementAnalysis {
         index,
         raw_sql: raw_sql.to_string(),
@@ -994,6 +1011,7 @@ fn analyze_ast_statement(
         referenced_columns: inspector.referenced_columns.into_iter().collect(),
         predicates: inspector.predicates.into_iter().collect(),
         is_transactional_ddl_safe,
+        disclosure,
     }
 }
 
@@ -1080,6 +1098,7 @@ fn analyze_fallback_statement(
         referenced_columns: Vec::new(),
         predicates: Vec::new(),
         is_transactional_ddl_safe: false,
+        disclosure: DisclosureAnalysis::opaque(raw_sql),
     }
 }
 
@@ -1188,5 +1207,125 @@ mod tests {
         let s2 = "SELECT id, email FROM users WHERE id = 1";
         assert_eq!(normalize_sql(s1), normalize_sql(s2));
         assert_eq!(hash_sql(s1), hash_sql(s2));
+    }
+
+    fn exposed(engine: DatabaseEngine, sql: &str) -> Vec<(String, Option<String>)> {
+        parse_and_analyze_sql(engine, sql)
+            .unwrap()
+            .disclosure
+            .exposures
+            .into_iter()
+            .map(|e| (e.column, e.output_name))
+            .collect()
+    }
+
+    fn untracked(engine: DatabaseEngine, sql: &str) -> Vec<String> {
+        parse_and_analyze_sql(engine, sql)
+            .unwrap()
+            .disclosure
+            .untracked_provenance
+    }
+
+    #[test]
+    fn test_disclosure_bare_projection_and_predicates_are_not_exposures() {
+        for engine in [DatabaseEngine::Sqlite, DatabaseEngine::Postgres, DatabaseEngine::MySql] {
+            for sql in [
+                "SELECT password_hash FROM users",
+                "SELECT users.password_hash FROM users",
+                "SELECT u.password_hash, o.id FROM users u JOIN orders o ON o.user_id = u.id",
+                "SELECT * FROM users ORDER BY id",
+                "WITH c AS (SELECT password_hash FROM users) SELECT * FROM c",
+                "SELECT id FROM users WHERE password_hash = 'x' ORDER BY password_hash",
+                "SELECT id FROM users WHERE id IN (SELECT id FROM users WHERE password_hash IS NULL)",
+                "SELECT id FROM users UNION ALL SELECT id FROM orders",
+                "INSERT INTO users (id, password_hash) VALUES (1, 'h')",
+                "UPDATE users SET password_hash = 'x' WHERE password_hash = 'y'",
+            ] {
+                let analysis = parse_and_analyze_sql(engine, sql).unwrap();
+                let sensitive: Vec<_> = analysis
+                    .disclosure
+                    .exposures
+                    .iter()
+                    .filter(|e| {
+                        e.column == "password_hash"
+                            && e.output_name.as_deref() != Some("password_hash")
+                    })
+                    .collect();
+                assert!(sensitive.is_empty(), "{engine} {sql}: {sensitive:?}");
+                assert!(analysis.disclosure.untracked_provenance.is_empty(), "{engine} {sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_disclosure_renamed_and_derived_projections_are_exposures() {
+        let ph = |out: Option<&str>| ("password_hash".to_string(), out.map(str::to_string));
+        for engine in [DatabaseEngine::Sqlite, DatabaseEngine::Postgres, DatabaseEngine::MySql] {
+            let cases: [(&str, Option<&str>); 11] = [
+                ("SELECT password_hash AS ph FROM users", Some("ph")),
+                ("SELECT upper(password_hash) FROM users", None),
+                ("SELECT email || ':' || password_hash AS creds FROM users", Some("creds")),
+                ("SELECT ph FROM (SELECT password_hash AS ph FROM users) t", Some("ph")),
+                ("SELECT 1 UNION SELECT password_hash FROM users", None),
+                ("SELECT (SELECT password_hash FROM users LIMIT 1) AS v", Some("v")),
+                ("WITH c(x) AS (SELECT password_hash FROM users) SELECT x FROM c", Some("x")),
+                ("INSERT INTO notes SELECT password_hash FROM users", None),
+                ("INSERT INTO notes (body) SELECT password_hash FROM users", Some("body")),
+                ("UPDATE users SET email = password_hash", Some("email")),
+                ("CREATE VIEW v AS SELECT password_hash AS x FROM users", Some("x")),
+            ];
+            for (sql, out) in cases {
+                assert!(exposed(engine, sql).contains(&ph(out)), "{engine} {sql}: {:?}", exposed(engine, sql));
+            }
+            // The leftmost branch names the column: a sensitive name stays masked.
+            assert!(exposed(engine, "SELECT password_hash FROM users UNION SELECT password_hash FROM users")
+                .iter()
+                .all(|(_, out)| out.as_deref() == Some("password_hash")));
+        }
+        assert!(exposed(DatabaseEngine::Sqlite, "ALTER TABLE users RENAME COLUMN password_hash TO ph")
+            .contains(&ph(Some("ph"))));
+    }
+
+    #[test]
+    fn test_disclosure_untracked_provenance() {
+        for engine in [DatabaseEngine::Sqlite, DatabaseEngine::Postgres, DatabaseEngine::MySql] {
+            for sql in [
+                "SELECT id, email, role, created_at, 1 FROM orders UNION SELECT * FROM users",
+                "INSERT INTO copy SELECT * FROM users",
+                "SELECT x FROM (SELECT * FROM users) AS t(a, b, x)",
+            ] {
+                assert!(!untracked(engine, sql).is_empty(), "{engine} {sql}");
+            }
+            assert!(untracked(engine, "SELECT * FROM users").is_empty());
+            assert!(untracked(engine, "SELECT * INTO new_table FROM users").is_empty(), "{engine}");
+            assert!(untracked(engine, "SELECT count(*) FROM users").is_empty());
+        }
+        let pg = DatabaseEngine::Postgres;
+        for sql in [
+            "SELECT u FROM users u",
+            "SELECT row_to_json(u) AS j FROM users u",
+            "SELECT row_to_json(u.*) AS j FROM users u",
+            "SELECT x FROM users AS u(a, x)",
+        ] {
+            assert!(!untracked(pg, sql).is_empty(), "{sql}");
+        }
+        assert!(untracked(pg, "SELECT n FROM generate_series(1, 3) AS g(n)").is_empty());
+    }
+
+    #[test]
+    fn test_disclosure_opaque_sql_is_reported() {
+        let analysis = parse_and_analyze_sql(
+            DatabaseEngine::Postgres,
+            "CREATE FUNCTION leak() RETURNS text AS $$ SELECT password_hash FROM users LIMIT 1 $$ LANGUAGE sql",
+        )
+        .unwrap();
+        assert!(analysis
+            .disclosure
+            .opaque_sql
+            .iter()
+            .any(|t| t.contains("password_hash")));
+        let unparsed =
+            parse_and_analyze_sql(DatabaseEngine::Sqlite, "FOOBAR_VENDOR password_hash WITH MAGIC").unwrap();
+        assert_eq!(unparsed.disclosure.opaque_sql.len(), 1);
     }
 }

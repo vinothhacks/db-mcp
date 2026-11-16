@@ -522,18 +522,20 @@ async function sectionRedaction(c) {
       redactedOk(p, 0);
     }
   });
-  // KNOWN-BUG: F05-B2 - disclosure control matches only the OUTPUT column name.
+  // Redaction masks by output column name, so a sensitive column that is renamed (alias, expression,
+  // subquery re-alias, set-operation position) is denied before execution (fail closed).
   const leak = async (label, sql) => check(label, async () => {
     const { payload: p } = await eq(c, { connection: L, sql });
-    if (p.status === "denied") { denied(p, ["SENSITIVE_COLUMN_FORBIDDEN", "UNPROVENANCED_SENSITIVE_QUERY"]); return; }
-    okEnvelope(p);
-    const text = JSON.stringify(p.rows).toLowerCase();
+    const text = JSON.stringify(p.rows || []).toLowerCase();
     assert.ok(!text.includes("hash_alice_secret") && !text.includes("hash_bob_secret"), `sensitive value leaked: ${JSON.stringify(p.rows)}`);
-  }, "F05-B2");
+    denied(p, "SENSITIVE_COLUMN_FORBIDDEN", sql);
+    assert.equal(p.next_action, "select_sensitive_column_directly");
+  });
   await leak("5.04 aliased sensitive column (password_hash AS ph) does not leak", "SELECT password_hash AS ph FROM users");
   await leak("5.05 expression over sensitive column (upper(password_hash)) does not leak", "SELECT upper(password_hash) FROM users");
   await leak("5.06 concatenation with sensitive column does not leak", "SELECT email || ':' || password_hash AS creds FROM users");
   await leak("5.07 sensitive column re-aliased through a subquery does not leak", "SELECT ph FROM (SELECT password_hash AS ph FROM users)");
+  await leak("5.07b sensitive column in a later UNION branch does not leak", "SELECT 'x' AS k UNION SELECT password_hash FROM users");
   await check("5.08 output column named like a sensitive column is redacted even for literals", async () => {
     const { payload: p } = await eq(c, { connection: L, sql: "SELECT 'k' AS api_key" });
     redactedOk(p);
