@@ -12,6 +12,7 @@ members = [
     "crates/db-mcp-sqlite",
     "crates/db-mcp-postgres",
     "crates/db-mcp-mysql",
+    "crates/db-mcp-sqlserver",
     "crates/db-mcp-pg-insights",
     "crates/db-mcp-changes",
     "crates/db-mcp-ontology",
@@ -63,6 +64,7 @@ db-mcp-tools = { path = "crates/db-mcp-tools" }
 db-mcp-sqlite = { path = "crates/db-mcp-sqlite" }
 db-mcp-postgres = { path = "crates/db-mcp-postgres" }
 db-mcp-mysql = { path = "crates/db-mcp-mysql" }
+db-mcp-sqlserver = { path = "crates/db-mcp-sqlserver" }
 db-mcp-pg-insights = { path = "crates/db-mcp-pg-insights" }
 db-mcp-changes = { path = "crates/db-mcp-changes" }
 db-mcp-ontology = { path = "crates/db-mcp-ontology" }

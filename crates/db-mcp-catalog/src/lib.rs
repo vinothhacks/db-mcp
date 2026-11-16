@@ -262,7 +262,7 @@ pub fn diff_schema(base: &SchemaSnapshot, target: &SchemaSnapshot) -> SchemaDiff
     let engine = target.engine;
     let engine_transactional_ddl = matches!(
         engine,
-        DatabaseEngine::Postgres | DatabaseEngine::Sqlite
+        DatabaseEngine::Postgres | DatabaseEngine::Sqlite | DatabaseEngine::SqlServer
     );
 
     let mut items = Vec::new();
@@ -346,6 +346,7 @@ pub fn diff_schema(base: &SchemaSnapshot, target: &SchemaSnapshot) -> SchemaDiff
                 &qname,
                 &base_tbl.indexes,
                 &target_tbl.indexes,
+                engine,
                 engine_transactional_ddl,
                 &mut items,
             );
@@ -532,6 +533,10 @@ fn diff_table_columns(
                         Some(mysql_modify_column(table_qname, b_col)),
                     ),
                     DatabaseEngine::Sqlite => (None, None),
+                    DatabaseEngine::SqlServer => (
+                        Some(sqlserver_alter_column(table_qname, t_col)),
+                        Some(sqlserver_alter_column(table_qname, b_col)),
+                    ),
                 };
                 items.push(SchemaDiffItem {
                     kind: DiffOperationKind::AlterColumnType,
@@ -568,6 +573,10 @@ fn diff_table_columns(
                         Some(mysql_modify_column(table_qname, b_col)),
                     ),
                     DatabaseEngine::Sqlite => (None, None),
+                    DatabaseEngine::SqlServer => (
+                        Some(sqlserver_alter_column(table_qname, t_col)),
+                        Some(sqlserver_alter_column(table_qname, b_col)),
+                    ),
                 };
                 items.push(SchemaDiffItem {
                     kind: DiffOperationKind::AlterColumnNullability,
@@ -648,8 +657,12 @@ fn diff_table_columns(
                     ReversalSafety::CompensatingMigrationRequired
                 },
                 suggested_ddl: Some(format!(
-                    "ALTER TABLE {table_qname} ADD COLUMN {} {}{}{};",
-                    t_col.name, t_col.data_type, null_clause, default_clause
+                    "ALTER TABLE {table_qname} {} {} {}{}{};",
+                    add_column_keyword(engine),
+                    t_col.name,
+                    t_col.data_type,
+                    null_clause,
+                    default_clause
                 )),
                 compensating_ddl: Some(format!(
                     "ALTER TABLE {table_qname} DROP COLUMN {};",
@@ -670,13 +683,19 @@ fn diff_table_columns(
                 destructive: true,
                 transactional: engine_transactional_ddl,
                 reversal_safety: ReversalSafety::BackupRecoveryRequired,
-                suggested_ddl: Some(format!(
-                    "ALTER TABLE {table_qname} DROP COLUMN {};",
-                    b_col.name
-                )),
+                suggested_ddl: Some(if engine == DatabaseEngine::SqlServer {
+                    format!(
+                        "ALTER TABLE {table_qname} DROP COLUMN {}; -- if this is a rename, use EXEC sp_rename '{table_qname}.{}', '<new_name>', 'COLUMN' instead",
+                        b_col.name, b_col.name
+                    )
+                } else {
+                    format!("ALTER TABLE {table_qname} DROP COLUMN {};", b_col.name)
+                }),
                 compensating_ddl: Some(format!(
-                    "ALTER TABLE {table_qname} ADD COLUMN {} {};",
-                    b_col.name, b_col.data_type
+                    "ALTER TABLE {table_qname} {} {} {};",
+                    add_column_keyword(engine),
+                    b_col.name,
+                    b_col.data_type
                 )),
             });
         }
@@ -687,6 +706,7 @@ fn diff_table_indexes(
     table_qname: &str,
     base_idxs: &[IndexSpec],
     target_idxs: &[IndexSpec],
+    engine: DatabaseEngine,
     engine_transactional_ddl: bool,
     items: &mut Vec<SchemaDiffItem>,
 ) {
@@ -730,7 +750,7 @@ fn diff_table_indexes(
                     destructive: false,
                     transactional: engine_transactional_ddl,
                     reversal_safety: ReversalSafety::CompensatingMigrationRequired,
-                    suggested_ddl: Some(format!("DROP INDEX {}; {create_ddl}", b_idx.name)),
+                    suggested_ddl: Some(format!("{} {create_ddl}", drop_index_ddl(engine, table_qname, &b_idx.name))),
                     compensating_ddl: b_idx.definition.clone(),
                 });
             }
@@ -753,7 +773,7 @@ fn diff_table_indexes(
                     ReversalSafety::CompensatingMigrationRequired
                 },
                 suggested_ddl: Some(create_ddl),
-                compensating_ddl: Some(format!("DROP INDEX {};", t_idx.name)),
+                compensating_ddl: Some(drop_index_ddl(engine, table_qname, &t_idx.name)),
             });
         }
     }
@@ -781,7 +801,7 @@ fn diff_table_indexes(
                 destructive: false,
                 transactional: engine_transactional_ddl,
                 reversal_safety: ReversalSafety::CompensatingMigrationRequired,
-                suggested_ddl: Some(format!("DROP INDEX {};", b_idx.name)),
+                suggested_ddl: Some(drop_index_ddl(engine, table_qname, &b_idx.name)),
                 compensating_ddl: Some(recreate_ddl),
             });
         }
@@ -794,10 +814,38 @@ fn is_default_schema(engine: DatabaseEngine, schema: &str) -> bool {
         DatabaseEngine::Sqlite => "main",
         DatabaseEngine::Postgres => "public",
         DatabaseEngine::MySql => "",
+        DatabaseEngine::SqlServer => "dbo",
     };
     schema.is_empty()
         || schema.eq_ignore_ascii_case("dbo")
         || (!default.is_empty() && schema.eq_ignore_ascii_case(default))
+}
+
+/// `ADD COLUMN` everywhere except T-SQL, which spells it `ADD`.
+fn add_column_keyword(engine: DatabaseEngine) -> &'static str {
+    if engine == DatabaseEngine::SqlServer {
+        "ADD"
+    } else {
+        "ADD COLUMN"
+    }
+}
+
+/// `DROP INDEX`; SQL Server names the table (`DROP INDEX ix ON dbo.t`).
+fn drop_index_ddl(engine: DatabaseEngine, table_qname: &str, index: &str) -> String {
+    if engine == DatabaseEngine::SqlServer {
+        format!("DROP INDEX {index} ON {table_qname};")
+    } else {
+        format!("DROP INDEX {index};")
+    }
+}
+
+/// SQL Server `ALTER COLUMN` restating type and nullability (defaults are separate constraints).
+fn sqlserver_alter_column(table_qname: &str, col: &ColumnSpec) -> String {
+    let null_clause = if col.nullable { "NULL" } else { "NOT NULL" };
+    format!(
+        "ALTER TABLE {table_qname} ALTER COLUMN {} {} {null_clause};",
+        col.name, col.data_type
+    )
 }
 
 /// MySQL `MODIFY COLUMN` restating the full column definition.
@@ -823,6 +871,19 @@ fn set_default_ddl(
 ) -> Option<String> {
     if engine == DatabaseEngine::Sqlite {
         return None;
+    }
+    if engine == DatabaseEngine::SqlServer {
+        // Defaults are named constraints: drop the current one (looked up by column), then add.
+        let table_lit = table_qname.replace('\'', "''");
+        let column_lit = column.replace('\'', "''");
+        let drop = format!(
+            "DECLARE @df sysname = (SELECT name FROM sys.default_constraints WHERE parent_object_id = OBJECT_ID(N'{table_lit}') AND parent_column_id = COLUMNPROPERTY(OBJECT_ID(N'{table_lit}'), N'{column_lit}', 'ColumnId')); IF @df IS NOT NULL EXEC(N'ALTER TABLE {table_lit} DROP CONSTRAINT ' + QUOTENAME(@df));"
+        );
+        let short = table_qname.rsplit('.').next().unwrap_or(table_qname);
+        return Some(match default {
+            Some(d) => format!("{drop} ALTER TABLE {table_qname} ADD CONSTRAINT DF_{short}_{column} DEFAULT {d} FOR {column};"),
+            None => drop,
+        });
     }
     Some(match default {
         Some(d) => format!("ALTER TABLE {table_qname} ALTER COLUMN {column} SET DEFAULT {d};"),
@@ -885,6 +946,9 @@ fn fk_drop_ddl(engine: DatabaseEngine, table_qname: &str, fk: &ForeignKeySpec) -
             Some(format!("ALTER TABLE {table_qname} DROP FOREIGN KEY {name};"))
         }
         DatabaseEngine::Sqlite => None,
+        DatabaseEngine::SqlServer => {
+            Some(format!("ALTER TABLE {table_qname} DROP CONSTRAINT {name};"))
+        }
     }
 }
 
@@ -1380,6 +1444,37 @@ mod tests {
             foreign_keys: vec![],
             definition: Some(def.to_string()),
         }
+    }
+
+    #[test]
+    fn sqlserver_diff_emits_tsql_ddl() {
+        let mut idx_tbl = tbl("dbo", "orders", vec![col("id", "int", false, true), col("status", "nvarchar(20)", false, false)], vec![]);
+        let base = snap(DatabaseEngine::SqlServer, vec![idx_tbl.clone()]);
+        idx_tbl.columns[1] = col("status", "nvarchar(40)", true, false);
+        idx_tbl.columns.push(col("note", "nvarchar(max)", true, false));
+        idx_tbl.indexes.push(IndexSpec {
+            name: "ix_orders_status".to_string(),
+            table_name: "dbo.orders".to_string(),
+            columns: vec!["status".to_string()],
+            unique: false,
+            primary: false,
+            index_type: None,
+            predicate: None,
+            definition: None,
+        });
+        let target = snap(DatabaseEngine::SqlServer, vec![idx_tbl]);
+        let diff = diff_schema(&base, &target);
+        assert!(diff.all_transactional);
+        let ddl: Vec<String> = diff.items.iter().filter_map(|i| i.suggested_ddl.clone()).collect();
+        let comp: Vec<String> = diff.items.iter().filter_map(|i| i.compensating_ddl.clone()).collect();
+        assert!(ddl.contains(&"ALTER TABLE dbo.orders ALTER COLUMN status nvarchar(40) NULL;".to_string()), "{ddl:?}");
+        assert!(ddl.contains(&"ALTER TABLE dbo.orders ADD note nvarchar(max);".to_string()), "{ddl:?}");
+        assert!(comp.contains(&"DROP INDEX ix_orders_status ON dbo.orders;".to_string()), "{comp:?}");
+        let back = diff_schema(&target, &base);
+        assert!(back
+            .items
+            .iter()
+            .any(|i| i.suggested_ddl.as_deref().unwrap_or("").contains("sp_rename")));
     }
 
     #[test]

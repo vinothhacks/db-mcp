@@ -149,6 +149,9 @@ pub enum DatabaseEngine {
     Postgres,
     MySql,
     Sqlite,
+    /// Microsoft SQL Server (T-SQL over TDS).
+    #[serde(rename = "sqlserver")]
+    SqlServer,
 }
 
 impl DatabaseEngine {
@@ -157,6 +160,7 @@ impl DatabaseEngine {
             Self::Postgres => "postgres",
             Self::MySql => "mysql",
             Self::Sqlite => "sqlite",
+            Self::SqlServer => "sqlserver",
         }
     }
 }
@@ -175,6 +179,7 @@ impl FromStr for DatabaseEngine {
             "postgres" | "postgresql" | "pg" => Ok(Self::Postgres),
             "mysql" | "mariadb" => Ok(Self::MySql),
             "sqlite" | "sqlite3" => Ok(Self::Sqlite),
+            "sqlserver" | "mssql" | "sql_server" | "tsql" => Ok(Self::SqlServer),
             other => Err(DbMcpError::InvalidArgument(format!(
                 "Unsupported database engine: {other}"
             ))),
@@ -500,6 +505,35 @@ impl DatabaseCapabilities {
             supports_health_diagnostics: false,
             supports_workload_analysis: false,
             supports_index_advisor: false,
+            supports_hypothetical_indexes: false,
+            supports_parameter_binding: true,
+            unavailable_reasons,
+        }
+    }
+
+    /// Microsoft SQL Server. Explain uses estimated plans (`SET SHOWPLAN_XML ON`, needs SHOWPLAN);
+    /// actual-execution plans are never collected because they would run the statement.
+    pub fn for_sqlserver() -> Self {
+        let mut unavailable_reasons = BTreeMap::new();
+        unavailable_reasons.insert(
+            "analyze_explain".to_string(),
+            "SQL Server actual execution plans run the statement; only estimated plans (SHOWPLAN_XML) are collected".to_string(),
+        );
+        unavailable_reasons.insert(
+            "hypothetical_indexes".to_string(),
+            "HypoPG is PostgreSQL-specific; SQL Server advice uses missing-index DMVs and showplan hints".to_string(),
+        );
+        Self {
+            engine: DatabaseEngine::SqlServer,
+            supports_explain: true,
+            supports_analyze_explain: false,
+            supports_cancellation: true,
+            supports_read_only_transaction: true,
+            supports_transactional_ddl: true,
+            supports_schema_diff: true,
+            supports_health_diagnostics: true,
+            supports_workload_analysis: true,
+            supports_index_advisor: true,
             supports_hypothetical_indexes: false,
             supports_parameter_binding: true,
             unavailable_reasons,

@@ -392,6 +392,12 @@ impl DbMcpRuntime {
                     }
                     Arc::new(MySqlAdapter::new(cfg)?)
                 }
+                DatabaseEngine::SqlServer => {
+                    return Err(DbMcpError::ConfigurationError(format!(
+                        "Connection '{}': the SQL Server adapter is not available in this build",
+                        conn.id
+                    )));
+                }
             };
 
             let mode = conn.effective_mode(config.default_mode);

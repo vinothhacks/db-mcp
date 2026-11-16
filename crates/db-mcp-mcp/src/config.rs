@@ -61,6 +61,7 @@ fn parse_engine_str(raw: &str) -> Result<DatabaseEngine, String> {
         "postgres" | "postgresql" | "pg" => Ok(DatabaseEngine::Postgres),
         "mysql" | "mariadb" => Ok(DatabaseEngine::MySql),
         "sqlite" | "sqlite3" => Ok(DatabaseEngine::Sqlite),
+        "sqlserver" | "mssql" | "sql_server" | "tsql" => Ok(DatabaseEngine::SqlServer),
         other => Err(format!("Unsupported database engine '{other}'")),
     }
 }

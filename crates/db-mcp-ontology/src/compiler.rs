@@ -390,6 +390,7 @@ pub fn quote_ident(name: &str, engine: DatabaseEngine) -> String {
     }
     match engine {
         DatabaseEngine::MySql => format!("`{}`", name.replace('`', "``")),
+        DatabaseEngine::SqlServer => format!("[{}]", name.replace(']', "]]")),
         _ => format!("\"{}\"", name.replace('"', "\"\"")),
     }
 }
@@ -407,6 +408,7 @@ fn placeholder(n: usize, engine: DatabaseEngine) -> String {
         DatabaseEngine::Sqlite => format!("?{n}"),
         DatabaseEngine::Postgres => format!("${n}"),
         DatabaseEngine::MySql => "?".to_string(),
+        DatabaseEngine::SqlServer => format!("@P{n}"),
     }
 }
 
@@ -936,7 +938,10 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
             }
         }
     }
-    let mut sql = format!("SELECT {} FROM {} t0", select.join(", "), quote_table(base_table, req.engine));
+    let row_cap = req.max_rows.clamp(1, 10_000);
+    // T-SQL has no LIMIT: the row cap is `SELECT TOP (n)`.
+    let top = if req.engine == DatabaseEngine::SqlServer { format!("TOP ({row_cap}) ") } else { String::new() };
+    let mut sql = format!("SELECT {top}{} FROM {} t0", select.join(", "), quote_table(base_table, req.engine));
     for j in &joins {
         sql.push(' ');
         sql.push_str(j);
@@ -947,7 +952,9 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
     if !group_by.is_empty() {
         sql.push_str(&format!(" GROUP BY {} ORDER BY {metric_alias} DESC", group_by.join(", ")));
     }
-    sql.push_str(&format!(" LIMIT {}", req.max_rows.clamp(1, 10_000)));
+    if req.engine != DatabaseEngine::SqlServer {
+        sql.push_str(&format!(" LIMIT {row_cap}"));
+    }
 
     let tables: Vec<String> = table_names.values().cloned().collect();
     if let Err(why) = validate_generated_sql(req.engine, &sql, &tables) {
@@ -1115,6 +1122,28 @@ mod tests {
     }
 
     #[test]
+    fn sqlserver_plans_use_top_and_named_parameters() {
+        let rev = revision();
+        let defs = golden_defs();
+        for q in ["count of completed orders by user role", "total order value for completed orders"] {
+            let p = plan(&PlanRequest {
+                question: q,
+                engine: DatabaseEngine::SqlServer,
+                max_rows: 50,
+                revision: Some(&rev),
+                published: &defs,
+                stale: &[],
+                schema_fingerprint: "fp",
+            });
+            assert!(p.is_answerable(), "{q}: {:?}", p.missing);
+            let sql = p.sql.clone().unwrap();
+            assert!(sql.starts_with("SELECT TOP (50) "), "{sql}");
+            assert!(!sql.contains("LIMIT"), "{sql}");
+            assert!(sql.contains("@P1"), "{sql}");
+        }
+    }
+
+    #[test]
     fn existing_answerable_questions_still_answer() {
         for q in [
             "total order value by user role",
@@ -1219,6 +1248,9 @@ mod tests {
         assert_eq!(quote_ident("orders", DatabaseEngine::Sqlite), "orders");
         assert_eq!(quote_ident("Order Items", DatabaseEngine::Postgres), "\"Order Items\"");
         assert_eq!(quote_ident("a`b", DatabaseEngine::MySql), "`a``b`");
+        assert_eq!(quote_ident("Order Items", DatabaseEngine::SqlServer), "[Order Items]");
+        assert_eq!(quote_ident("a]b", DatabaseEngine::SqlServer), "[a]]b]");
+        assert_eq!(placeholder(2, DatabaseEngine::SqlServer), "@P2");
     }
 
     #[test]
