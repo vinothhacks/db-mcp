@@ -445,7 +445,9 @@ async function main() {
   check("telemetry/pg: top_n=1 returns 1 row while total_queries_analyzed reports the full history size", () => {
     assert.equal(wlPgTop1.body.returned_rows, 1);
     assert.equal(wlPgTop1.body.data.total_queries_analyzed, wlPg.body.data.total_queries_analyzed);
-    assert.ok(wlPgTop1.body.data.total_queries_analyzed >= 3);
+    // qAlice and qSecret differ only in literals; literal-free fingerprints (v0.2.0) group them, so the pg
+    // history holds 2 distinct statements (qPending x3, user lookup x2).
+    assert.ok(wlPgTop1.body.data.total_queries_analyzed >= 2);
   });
 
   check("telemetry: history is kept per connection (sqlite sees only its own 1 execution)", () => {
