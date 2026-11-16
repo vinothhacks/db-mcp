@@ -172,9 +172,50 @@ pub struct ConnectionConfig {
     pub allowed_principals: Vec<String>,
     #[serde(default)]
     pub init_sql: Option<String>,
+    /// `"live"` (talk to the real server, fail closed when unreachable) or `"simulated"` (embedded
+    /// engine, never contacts a server). Default: live for MySQL, simulated for Postgres, and
+    /// SQLite is always a local database file.
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
+/// Backend values accepted by `ConnectionConfig::backend`.
+pub const BACKEND_LIVE: &str = "live";
+pub const BACKEND_SIMULATED: &str = "simulated";
+
 impl ConnectionConfig {
+    /// Resolved backend (`live` or `simulated`) after defaults; an invalid value is a config error.
+    pub fn effective_backend(&self) -> DbMcpResult<&'static str> {
+        let explicit = match self.backend.as_deref().map(|b| b.trim().to_ascii_lowercase()) {
+            None => None,
+            Some(b) if b == BACKEND_LIVE => Some(BACKEND_LIVE),
+            Some(b) if b == BACKEND_SIMULATED => Some(BACKEND_SIMULATED),
+            Some(other) => {
+                return Err(DbMcpError::ConfigurationError(format!(
+                    "Connection '{}': backend '{other}' is not supported (expected \"live\" or \"simulated\")",
+                    self.id.trim()
+                )))
+            }
+        };
+        match self.engine {
+            DatabaseEngine::MySql => Ok(explicit.unwrap_or(BACKEND_LIVE)),
+            DatabaseEngine::Postgres => match explicit {
+                Some(BACKEND_LIVE) => Err(DbMcpError::ConfigurationError(format!(
+                    "Connection '{}': backend = \"live\" is not available for Postgres in this release; use backend = \"simulated\"",
+                    self.id.trim()
+                ))),
+                _ => Ok(BACKEND_SIMULATED),
+            },
+            DatabaseEngine::Sqlite => match explicit {
+                Some(BACKEND_SIMULATED) => Err(DbMcpError::ConfigurationError(format!(
+                    "Connection '{}': SQLite always opens its local database file; remove backend = \"simulated\"",
+                    self.id.trim()
+                ))),
+                _ => Ok(BACKEND_LIVE),
+            },
+        }
+    }
+
     pub fn effective_mode(&self, default_mode: OperatingMode) -> OperatingMode {
         self.mode.unwrap_or(default_mode)
     }
@@ -535,6 +576,7 @@ impl ServerConfig {
                     allowed_roles: default_wildcard_vec(),
                     allowed_principals: default_wildcard_vec(),
                     init_sql: Some(DEMO_SEED_SQL.to_string()),
+                    backend: None,
                 },
                 ConnectionConfig {
                     id: "prod-postgres".to_string(),
@@ -568,6 +610,7 @@ impl ServerConfig {
                     ],
                     allowed_principals: default_wildcard_vec(),
                     init_sql: Some(DEMO_SEED_SQL.to_string()),
+                    backend: None,
                 },
                 ConnectionConfig {
                     id: "analytics-mysql".to_string(),
@@ -596,6 +639,7 @@ impl ServerConfig {
                     allowed_roles: default_wildcard_vec(),
                     allowed_principals: default_wildcard_vec(),
                     init_sql: Some(DEMO_SEED_SQL.to_string()),
+                    backend: Some(BACKEND_SIMULATED.to_string()),
                 },
             ],
             named_tools: vec![
@@ -747,6 +791,7 @@ impl ServerConfig {
                     "Connection '{trimmed}' limits must be greater than zero"
                 )));
             }
+            conn.effective_backend()?;
             conn.resolve_dsn(&dsn_secrets)?;
         }
         let _registry = NamedToolRegistry::from_specs(self.named_tools.clone())?;
@@ -852,6 +897,36 @@ mod tests {
         assert!(err("[http]\nbind = \"not-an-addr\"\n").contains("http.bind"));
         assert!(err("[http]\nbind = \"host:99999\"\n").contains("http.bind"));
         ServerConfig::from_toml_str(&format!("{BASE}[http]\nbind = \"localhost:9000\"\n")).unwrap();
+    }
+
+    #[test]
+    fn backend_defaults_and_validation() {
+        let my = |extra: &str| {
+            format!("server_name = \"t\"
+[[connections]]
+id = \"m\"
+engine = \"MySql\"
+dsn = \"mysql://u:p@127.0.0.1:1/db\"
+{extra}")
+        };
+        let cfg = ServerConfig::from_toml_str(&my("")).unwrap();
+        assert_eq!(cfg.connections[0].effective_backend().unwrap(), "live");
+        let cfg = ServerConfig::from_toml_str(&my("backend = \"Simulated\"
+")).unwrap();
+        assert_eq!(cfg.connections[0].effective_backend().unwrap(), "simulated");
+        let e = ServerConfig::from_toml_str(&my("backend = \"maybe\"
+")).unwrap_err().to_string();
+        assert!(e.contains("backend 'maybe'"), "{e}");
+        let pg = BASE.replace("Sqlite", "Postgres").replace("sqlite://:memory:", "postgres://h/db");
+        let cfg = ServerConfig::from_toml_str(&pg).unwrap();
+        assert_eq!(cfg.connections[0].effective_backend().unwrap(), "simulated");
+        assert!(ServerConfig::from_toml_str(&format!("{pg}backend = \"live\"
+")).is_err());
+        assert!(err("backend = \"simulated\"
+").contains("SQLite"));
+        let demo = ServerConfig::default_demo();
+        let mysql = demo.connections.iter().find(|c| c.engine == DatabaseEngine::MySql).unwrap();
+        assert_eq!(mysql.effective_backend().unwrap(), "simulated");
     }
 
     #[test]

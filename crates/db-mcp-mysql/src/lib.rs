@@ -2,8 +2,9 @@
 //! `SchemaDiffProvider`, and `TransactionalDdlProvider`.
 //!
 //! Features:
-//! - Live MySQL TCP connection probing and handshake verification alongside a deterministic
-//!   simulated MySQL execution & catalog engine (`MySqlBackendMode::LiveOrSimulated`)
+//! - Explicit backend selection (`MySqlBackendMode`): `LiveOnly` talks to a real MySQL 8 server
+//!   and fails closed (`CONNECTION_UNAVAILABLE`) when it is unreachable; `SimulatedOnly` serves a
+//!   deterministic embedded engine and never contacts a server. There is no silent fallback.
 //! - `information_schema` progressive discovery (`TABLES`, `COLUMNS`, `STATISTICS`, `KEY_COLUMN_USAGE`)
 //! - `EXPLAIN FORMAT=JSON` generation and structured plan parsing (`access_type: "ALL"` vs `"ref"` / `"range"`)
 //! - `KILL QUERY <thread_id>` active query cancellation tracking
@@ -38,22 +39,43 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use url::Url;
 
+pub mod catalog;
+pub mod diagnostics;
+pub mod live;
+
+pub use live::{
+    bind_mysql_placeholders, build_mysql_session_setup, live_capabilities, mysql_column_type_name,
+    mysql_value_to_json, parse_mysql_dsn, summarize_grants, GrantSummary, LiveMySql, MySqlDsn,
+    CODE_CONNECTION_UNAVAILABLE, CODE_DATABASE_PERMISSION_DENIED, CODE_SERVER_READ_ONLY,
+};
+
 /// Warning emitted whenever DDL is executed on MySQL/MariaDB.
 pub const MYSQL_NON_TRANSACTIONAL_DDL_WARNING: &str =
     "MySQL/MariaDB does not support transactional DDL (supports_transactional_ddl=false); DDL statements cause an implicit commit and require a compensating migration to undo.";
 
-/// Execution mode for `MySqlAdapter`.
+/// Execution mode for `MySqlAdapter`. Selected explicitly by configuration (`backend`); a live
+/// connection never falls back to the simulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MySqlBackendMode {
-    LiveOrSimulated,
+    /// Embedded simulation (bundled example config, offline tests). No server is contacted.
     SimulatedOnly,
+    /// Real MySQL server reached through the DSN; failures are reported, never simulated.
     LiveOnly,
 }
 
 impl Default for MySqlBackendMode {
     fn default() -> Self {
-        Self::LiveOrSimulated
+        Self::LiveOnly
+    }
+}
+
+impl MySqlBackendMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SimulatedOnly => "simulated",
+            Self::LiveOnly => "live",
+        }
     }
 }
 
@@ -90,7 +112,7 @@ impl MySqlConfig {
             read_only: false,
             default_schema: default_mysql_schema(),
             max_execution_time_ms: default_max_execution_time_ms(),
-            backend_mode: MySqlBackendMode::LiveOrSimulated,
+            backend_mode: MySqlBackendMode::LiveOnly,
             init_sql: None,
         }
     }
@@ -265,15 +287,17 @@ pub fn parse_mysql_explain_json(raw_json: &str) -> DbMcpResult<ParsedMySqlPlan> 
     let mut seq_scans = Vec::new();
     let mut index_scans = Vec::new();
     let mut rows_examined_total = 0.0_f64;
+    let mut notes = Vec::new();
 
     walk_mysql_plan_node(
-        qb,
+        &parsed,
         &mut seq_scans,
         &mut index_scans,
         &mut rows_examined_total,
+        &mut notes,
     );
 
-    let mut warnings = Vec::new();
+    let mut warnings = notes;
     for tbl in &seq_scans {
         warnings.push(format!(
             "Full table scan (access_type=ALL) detected on MySQL table '{tbl}'"
@@ -295,37 +319,56 @@ fn walk_mysql_plan_node(
     seq_scans: &mut Vec<String>,
     index_scans: &mut Vec<String>,
     rows_examined: &mut f64,
+    notes: &mut Vec<String>,
 ) {
-    if let Some(tbl_obj) = node.get("table") {
-        let table_name = tbl_obj
-            .get("table_name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown");
-        let access_type = tbl_obj
-            .get("access_type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("ALL");
-        let rows = tbl_obj
-            .get("rows_examined_per_scan")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(1.0);
-        *rows_examined += rows;
-
-        if access_type.eq_ignore_ascii_case("ALL") {
-            if !seq_scans.contains(&table_name.to_string()) {
-                seq_scans.push(table_name.to_string());
+    match node {
+        serde_json::Value::Object(map) => {
+            if let Some(tbl_obj) = map.get("table").filter(|t| t.is_object()) {
+                let table_name = tbl_obj
+                    .get("table_name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                let access_type = tbl_obj
+                    .get("access_type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("ALL");
+                let rows = tbl_obj
+                    .get("rows_examined_per_scan")
+                    .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                    .unwrap_or(1.0);
+                *rows_examined += rows;
+                if access_type.eq_ignore_ascii_case("ALL") {
+                    if !seq_scans.contains(&table_name.to_string()) {
+                        seq_scans.push(table_name.to_string());
+                    }
+                } else if let Some(key) = tbl_obj.get("key").and_then(serde_json::Value::as_str) {
+                    if !index_scans.contains(&key.to_string()) {
+                        index_scans.push(key.to_string());
+                    }
+                }
             }
-        } else if let Some(key) = tbl_obj.get("key").and_then(serde_json::Value::as_str) {
-            if !index_scans.contains(&key.to_string()) {
-                index_scans.push(key.to_string());
+            if map.get("using_filesort").and_then(serde_json::Value::as_bool) == Some(true) {
+                let n = "Plan sorts rows with a filesort (no index provides the ORDER BY / GROUP BY order)".to_string();
+                if !notes.contains(&n) {
+                    notes.push(n);
+                }
+            }
+            if map.get("using_temporary_table").and_then(serde_json::Value::as_bool) == Some(true) {
+                let n = "Plan materializes an internal temporary table".to_string();
+                if !notes.contains(&n) {
+                    notes.push(n);
+                }
+            }
+            for child in map.values() {
+                walk_mysql_plan_node(child, seq_scans, index_scans, rows_examined, notes);
             }
         }
-    }
-
-    if let Some(nested) = node.get("nested_loop").and_then(serde_json::Value::as_array) {
-        for child in nested {
-            walk_mysql_plan_node(child, seq_scans, index_scans, rows_examined);
+        serde_json::Value::Array(items) => {
+            for child in items {
+                walk_mysql_plan_node(child, seq_scans, index_scans, rows_examined, notes);
+            }
         }
+        _ => {}
     }
 }
 
@@ -370,6 +413,7 @@ pub struct MySqlAdapter {
     kill_query_log: Arc<Mutex<Vec<String>>>,
     session_log: Arc<Mutex<Vec<String>>>,
     next_thread_id: Arc<AtomicU64>,
+    live: Option<Arc<live::LiveMySql>>,
 }
 
 impl std::fmt::Debug for MySqlAdapter {
@@ -387,6 +431,21 @@ impl std::fmt::Debug for MySqlAdapter {
 impl MySqlAdapter {
     /// Create a new `MySqlAdapter` from `MySqlConfig`.
     pub fn new(config: MySqlConfig) -> DbMcpResult<Self> {
+        let live = if config.backend_mode == MySqlBackendMode::LiveOnly {
+            if config.init_sql.as_deref().map(str::trim).is_some_and(|s| !s.is_empty()) {
+                return Err(DbMcpError::ConfigurationError(format!(
+                    "Connection '{}': init_sql is only allowed with backend = \"simulated\"; it is never run on a live server",
+                    config.connection_id
+                )));
+            }
+            Some(Arc::new(live::LiveMySql::new(
+                &config.connection_id,
+                config.dsn.expose_secret(),
+                config.read_only,
+            )?))
+        } else {
+            None
+        };
         let conn = Connection::open_in_memory()
             .map_err(|e| DbMcpError::AdapterError(e.to_string()))?;
 
@@ -410,7 +469,32 @@ impl MySqlAdapter {
             kill_query_log: Arc::new(Mutex::new(Vec::new())),
             session_log: Arc::new(Mutex::new(Vec::new())),
             next_thread_id: Arc::new(AtomicU64::new(700)),
+            live,
         })
+    }
+
+    /// `live` or `simulated`.
+    pub fn backend(&self) -> &'static str {
+        self.config.backend_mode.as_str()
+    }
+
+    /// Read-only `check-connection` report (JSON). Never contains the DSN or password.
+    pub async fn check_connection(&self) -> serde_json::Value {
+        match &self.live {
+            Some(live) => live.check().await,
+            None => serde_json::json!({
+                "connection": self.config.connection_id,
+                "engine": "mysql",
+                "backend": "simulated",
+                "server_version": null,
+                "can_connect": true,
+                "select_1": true,
+                "object_count": null,
+                "permissions": [],
+                "can_write": !self.config.read_only,
+                "warnings": ["embedded simulated MySQL engine: no server is contacted and the DSN is ignored"],
+            }),
+        }
     }
 
     /// Create a simulated MySQL adapter for offline testing.
@@ -496,20 +580,68 @@ impl MySqlAdapter {
         catalog_describe_object(&all, schema, object_name, detail_level)
     }
 
+    /// The live backend, when this adapter talks to a real server.
+    pub fn live(&self) -> Option<&Arc<live::LiveMySql>> {
+        self.live.as_ref()
+    }
+
+    /// Simulated backends need no connectivity; live calls go to the server directly.
     async fn ensure_connectivity(&self) -> DbMcpResult<()> {
-        if self.config.backend_mode == MySqlBackendMode::LiveOnly {
-            let dsn_raw = self.config.dsn.expose_secret();
-            probe_mysql_tcp(dsn_raw, Duration::from_millis(500)).await?;
-        } else if self.config.backend_mode == MySqlBackendMode::LiveOrSimulated {
-            let dsn_raw = self.config.dsn.expose_secret();
-            if dsn_raw.starts_with("mysql://") || dsn_raw.starts_with("mariadb://") {
-                let _ = probe_mysql_tcp(dsn_raw, Duration::from_millis(80)).await;
+        Ok(())
+    }
+
+    /// Live catalog (cached for `catalog::CATALOG_CACHE_TTL`) merged with registered objects.
+    async fn live_catalog_objects(&self, live: &live::LiveMySql, force: bool) -> DbMcpResult<Vec<CatalogObject>> {
+        let cached = live.catalog(force).await?;
+        let mut objects: Vec<CatalogObject> = cached.objects.as_ref().clone();
+        for entry in self.custom_catalog.iter() {
+            if let Some(existing) = objects
+                .iter_mut()
+                .find(|o| o.qualified_name().to_ascii_lowercase() == *entry.key())
+            {
+                *existing = entry.value().clone();
+            } else {
+                objects.push(entry.value().clone());
             }
+        }
+        Ok(objects)
+    }
+
+    /// Re-read the live catalog now (capture_schema / diff_schema / drift checks).
+    pub async fn refresh_catalog(&self) -> DbMcpResult<()> {
+        if let Some(live) = &self.live {
+            live.catalog(true).await?;
         }
         Ok(())
     }
 
+    /// Shared read-only guard (policy is enforced upstream; this is defence in depth).
+    fn guard_read_only(&self, request: &AuthorizedQuery) -> DbMcpResult<bool> {
+        let effective_read_only = self.config.read_only || request.read_only;
+        let analysis = parse_and_analyze_sql(DatabaseEngine::MySql, &request.sql)?;
+        if effective_read_only
+            && (analysis.overall_class.is_mutating()
+                || analysis.has_writes
+                || analysis.has_ddl
+                || analysis.has_cte_write
+                || analysis.has_privileged_functions)
+        {
+            return Err(DbMcpError::PolicyDenied {
+                code: "READONLY_VIOLATION".to_string(),
+                message: format!(
+                    "MySQL statement classified as '{}' is forbidden in read-only mode on '{}'",
+                    analysis.overall_class, self.config.connection_id
+                ),
+                next_action: Some("propose_change".to_string()),
+            });
+        }
+        Ok(effective_read_only)
+    }
+
     async fn collect_all_catalog_objects(&self) -> DbMcpResult<Vec<CatalogObject>> {
+        if let Some(live) = &self.live {
+            return self.live_catalog_objects(live, false).await;
+        }
         self.ensure_connectivity().await?;
         let conn = Arc::clone(&self.engine_conn);
         let default_schema = self.config.default_schema.clone();
@@ -539,6 +671,12 @@ impl MySqlAdapter {
         .await
         .map_err(|e| DbMcpError::InternalError(format!("MySQL catalog join error: {e}")))?
     }
+}
+
+fn is_ddl_statement(sql: &str) -> bool {
+    parse_and_analyze_sql(DatabaseEngine::MySql, sql)
+        .map(|a| a.overall_class == SqlStatementClass::Ddl || a.has_ddl)
+        .unwrap_or(false)
 }
 
 fn bootstrap_mysql_system_tables(conn: &Connection) -> DbMcpResult<()> {
@@ -1215,22 +1353,55 @@ impl DatabaseAdapter for MySqlAdapter {
     }
 
     fn is_simulated(&self) -> bool {
-        // No wire-protocol client is implemented: statements always run on the embedded engine,
-        // even when the configured host answers a TCP probe.
-        true
+        self.live.is_none()
     }
 
     fn capabilities(&self) -> DatabaseCapabilities {
-        DatabaseCapabilities::for_mysql()
+        if self.live.is_some() {
+            live::live_capabilities()
+        } else {
+            DatabaseCapabilities::for_mysql()
+        }
     }
 
     async fn discover(&self, request: CatalogRequest) -> DbMcpResult<CatalogResponse> {
         let all_objects = self.collect_all_catalog_objects().await?;
-        Ok(filter_and_paginate_objects(&all_objects, &request))
+        let mut response = filter_and_paginate_objects(&all_objects, &request);
+        if self.live.is_some() {
+            response.schema_version = Some(compute_schema_version(&all_objects));
+        }
+        Ok(response)
     }
 
     async fn execute(&self, request: AuthorizedQuery) -> DbMcpResult<QueryResult> {
-        self.ensure_connectivity().await?;
+        if let Some(live) = &self.live {
+            let read_only = self.guard_read_only(&request)?;
+            let timeout_ms = if request.timeout_ms == 0 {
+                self.config.max_execution_time_ms
+            } else {
+                request.timeout_ms
+            };
+            if read_only {
+                if let Ok(mut log) = self.session_log.lock() {
+                    log.push(live::build_mysql_session_setup(true, timeout_ms));
+                }
+            }
+            let mutating = !read_only
+                && parse_and_analyze_sql(DatabaseEngine::MySql, &request.sql)
+                    .map(|a| a.overall_class != SqlStatementClass::Read || a.has_ddl || a.has_cte_write)
+                    .unwrap_or(true);
+            let outcome = live.execute(&request, read_only, timeout_ms).await;
+            if mutating {
+                // Writes and DDL (implicit commit) may change the schema: re-read it next time.
+                live.invalidate_catalog();
+            }
+            let mut result = outcome?;
+            if is_ddl_statement(&request.sql) {
+                result.warnings.push(MYSQL_NON_TRANSACTIONAL_DDL_WARNING.to_string());
+            }
+            result.schema_version = live.cached_schema_version();
+            return Ok(result);
+        }
 
         let exec_id = request.execution_id.clone();
         if self.cancelled_executions.contains_key(&exec_id) {
@@ -1416,6 +1587,9 @@ impl DatabaseAdapter for MySqlAdapter {
     }
 
     async fn explain(&self, request: ExplainRequest) -> DbMcpResult<ExplainPlan> {
+        if let Some(live) = &self.live {
+            return live.explain(&request).await;
+        }
         self.ensure_connectivity().await?;
 
         let stmts = split_sql_statements(DatabaseEngine::MySql, &request.sql);
@@ -1562,6 +1736,18 @@ impl DatabaseAdapter for MySqlAdapter {
     }
 
     async fn cancel(&self, execution: ExecutionId) -> DbMcpResult<bool> {
+        if let Some(live) = &self.live {
+            let killed = live.cancel(&execution).await?;
+            if let Some(thread_id) = killed {
+                if let Ok(mut threads) = self.killed_threads.lock() {
+                    threads.push(u64::from(thread_id));
+                }
+                if let Ok(mut log) = self.kill_query_log.lock() {
+                    log.push(build_mysql_kill_query(u64::from(thread_id)));
+                }
+            }
+            return Ok(killed.is_some());
+        }
         self.cancelled_executions
             .insert(execution.clone(), Utc::now());
         let thread_id = self
@@ -1588,6 +1774,7 @@ impl SchemaDiffProvider for MySqlAdapter {
         connection: &str,
         schema_pattern: Option<String>,
     ) -> DbMcpResult<SchemaSnapshot> {
+        self.refresh_catalog().await?;
         let req = CatalogRequest {
             connection: connection.to_string(),
             schema_pattern,
@@ -1897,6 +2084,171 @@ INSERT INTO t VALUES (1);
         assert!(out.contains("END ;"), "{out}");
         let adapter = MySqlAdapter::simulated_with_seed("m", sql).unwrap();
         adapter.execute_batch("SELECT 1;").unwrap();
+    }
+
+    fn live_adapter(var: &str) -> Option<MySqlAdapter> {
+        let dsn = std::env::var(var).ok().filter(|v| !v.trim().is_empty());
+        let Some(dsn) = dsn else {
+            eprintln!("skipped: {var} not set (run `eval \"$(bash scripts/live-db-up.sh mysql)\"`)");
+            return None;
+        };
+        Some(MySqlAdapter::new(MySqlConfig::new("live", dsn).with_read_only(true)).unwrap())
+    }
+
+    fn catalog_req(types: Vec<CatalogObjectType>) -> CatalogRequest {
+        CatalogRequest {
+            connection: "live".to_string(),
+            schema_pattern: None,
+            name_pattern: None,
+            object_types: types,
+            detail_level: CatalogDetailLevel::Full,
+            limit: 1000,
+            offset: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn live_catalog_discovery_and_explain() {
+        let Some(adapter) = live_adapter("DB_MCP_MYSQL_TEST_DSN") else { return };
+        assert!(!adapter.is_simulated());
+        assert!(adapter.capabilities().supports_health_diagnostics);
+        let resp = adapter.discover(catalog_req(vec![CatalogObjectType::Table, CatalogObjectType::View])).await.unwrap();
+        let names: Vec<&str> = resp.objects.iter().map(|o| o.name.as_str()).collect();
+        for t in ["users", "orders", "order_items", "inventory", "audit_logs", "internal_secrets", "active_user_orders"] {
+            assert!(names.contains(&t), "{t} missing from {names:?}");
+        }
+        assert!(resp.schema_version.as_deref().unwrap().starts_with("snapshot_"));
+        let orders = resp.objects.iter().find(|o| o.name == "orders").unwrap();
+        assert_eq!(orders.schema, "appdb");
+        assert!(orders.foreign_keys.iter().any(|f| f.referenced_table == "users" && f.columns == vec!["user_id"]));
+        assert!(orders.indexes.iter().any(|i| i.name == "idx_orders_status_created" && i.columns == vec!["status", "created_at"]));
+        let view = resp.objects.iter().find(|o| o.name == "active_user_orders").unwrap();
+        assert!(view.definition.as_deref().unwrap().contains("`appdb`.`orders`"));
+        // The minimal login cannot see routines; the catalog says so instead of failing.
+        let warnings = adapter.live().unwrap().catalog_warnings();
+        assert!(warnings.iter().any(|w| w.contains("SHOW_ROUTINE")), "{warnings:?}");
+
+        let described = adapter.describe_object(Some("appdb"), "users", CatalogDetailLevel::Full).await.unwrap();
+        assert!(described.columns.iter().any(|c| c.name == "password_hash"));
+
+        let plan = adapter
+            .explain(ExplainRequest {
+                request_id: "e1".to_string(),
+                connection: "live".to_string(),
+                sql: "SELECT * FROM orders WHERE total_cents > ?".to_string(),
+                params: vec![serde_json::json!(1000)],
+                analyze: false,
+                format: ExplainFormat::Json,
+                timeout_ms: 5_000,
+            })
+            .await
+            .unwrap();
+        assert_eq!(plan.seq_scans, vec!["orders".to_string()], "{plan:?}");
+        assert!(plan.estimated_cost.is_some());
+        let plan = adapter
+            .explain(ExplainRequest {
+                request_id: "e2".to_string(),
+                connection: "live".to_string(),
+                sql: "SELECT o.id FROM orders o JOIN users u ON u.id = o.user_id WHERE o.user_id = 1".to_string(),
+                params: vec![],
+                analyze: true,
+                format: ExplainFormat::Text,
+                timeout_ms: 5_000,
+            })
+            .await
+            .unwrap();
+        assert!(plan.raw_plan.contains("actual time"), "{}", plan.raw_plan);
+        assert!(!plan.index_scans.is_empty(), "{plan:?}");
+        let err = adapter
+            .explain(ExplainRequest {
+                request_id: "e3".to_string(),
+                connection: "live".to_string(),
+                sql: "SELECT * FROM no_such_table".to_string(),
+                params: vec![],
+                analyze: false,
+                format: ExplainFormat::Json,
+                timeout_ms: 5_000,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "ADAPTER_ERROR");
+        let err = adapter
+            .explain(ExplainRequest {
+                request_id: "e4".to_string(),
+                connection: "live".to_string(),
+                sql: "DELETE FROM orders".to_string(),
+                params: vec![],
+                analyze: false,
+                format: ExplainFormat::Json,
+                timeout_ms: 5_000,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "READONLY_VIOLATION");
+
+        let snap = adapter.capture_schema("live", None).await.unwrap();
+        let q = AuthorizedQuery::new_read(
+            "r",
+            "live",
+            CallerIdentity::local_agent("t"),
+            "SELECT COUNT(*) FROM orders",
+            vec![],
+            &ExecutionLimits::default(),
+        );
+        let res = adapter.execute(q).await.unwrap();
+        assert_eq!(res.schema_version.as_deref(), Some(snap.schema_version.as_str()));
+    }
+
+    #[tokio::test]
+    async fn live_catalog_with_show_routine_lists_routines() {
+        let Some(adapter) = live_adapter("DB_MCP_MYSQL_TEST_DSN_DIAG") else { return };
+        let resp = adapter
+            .discover(catalog_req(vec![CatalogObjectType::Procedure, CatalogObjectType::Function]))
+            .await
+            .unwrap();
+        let checkout = resp.objects.iter().find(|o| o.name == "checkout_order").expect("checkout_order");
+        let def = checkout.definition.as_deref().unwrap();
+        assert!(def.starts_with("CREATE PROCEDURE `appdb`.`checkout_order`(IN p_order_id bigint)"), "{def}");
+        assert!(def.contains("CALL reserve_inventory"));
+        let f = resp.objects.iter().find(|o| o.name == "calculate_order_discount").unwrap();
+        assert_eq!(f.object_type, CatalogObjectType::Function);
+        assert!(f.definition.as_deref().unwrap().contains("RETURNS decimal(12,2)"));
+        assert!(!adapter.live().unwrap().catalog_warnings().iter().any(|w| w.contains("SHOW_ROUTINE")));
+    }
+
+    #[tokio::test]
+    async fn live_diagnostics_degrade_without_grants_and_use_them_when_granted() {
+        let Some(ro) = live_adapter("DB_MCP_MYSQL_TEST_DSN") else { return };
+        let live = ro.live().unwrap().clone();
+        let objects = ro.collect_all_catalog_objects().await.unwrap();
+        let report = live.database_health(&objects).await.unwrap();
+        let ids: Vec<&str> = report.findings.iter().map(|f| f.check_id.as_str()).collect();
+        assert!(ids.contains(&"tables_without_primary_key") && ids.contains(&"redundant_indexes"), "{ids:?}");
+        assert!(ids.contains(&"process_visibility") && ids.contains(&"workload_visibility"), "{ids:?}");
+        assert!(report.active_connections.is_some() && report.max_connections.is_some());
+        let no_pk = report.findings.iter().find(|f| f.check_id == "tables_without_primary_key").unwrap();
+        assert!(no_pk.evidence.to_string().contains("event_log_nopk"));
+        let w = live.analyze_workload(10).await.unwrap();
+        assert!(w.unwrap_err().contains("GRANT SELECT ON performance_schema"));
+
+        let Some(diag) = live_adapter("DB_MCP_MYSQL_TEST_DSN_DIAG") else { return };
+        let q = AuthorizedQuery::new_read(
+            "r",
+            "live",
+            CallerIdentity::local_agent("t"),
+            "SELECT id, total_cents FROM orders WHERE total_cents > 1000",
+            vec![],
+            &ExecutionLimits::default(),
+        );
+        diag.execute(q).await.unwrap();
+        let live = diag.live().unwrap().clone();
+        let w = live.analyze_workload(20).await.unwrap().expect("digests readable with the grant");
+        assert_eq!(w.source, "performance_schema.events_statements_summary_by_digest");
+        assert!(w.top_queries.iter().any(|q| q.normalized_query.to_ascii_lowercase().contains("total_cents")), "{:?}", w.top_queries);
+        assert!(!w.top_queries.iter().any(|q| q.normalized_query.to_ascii_lowercase().contains("information_schema")));
+        let objects = diag.collect_all_catalog_objects().await.unwrap();
+        let report = live.database_health(&objects).await.unwrap();
+        assert!(!report.findings.iter().any(|f| f.check_id == "process_visibility" || f.check_id == "workload_visibility"));
     }
 
     #[test]

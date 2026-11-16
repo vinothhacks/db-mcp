@@ -33,7 +33,7 @@ use db_mcp_core::{
     PostgresHealthProvider, PostgresIndexAdvisor, SchemaSnapshot, SqlStatementClass,
 };
 use db_mcp_executor::{BoundedExecutor, GovernedQueryRequest};
-use db_mcp_mysql::{MySqlAdapter, MySqlConfig};
+use db_mcp_mysql::{MySqlAdapter, MySqlBackendMode, MySqlConfig};
 use db_mcp_pg_insights::PgInsightsEngine;
 use db_mcp_policy::{PolicyEngine, PolicyEvaluation, CODE_MUTATION_NOT_ALLOWED_IN_READ_ONLY};
 use db_mcp_postgres::{PostgresAdapter, PostgresConfig};
@@ -170,6 +170,8 @@ pub struct DbMcpRuntime {
     pg_insights: PgInsightsEngine,
     changes: ChangeManager,
     ontology: OntologyService,
+    /// Live MySQL adapters (typed handles for catalog refresh and MySQL diagnostics).
+    mysql_live: BTreeMap<String, Arc<MySqlAdapter>>,
 }
 
 /// Build the ontology service from configuration (shared by the runtime and the admin CLI).
@@ -347,6 +349,7 @@ impl DbMcpRuntime {
         let mut adapters: BTreeMap<String, Arc<dyn DatabaseAdapter>> = BTreeMap::new();
         let mut summaries = BTreeMap::new();
         let mut policy_configs = Vec::new();
+        let mut mysql_live: BTreeMap<String, Arc<MySqlAdapter>> = BTreeMap::new();
 
         for conn in &config.connections {
             let resolved_dsn = conn.resolve_dsn(&secrets)?;
@@ -382,15 +385,27 @@ impl DbMcpRuntime {
                     Arc::new(PostgresAdapter::new(cfg)?)
                 }
                 DatabaseEngine::MySql => {
-                    let mut cfg =
-                        MySqlConfig::new(&conn.id, resolved_dsn).with_read_only(conn.read_only);
+                    // Explicit backend: a live connection never falls back to the simulation.
+                    let mode = if conn.effective_backend()? == config::BACKEND_SIMULATED {
+                        MySqlBackendMode::SimulatedOnly
+                    } else {
+                        MySqlBackendMode::LiveOnly
+                    };
+                    let mut cfg = MySqlConfig::new(&conn.id, resolved_dsn)
+                        .with_read_only(conn.read_only)
+                        .with_backend_mode(mode)
+                        .with_max_execution_time_ms(conn.timeout_ms);
                     if let Some(schema) = &conn.default_schema {
                         cfg = cfg.with_default_schema(schema.clone());
                     }
                     if let Some(init_sql) = &conn.init_sql {
                         cfg = cfg.with_init_sql(init_sql.clone());
                     }
-                    Arc::new(MySqlAdapter::new(cfg)?)
+                    let mysql = Arc::new(MySqlAdapter::new(cfg)?);
+                    if mysql.live().is_some() {
+                        mysql_live.insert(conn.id.clone(), mysql.clone());
+                    }
+                    mysql
                 }
             };
 
@@ -448,6 +463,7 @@ impl DbMcpRuntime {
             pg_insights,
             changes,
             ontology,
+            mysql_live,
         })
     }
 
@@ -628,6 +644,41 @@ impl DbMcpRuntime {
         })
     }
 
+    /// Re-read a live MySQL catalog now (snapshots, diffs and change drift checks must not use
+    /// the short-lived discovery cache).
+    async fn refresh_live_catalog(&self, connection: &str) -> DbMcpResult<()> {
+        if let Some(mysql) = self.mysql_live.get(connection) {
+            mysql.refresh_catalog().await?;
+        }
+        Ok(())
+    }
+
+    /// Catalog visibility warnings (missing optional grants) for live MySQL catalog tools.
+    fn add_live_catalog_warnings(&self, tool_name: &str, val: &mut Value, args: &Value) {
+        if !matches!(
+            tool_name,
+            "search_objects" | "describe_object" | "trace_table_dependencies" | "get_procedure_call_graph" | "capture_schema" | "discover_ontology"
+        ) {
+            return;
+        }
+        let Some(conn) = args.get("connection").and_then(|v| v.as_str()) else { return };
+        let Some(mysql) = self.mysql_live.get(conn) else { return };
+        let notes = mysql.live().map(|l| l.catalog_warnings()).unwrap_or_default();
+        if notes.is_empty() {
+            return;
+        }
+        if let Some(obj) = val.as_object_mut() {
+            let warnings = obj.entry("warnings").or_insert_with(|| json!([]));
+            if let Some(arr) = warnings.as_array_mut() {
+                for n in notes {
+                    if !arr.iter().any(|w| w.as_str() == Some(n.as_str())) {
+                        arr.push(Value::String(n));
+                    }
+                }
+            }
+        }
+    }
+
     /// Capture a schema snapshot over the policy-visible catalog only.
     async fn capture_allowed(
         &self,
@@ -635,6 +686,7 @@ impl DbMcpRuntime {
         connection: &str,
         schema_pattern: Option<String>,
     ) -> DbMcpResult<SchemaSnapshot> {
+        self.refresh_live_catalog(connection).await?;
         let (objects, _) = self.discover_allowed(adapter, connection, schema_pattern).await?;
         Ok(capture_schema(connection, adapter.capabilities().engine, objects))
     }
@@ -957,6 +1009,7 @@ impl DbMcpRuntime {
         match outcome {
             Ok(mut val) => {
                 self.finalize_response(&mut val, &arguments);
+                self.add_live_catalog_warnings(tool_name, &mut val, &arguments);
                 if !already_audited {
                     self.audit_call_outcome(&req_id, tool_name, caller, conn_hint.as_deref(), Ok(&val), started);
                     self.audit_tracker.take_seen(&req_id);
@@ -1059,6 +1112,7 @@ impl DbMcpRuntime {
                         }
                         let mut entry = serde_json::to_value(&summary).unwrap_or_else(|_| json!({}));
                         entry["simulated"] = json!(simulated);
+                        entry["backend"] = json!(if simulated { "simulated" } else { "live" });
                         if simulated {
                             entry["warnings"] = json!([format!(
                                 "connection '{}' is served by the embedded simulated {} engine (no external server is queried; results are illustrative)",
@@ -1369,7 +1423,14 @@ impl DbMcpRuntime {
                         "supports_health_diagnostics",
                     ));
                 }
-                let report = self.pg_insights.database_health(&conn).await?;
+                let report = match self.mysql_live.get(&conn).and_then(|m| m.live().cloned()) {
+                    // Live MySQL: server counters + catalog checks over the policy-visible catalog.
+                    Some(live) => {
+                        let (visible, _) = self.discover_allowed(adapter.as_ref(), &conn, None).await?;
+                        live.database_health(&visible).await?
+                    }
+                    None => self.pg_insights.database_health(&conn).await?,
+                };
                 let mut val = to_json(PgInsightsEngine::health_report_to_response(
                     req_id,
                     "snapshot_health",
@@ -1386,7 +1447,18 @@ impl DbMcpRuntime {
                 let conn = req_str("connection")?;
                 let _adapter = self.get_authorized_adapter(caller, &conn)?;
                 let top_n = arg_positive_u64(args, "top_n")?.unwrap_or(10) as usize;
-                let workload = self.pg_insights.analyze_workload(&conn, top_n).await?;
+                let workload = match self.mysql_live.get(&conn).and_then(|m| m.live().cloned()) {
+                    Some(live) => match live.analyze_workload(top_n).await? {
+                        Ok(w) => w,
+                        // Missing optional grant: session history, plus a note naming the GRANT.
+                        Err(note) => {
+                            let mut w = self.pg_insights.analyze_workload(&conn, top_n).await?;
+                            w.notes.push(note);
+                            w
+                        }
+                    },
+                    None => self.pg_insights.analyze_workload(&conn, top_n).await?,
+                };
                 let mut val = to_json(PgInsightsEngine::workload_to_response(
                     req_id,
                     "snapshot_workload",
@@ -1423,7 +1495,25 @@ impl DbMcpRuntime {
                         next_action: Some("Remove restricted tables from the workload".to_string()),
                     });
                 }
-                let recs = self.pg_insights.recommend_indexes(&conn, queries, max_recs).await?;
+                let recs = match self.mysql_live.get(&conn).and_then(|m| m.live().cloned()) {
+                    Some(live) => {
+                        // Without explicit queries, prefer the server's statement digests.
+                        let mut queries = queries;
+                        if queries.is_empty() {
+                            if let Ok(Ok(w)) = live.analyze_workload(max_recs.max(10) * 2).await {
+                                queries = w
+                                    .top_queries
+                                    .into_iter()
+                                    .map(|q| q.normalized_query)
+                                    .filter(|q| !mentions_restricted(q, &cfg))
+                                    .collect();
+                            }
+                        }
+                        let recs = self.pg_insights.recommend_indexes(&conn, queries, max_recs).await?;
+                        live.finish_index_recommendations(recs).await
+                    }
+                    None => self.pg_insights.recommend_indexes(&conn, queries, max_recs).await?,
+                };
                 let mut val = to_json(PgInsightsEngine::recommendations_to_response(
                     req_id,
                     &conn,
@@ -1452,6 +1542,7 @@ impl DbMcpRuntime {
                 // Same connection policy execute_query enforces (restricted tables, multi-statement,
                 // ReadOnly, privileged/admin statements); reads are not changes.
                 self.authorize_change_sql(caller, &conn, adapter.capabilities().engine, &sql)?;
+                self.refresh_live_catalog(&conn).await?;
                 let proposal = self
                     .changes
                     .propose_change_with_adapter(caller, adapter.as_ref(), sql, params, constraints, ttl)
@@ -1489,6 +1580,7 @@ impl DbMcpRuntime {
                 let adapter = self.get_authorized_adapter(caller, &existing.connection)?;
                 // Re-check the connection policy: it may have changed since the proposal.
                 self.authorize_change_sql(caller, &existing.connection, adapter.capabilities().engine, &existing.sql)?;
+                self.refresh_live_catalog(&existing.connection).await?;
                 let mode = self.policy.effective_config(&existing.connection).mode;
                 let options = ApplyChangeOptions {
                     // Fail closed: production changes only run on keyed (unforgeable) approvals.

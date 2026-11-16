@@ -176,6 +176,16 @@ function buildUnreachableDsnConfig() {
   }).configPath;
 }
 
+const LIVE_PW = "s3cr3t-pw-never-shown";
+function buildLiveUnreachableMysqlConfig(hostPort) {
+  return makeIsolatedConfig({
+    transform: (t) => t
+      .replace(/(id = "analytics-mysql"[\s\S]*?)init_sql = """[\s\S]*?"""\n/, "$1")
+      .replace('backend = "simulated"\ndsn = "mysql://localhost:3306/analytics"',
+        `backend = "live"\ndsn = "mysql://dbmcp_ro:${LIVE_PW}@${hostPort}/analytics?connect_timeout=1500"`),
+  }).configPath;
+}
+
 const L = "local-sqlite";
 const P = "prod-postgres";
 const M = "analytics-mysql";
@@ -809,7 +819,7 @@ async function sectionSimulated(c) {
     denied(p, "EXECUTION_TIMEOUT");
     okEnvelope((await eq(c, { connection: P, sql: "SELECT 1 AS alive" })).payload);
   });
-  await check("8.06 unreachable DSN: first and subsequent calls still answer promptly (probe cost recorded)", async () => {
+  await check("8.06 simulated backends ignore the DSN: an unreachable host still answers promptly (no probe)", async () => {
     const cfg = buildUnreachableDsnConfig();
     const t0 = Date.now();
     const u = await openClient(cfg, "p1", "agent");
@@ -828,6 +838,27 @@ async function sectionSimulated(c) {
     u.close();
     return `init ${initMs}ms, pg calls ${times.join("/")}ms, mysql ${mysqlMs}ms`;
   });
+  for (const [label, host] of [["refused port", "127.0.0.1:1"], ["unroutable host", "10.255.255.1:3306"]]) {
+    await check(`8.06b live MySQL backend with ${label}: fails fast with CONNECTION_UNAVAILABLE + next_action, never simulated, no password`, async () => {
+      const cfg = buildLiveUnreachableMysqlConfig(host);
+      const u = await openClient(cfg, "p1", "agent");
+      const t0 = Date.now();
+      const { payload: p } = await eq(u, { connection: M, sql: "SELECT 1 AS x" });
+      const ms = Date.now() - t0;
+      denied(p, "CONNECTION_UNAVAILABLE");
+      assert.ok(p.next_action && /check-connection/.test(p.next_action), `next_action=${p.next_action}`);
+      assert.ok(ms < 6000, `took ${ms}ms`);
+      assert.ok(!JSON.stringify(p).includes(LIVE_PW), "password leaked");
+      const lc = await u.rpc("tools/call", { name: "list_connections", arguments: {} });
+      const entry = lc.result.structuredContent.data.find((x) => x.id === M);
+      assert.equal(entry.backend, "live");
+      assert.equal(entry.simulated, false);
+      const so = (await u.rpc("tools/call", { name: "search_objects", arguments: { connection: M } })).result.structuredContent;
+      denied(so, "CONNECTION_UNAVAILABLE");
+      u.close();
+      return `${ms}ms`;
+    });
+  }
   await check("8.07 observation: simulated-engine results carry no 'simulated' marker (documented, not asserted)", async () => {
     const { payload: p } = await eq(c, { connection: P, sql: "SELECT 1 AS x" });
     okEnvelope(p);

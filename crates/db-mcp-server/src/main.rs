@@ -61,6 +61,19 @@ pub enum Commands {
     VerifyConfig {
         #[arg(long)]
         config: PathBuf,
+        /// Also run the read-only `check-connection` smoke test against every connection.
+        #[arg(long)]
+        live: bool,
+    },
+    /// Read-only smoke test of configured connections: connect, server version, permissions,
+    /// `SELECT 1`, catalog object count, and a warning when the account can write.
+    /// Prints JSON; exits non-zero when a connection cannot be reached.
+    CheckConnection {
+        #[arg(long)]
+        config: PathBuf,
+        /// Only check this connection id (default: every connection).
+        #[arg(long)]
+        connection: Option<String>,
     },
     /// Verify the hash chains of the configured JSONL and SQLite audit trails (non-zero exit on tamper).
     VerifyAudit {
@@ -570,9 +583,24 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     });
 
     match command {
-        Commands::VerifyConfig { config } => {
+        Commands::CheckConnection { config, connection } => {
             let parsed = ServerConfig::from_file(&config)?;
-            let summary = json!({
+            let (all_ok, results) = check_connections(&parsed, connection.as_deref()).await?;
+            let out = if results.len() == 1 { results[0].clone() } else { Value::Array(results) };
+            println!("{}", serde_json::to_string_pretty(&out)?);
+            if !all_ok {
+                std::process::exit(3);
+            }
+            Ok(())
+        }
+        Commands::VerifyConfig { config, live } => {
+            let parsed = ServerConfig::from_file(&config)?;
+            let live_checks = if live {
+                Some(check_connections(&parsed, None).await?)
+            } else {
+                None
+            };
+            let mut summary = json!({
                 "status": "ok",
                 "config_path": config.display().to_string(),
                 "server_name": parsed.server_name,
@@ -582,6 +610,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 "named_tools": parsed.named_tools.len(),
                 "active_profiles": parsed.active_profiles,
             });
+            if let Some((all_ok, results)) = live_checks {
+                summary["status"] = json!(if all_ok { "ok" } else { "unreachable" });
+                summary["connection_checks"] = Value::Array(results);
+                println!("{}", serde_json::to_string_pretty(&summary)?);
+                if !all_ok {
+                    std::process::exit(3);
+                }
+                return Ok(());
+            }
             println!("{}", serde_json::to_string_pretty(&summary)?);
             Ok(())
         }
@@ -685,6 +722,104 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             }
         }
     }
+}
+
+/// Run the read-only connection smoke test. Live MySQL connections are checked by the adapter
+/// itself (grants, version, read-only session); every other connection goes through the governed
+/// runtime as an admin caller (`SELECT 1` + catalog count). Never prints DSNs or passwords.
+async fn check_connections(cfg: &ServerConfig, only: Option<&str>) -> anyhow::Result<(bool, Vec<Value>)> {
+    let selected: Vec<&db_mcp_mcp::ConnectionConfig> = cfg
+        .connections
+        .iter()
+        .filter(|c| only.map(|id| c.id == id).unwrap_or(true))
+        .collect();
+    if selected.is_empty() {
+        anyhow::bail!("Unknown connection '{}' in configuration", only.unwrap_or_default());
+    }
+    let mut results = Vec::new();
+    let mut all_ok = true;
+    let mut runtime: Option<db_mcp_mcp::DbMcpRuntime> = None;
+    for conn in selected {
+        let backend = conn.effective_backend()?;
+        let result = if conn.engine == db_mcp_core::DatabaseEngine::MySql && backend == db_mcp_mcp::config::BACKEND_LIVE {
+            check_mysql_live(conn).await
+        } else {
+            if runtime.is_none() {
+                runtime = Some(db_mcp_mcp::DbMcpRuntime::from_config(cfg.clone())?);
+            }
+            check_via_runtime(runtime.as_ref().expect("runtime"), conn, backend).await
+        };
+        all_ok &= result.get("can_connect").and_then(Value::as_bool).unwrap_or(false);
+        results.push(result);
+    }
+    Ok((all_ok, results))
+}
+
+async fn check_mysql_live(conn: &db_mcp_mcp::ConnectionConfig) -> Value {
+    let secrets = CompositeSecretProvider::with_static_and_env(StaticSecretProvider::new());
+    let built = conn.resolve_dsn(&secrets).and_then(|dsn| {
+        let mut cfg = db_mcp_mysql::MySqlConfig::new(&conn.id, dsn)
+            .with_read_only(true)
+            .with_backend_mode(db_mcp_mysql::MySqlBackendMode::LiveOnly)
+            .with_max_execution_time_ms(conn.timeout_ms);
+        if let Some(schema) = &conn.default_schema {
+            cfg = cfg.with_default_schema(schema.clone());
+        }
+        db_mcp_mysql::MySqlAdapter::new(cfg)
+    });
+    match built {
+        Ok(adapter) => adapter.check_connection().await,
+        Err(e) => json!({
+            "connection": conn.id,
+            "engine": conn.engine.as_str(),
+            "backend": "live",
+            "server_version": null,
+            "can_connect": false,
+            "select_1": false,
+            "object_count": null,
+            "permissions": [],
+            "can_write": null,
+            "warnings": [db_mcp_secrets::redact_sensitive_text(&e.to_string())],
+        }),
+    }
+}
+
+async fn check_via_runtime(runtime: &db_mcp_mcp::DbMcpRuntime, conn: &db_mcp_mcp::ConnectionConfig, backend: &str) -> Value {
+    let admin = CallerIdentity::new("check-connection", "admin", vec!["*".to_string()], "cli");
+    let mut warnings = Vec::new();
+    if backend == db_mcp_mcp::config::BACKEND_SIMULATED {
+        warnings.push(format!(
+            "connection '{}' uses the embedded simulated {} engine: no server is contacted and the DSN is ignored",
+            conn.id,
+            conn.engine.as_str()
+        ));
+    }
+    let select = runtime
+        .call_tool("execute_query", json!({"connection": conn.id, "sql": "SELECT 1 AS one"}), &admin)
+        .await;
+    let select_1 = select.get("status").and_then(Value::as_str) == Some("ok");
+    if !select_1 {
+        warnings.push(format!(
+            "SELECT 1 failed: {}",
+            select.get("message").and_then(Value::as_str).unwrap_or("unknown error")
+        ));
+    }
+    let search = runtime
+        .call_tool("search_objects", json!({"connection": conn.id, "detail_level": "names", "limit": 1}), &admin)
+        .await;
+    let object_count = search.pointer("/data/total_count").cloned().unwrap_or(Value::Null);
+    json!({
+        "connection": conn.id,
+        "engine": conn.engine.as_str(),
+        "backend": backend,
+        "server_version": null,
+        "can_connect": select_1,
+        "select_1": select_1,
+        "object_count": object_count,
+        "permissions": [],
+        "can_write": !conn.read_only,
+        "warnings": warnings,
+    })
 }
 
 async fn run_ontology_command(command: OntologyCommand) -> anyhow::Result<()> {
@@ -811,7 +946,9 @@ mod tests {
     #[test]
     fn cli_parses_verify_config_and_default_serve() {
         let cli = Cli::parse_from(["db-mcp-server", "verify-config", "--config", "config/db-mcp.example.toml"]);
-        assert!(matches!(cli.command, Some(Commands::VerifyConfig { .. })));
+        assert!(matches!(cli.command, Some(Commands::VerifyConfig { live: false, .. })));
+        let cli = Cli::parse_from(["db-mcp-server", "check-connection", "--config", "c.toml", "--connection", "m"]);
+        assert!(matches!(cli.command, Some(Commands::CheckConnection { connection: Some(_), .. })));
 
         let default_cli = Cli::parse_from(["db-mcp-server"]);
         assert!(default_cli.command.is_none());

@@ -21,3 +21,5 @@ regex.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 tracing.workspace = true
+mysql_async.workspace = true
+percent-encoding = "2"

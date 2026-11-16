@@ -300,6 +300,9 @@ END;
 [[connections]]
 id = "analytics-mysql"
 engine = "MySql"
+# Embedded simulation for the offline demo and test suites: no MySQL server is contacted and the
+# DSN is ignored. Remove this line (or set backend = "live") to query a real MySQL 8 server.
+backend = "simulated"
 dsn = "mysql://localhost:3306/analytics"
 mode = "ReadOnly"
 read_only = true

@@ -102,11 +102,14 @@ CREATE TABLE IF NOT EXISTS notes (
 # allowed_principals = ["*"]
 
 # ---------------------------------------------------------------------------
-# MySQL / MariaDB (read-only replica)
+# MySQL 8 (live server, read-only login: GRANT SELECT, SHOW VIEW ON analytics.*)
+# Plain TCP; percent-encode special characters in the password. Check it with
+#   db-mcp check-connection --config db-mcp.toml --connection mysql
 # ---------------------------------------------------------------------------
 # [[connections]]
 # id = "mysql"
 # engine = "MySql"
+# backend = "live"                          # default for MySql; "simulated" = embedded demo engine
 # dsn = "env:MYSQL_URL"                     # e.g. mysql://user:pass@localhost:3306/analytics
 # mode = "ReadOnly"
 # read_only = true
