@@ -434,7 +434,9 @@ async function main() {
     await withServer({ config: configPath, unsetEnv: ["F13_MISSING_DSN_VAR"], env: { RUST_LOG: "debug" } }, async (s) => {
       const q = await s.call("execute_query", { connection: "prod-postgres", sql: "SELECT 1 AS x" });
       assert.equal(q.status, "ok", "server came up in simulated mode without any warning");
-      assert.equal(s.stderr.join(""), "", "no diagnostics at all are written to stderr");
+      // The unrelated startup warning about unkeyed change approvals (no DB_MCP_APPROVAL_KEY here) is ignored.
+      const diag = s.stderr.join("").split(/\r?\n/).filter((l) => l.trim() && !/approval records are not keyed/.test(l));
+      assert.deepEqual(diag, [], "no diagnostics at all are written to stderr");
     });
   });
   await check("secrets: file: DSN reference resolves from file (trimmed) as documented in starter config", async () => {
@@ -732,7 +734,8 @@ async function main() {
   await check("http: with tokens set, /mcp requires bearer; header role cannot approve, /admin/approve needs the separate admin token", async () => {
     const port = 19000 + Math.floor(Math.random() * 500);
     const { configPath, dir } = makeIsolatedConfig({ dir: path.join(TMP, "http-tok"), transform: (t) => t.replace('bind = "127.0.0.1:8080"', `bind = "127.0.0.1:${port}"`) });
-    const srv = await startHttp({ config: configPath, port, env: { DB_MCP_AUTH_TOKEN: "tok-user-123456", DB_MCP_ADMIN_TOKEN: "tok-admin-654321" } });
+    // DB_MCP_APPROVAL_KEY: GovernedProduction apply_change requires keyed approvals.
+    const srv = await startHttp({ config: configPath, port, env: { DB_MCP_AUTH_TOKEN: "tok-user-123456", DB_MCP_ADMIN_TOKEN: "tok-admin-654321", DB_MCP_APPROVAL_KEY: "f13-approval-key-0123456789abcdef" } });
     try {
       const U = { authorization: "Bearer tok-user-123456" };
       const asAdminHdr = { ...U, "x-mcp-principal": "mallory", "x-mcp-role": "admin" };

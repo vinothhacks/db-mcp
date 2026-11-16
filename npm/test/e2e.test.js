@@ -12,6 +12,10 @@ const REPO_ROOT = path.resolve(__dirname, "..", "..");
 const BIN_WRAPPER = path.join(REPO_ROOT, "npm", "bin", "db-mcp.js");
 const EXAMPLE_CONFIG = "config/db-mcp.example.toml";
 
+// GovernedProduction apply_change requires keyed approvals; every spawned server and
+// `db-mcp approve` inherits this key.
+process.env.DB_MCP_APPROVAL_KEY = process.env.DB_MCP_APPROVAL_KEY || "e2e-approval-key-0123456789abcdef";
+
 function getFreePort() {
   return new Promise((resolve, reject) => {
     const srv = net.createServer();

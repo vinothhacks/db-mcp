@@ -22,6 +22,11 @@ sqlite_path = "research/traces/audit.db"
 storage_path = "research/traces/changes.db"
 policy_revision = "policy_v1"
 default_ttl_seconds = 3600
+# HMAC key signing approval records (min 16 bytes; env:VAR, file:/path or literal). Without it,
+# approvals in changes.db are unkeyed (forgeable by anyone who can write the file): the server
+# warns, and GovernedProduction connections refuse apply_change. When unset, the env variable
+# DB_MCP_APPROVAL_KEY is used if present. Startup fails if set but unresolvable.
+# approval_key = "env:DB_MCP_APPROVAL_KEY"
 
 [ontology]
 # Governed semantic layer. Dedicated metadata store (never business tables).

@@ -107,6 +107,31 @@ The proposing principal can never approve its own change (`SELF_APPROVAL_FORBIDD
 once (`APPROVAL_ALREADY_CONSUMED`), and the SQL, parameters, connection, policy revision and schema fingerprint are all
 bound into the approval hash (`APPROVAL_HASH_MISMATCH`, `SCHEMA_DRIFT_DETECTED`).
 
+Only a `proposed` change can be approved, and only once: a second or concurrent approval, or approving a rejected or
+expired change, is refused (`CHANGE_NOT_PENDING`, `APPROVAL_EXPIRED`). `propose_change` applies the connection policy of
+`execute_query` (restricted tables, multi-statement batches, ReadOnly connections, privileged and administrative
+statements) and refuses plain reads (`NOT_A_CHANGE`); `apply_change` checks the policy again before executing.
+
+### Approval key
+
+Approval records are signed with HMAC-SHA256 (`approval_mac`) over the change id, approval hash, approver, approval
+time and comment. Configure the same key for the server and for `db-mcp approve`:
+
+```toml
+[changes]
+approval_key = "env:DB_MCP_APPROVAL_KEY"   # or "file:/run/secrets/db-mcp-approval-key"; at least 16 bytes
+```
+
+When `changes.approval_key` is unset, the `DB_MCP_APPROVAL_KEY` environment variable is used if present. A configured
+reference that cannot be resolved stops startup. `apply_change` refuses an approval whose MAC is missing or invalid
+(`APPROVAL_HASH_MISMATCH`), so an approval written directly into `changes.db` is never executed. Rotating the key
+invalidates approvals that have not been applied yet; approve them again.
+
+Without a key, approvals in a persistent change store are not keyed: the server prints a startup warning, approve and
+apply results carry the warning `approval records are not keyed`, and **GovernedProduction connections refuse
+`apply_change`** (`APPROVAL_KEY_REQUIRED`). Development connections keep working. An in-memory change store (no
+`storage_path`) signs approvals with a random per-process key.
+
 ## Environment variables
 
 | Variable | Effect |
@@ -115,4 +140,5 @@ bound into the approval hash (`APPROVAL_HASH_MISMATCH`, `SCHEMA_DRIFT_DETECTED`)
 | `DB_MCP_SKIP_DOWNLOAD=1` | Never download prebuilt binaries (build locally or fail) |
 | `DB_MCP_RELEASE_BASE_URL` | Override the release download base (mirrors / air-gapped) |
 | `DB_MCP_AUTH_TOKEN`, `DB_MCP_ADMIN_TOKEN` | Bearer tokens referenced from the example config |
+| `DB_MCP_APPROVAL_KEY` | HMAC key signing change approvals when `changes.approval_key` is unset (required for `apply_change` on GovernedProduction) |
 | `RUST_LOG` | Tracing filter for the server (`info`, `debug`, ...) |

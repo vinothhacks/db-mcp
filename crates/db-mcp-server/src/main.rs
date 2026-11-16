@@ -393,7 +393,7 @@ async fn handle_admin_approve(
     {
         Ok(proposal) => (
             StatusCode::OK,
-            Json(json!({ "status": "ok", "proposal": proposal })),
+            Json(json!({ "status": "ok", "proposal": proposal, "warnings": state.handler.approval_warnings() })),
         ),
         Err(err) => {
             let denied = err.to_denied_response(None, None);
@@ -544,14 +544,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             config,
         } => {
             let cfg = load_server_config(config.as_ref())?;
-            let changes = match &cfg.changes.storage_path {
-                Some(path) if !path.trim().is_empty() => {
-                    db_mcp_changes::ChangeManager::with_storage_path(path)?
-                }
-                _ => db_mcp_changes::ChangeManager::new_in_memory(),
+            // Same store and approval key as the server, so the approval MAC verifies at apply time.
+            let changes = db_mcp_mcp::build_change_manager(&cfg)?;
+            let warnings = changes.approval_warnings();
+            for w in &warnings {
+                eprintln!("[db-mcp] WARNING: {w}");
             }
-            .with_policy_revision(&cfg.changes.policy_revision)
-            .with_default_ttl_seconds(cfg.changes.default_ttl_seconds);
             let caller = CallerIdentity::new(approver, role, vec!["*".to_string()], "cli");
             let outcome = changes.approve_change(&change_id, &caller, comment);
             let conn = outcome.as_ref().map(|p| p.connection.clone()).unwrap_or_else(|_| "server".to_string());
@@ -572,6 +570,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     "state": proposal.state,
                     "approval": proposal.approval,
                     "approval_hash": proposal.approval_hash,
+                    "warnings": warnings,
                 }))?
             );
             Ok(())
@@ -588,6 +587,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             let auth_token_ref = cfg.http.auth_token.clone();
             let admin_token_ref = cfg.http.admin_token.clone();
             let handler = McpProtocolHandler::from_config(cfg)?;
+            for w in handler.approval_warnings() {
+                eprintln!("[db-mcp] WARNING: {w}; apply_change is refused on GovernedProduction connections");
+            }
 
             match transport.trim().to_ascii_lowercase().as_str() {
                 "stdio" => {

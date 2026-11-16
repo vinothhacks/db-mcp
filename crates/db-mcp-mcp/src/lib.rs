@@ -20,7 +20,7 @@ use db_mcp_catalog::{
     build_procedure_call_graph, capture_schema, compute_schema_version, describe_object,
     diff_schema, filter_and_paginate_objects, trace_table_dependencies,
 };
-use db_mcp_changes::ChangeManager;
+use db_mcp_changes::{ApplyChangeOptions, ChangeManager};
 use db_mcp_ontology::{
     Certification, Definition, DefinitionBody, DefinitionKind, DefinitionStatus, GovernanceOptions,
     OntologyRevision, OntologyService, OntologyStore, PlanRequest, ProposalInput, QuestionEvidence,
@@ -35,10 +35,10 @@ use db_mcp_core::{
 use db_mcp_executor::{BoundedExecutor, GovernedQueryRequest};
 use db_mcp_mysql::{MySqlAdapter, MySqlConfig};
 use db_mcp_pg_insights::PgInsightsEngine;
-use db_mcp_policy::{PolicyEngine, PolicyEvaluation};
+use db_mcp_policy::{PolicyEngine, PolicyEvaluation, CODE_MUTATION_NOT_ALLOWED_IN_READ_ONLY};
 use db_mcp_postgres::{PostgresAdapter, PostgresConfig};
 use db_mcp_secrets::{CompositeSecretProvider, SecretProvider, SecretString, StaticSecretProvider};
-use db_mcp_sql::hash_sql;
+use db_mcp_sql::{hash_sql, parse_and_analyze_sql};
 use db_mcp_sqlite::{SqliteAdapter, SqliteConfig};
 use db_mcp_tools::NamedToolRegistry;
 use serde::Serialize;
@@ -98,6 +98,7 @@ impl AuditSink for TrackingAuditSink {
 fn audit_decision_for_error(err: &DbMcpError) -> AuditDecision {
     match err {
         DbMcpError::ApprovalRequired(_) => AuditDecision::RequiresApproval,
+        DbMcpError::PolicyDenied { code, .. } if code == "APPROVAL_REQUIRED" => AuditDecision::RequiresApproval,
         DbMcpError::ExecutionCancelled(..) => AuditDecision::Cancelled,
         DbMcpError::AdapterError(_)
         | DbMcpError::StorageError(_)
@@ -197,6 +198,62 @@ pub fn build_ontology_service(config: &ServerConfig) -> DbMcpResult<OntologyServ
             certification_ttl_days: config.ontology.certification_ttl_days,
         },
     ))
+}
+
+/// Environment variable consulted for the approval key when `changes.approval_key` is not set.
+pub const APPROVAL_KEY_ENV: &str = "DB_MCP_APPROVAL_KEY";
+
+/// Resolve the approval-signing key: `changes.approval_key` (`env:VAR`, `file:/path`,
+/// `secret:NAME` or literal) or, when unset, env `DB_MCP_APPROVAL_KEY`.
+///
+/// A configured reference that cannot be resolved (or resolves to nothing) is an error (fail closed).
+pub fn resolve_approval_key(config: &ServerConfig) -> DbMcpResult<Option<Vec<u8>>> {
+    let Some(reference) = config.changes.approval_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) else {
+        return Ok(std::env::var(APPROVAL_KEY_ENV)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .map(String::into_bytes));
+    };
+    let value = if let Some(path) = reference.strip_prefix("file:") {
+        std::fs::read_to_string(path.trim()).map_err(|e| {
+            DbMcpError::ConfigurationError(format!("changes.approval_key file '{}' could not be read: {e}", path.trim()))
+        })?
+    } else {
+        let secrets = CompositeSecretProvider::with_static_and_env(StaticSecretProvider::new());
+        secrets
+            .resolve_dsn(reference)
+            .map_err(|e| DbMcpError::ConfigurationError(format!("changes.approval_key could not be resolved: {e}")))?
+            .expose_secret()
+            .to_string()
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(DbMcpError::ConfigurationError("changes.approval_key resolved to an empty value".to_string()));
+    }
+    Ok(Some(value.as_bytes().to_vec()))
+}
+
+/// Build the change store from configuration (shared by the runtime and the admin CLI), so the
+/// server and `db-mcp approve` sign and verify approvals with the same key.
+pub fn build_change_manager(config: &ServerConfig) -> DbMcpResult<ChangeManager> {
+    let mut changes = match &config.changes.storage_path {
+        Some(path) if !path.trim().is_empty() => {
+            if let Some(parent) = Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            }
+            ChangeManager::with_storage_path(path)?
+        }
+        _ => ChangeManager::new_in_memory(),
+    }
+    .with_policy_revision(&config.changes.policy_revision)
+    .with_default_ttl_seconds(config.changes.default_ttl_seconds);
+    if let Some(key) = resolve_approval_key(config)? {
+        changes = changes.with_approval_key(key)?;
+    }
+    Ok(changes)
 }
 
 fn arg_u64(args: &Value, key: &str) -> DbMcpResult<Option<u64>> {
@@ -314,19 +371,7 @@ impl DbMcpRuntime {
         let named_tools = NamedToolRegistry::from_specs(config.named_tools.clone())?;
         let pg_insights = PgInsightsEngine::with_adapters(adapters.values().cloned());
 
-        let changes = match &config.changes.storage_path {
-            Some(path) if !path.trim().is_empty() => {
-                if let Some(parent) = Path::new(path).parent() {
-                    if !parent.as_os_str().is_empty() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                }
-                ChangeManager::with_storage_path(path)?
-            }
-            _ => ChangeManager::new_in_memory(),
-        }
-        .with_policy_revision(&config.changes.policy_revision)
-        .with_default_ttl_seconds(config.changes.default_ttl_seconds);
+        let changes = build_change_manager(&config)?;
         let ontology = build_ontology_service(&config)?;
 
         Ok(Self {
@@ -394,6 +439,47 @@ impl DbMcpRuntime {
             err_msg,
         ));
         outcome
+    }
+
+    /// Governance warnings for approve/apply results (e.g. approval records are not keyed).
+    pub fn approval_warnings(&self) -> Vec<String> {
+        self.changes.approval_warnings()
+    }
+
+    /// Enforce the connection policy `execute_query` applies (via `PolicyEngine`, evaluated as an
+    /// approved change) on governed change SQL: restricted tables, multi-statement batches,
+    /// ReadOnly connections, privileged functions and fail-closed unknown SQL. Then reject
+    /// statements that are never a change (reads, administrative statements). Used at propose time
+    /// and again at apply time, because the policy may have changed in between.
+    fn authorize_change_sql(
+        &self,
+        caller: &CallerIdentity,
+        connection: &str,
+        engine: DatabaseEngine,
+        sql: &str,
+    ) -> DbMcpResult<()> {
+        let analysis = parse_and_analyze_sql(engine, sql)?;
+        match self.policy.evaluate_sql_with_context(caller, connection, &analysis, true, false) {
+            PolicyEvaluation::Denied { code, message, next_action } => {
+                // A read-only connection cannot take this change at all: proposing again is no remedy.
+                let next_action = if code == CODE_MUTATION_NOT_ALLOWED_IN_READ_ONLY {
+                    Some("list_connections".to_string())
+                } else {
+                    next_action
+                };
+                return Err(DbMcpError::PolicyDenied { code, message, next_action });
+            }
+            other => other.into_result()?,
+        }
+        let read_only_connection = self.summaries.get(connection).map(|s| s.read_only).unwrap_or(false);
+        if read_only_connection && (analysis.overall_class != SqlStatementClass::Read || analysis.has_cte_write) {
+            return Err(DbMcpError::PolicyDenied {
+                code: CODE_MUTATION_NOT_ALLOWED_IN_READ_ONLY.to_string(),
+                message: format!("Connection '{connection}' is read-only; mutating changes cannot be proposed or applied on it."),
+                next_action: Some("list_connections".to_string()),
+            });
+        }
+        db_mcp_changes::validate_change_statement(&analysis)
     }
 
     /// True when the connection's adapter serves results from an embedded simulation.
@@ -1208,7 +1294,15 @@ impl DbMcpRuntime {
                 let adapter = self.get_authorized_adapter(caller, &conn)?;
                 let params = args.get("params").and_then(|v| v.as_array()).cloned().unwrap_or_default();
                 let constraints = args.get("constraints").cloned();
-                let ttl = args.get("ttl_seconds").and_then(|v| v.as_i64());
+                let ttl = match args.get("ttl_seconds") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(v.as_i64().ok_or_else(|| {
+                        DbMcpError::InvalidArgument("'ttl_seconds' must be an integer number of seconds".to_string())
+                    })?),
+                };
+                // Same connection policy execute_query enforces (restricted tables, multi-statement,
+                // ReadOnly, privileged/admin statements); reads are not changes.
+                self.authorize_change_sql(caller, &conn, adapter.capabilities().engine, &sql)?;
                 let proposal = self
                     .changes
                     .propose_change_with_adapter(caller, adapter.as_ref(), sql, params, constraints, ttl)
@@ -1244,8 +1338,18 @@ impl DbMcpRuntime {
                 let change_id = req_str("change_id")?;
                 let existing = self.changes.get_change(&change_id)?;
                 let adapter = self.get_authorized_adapter(caller, &existing.connection)?;
-                let outcome = self.changes.apply_change(&change_id, caller, adapter.as_ref()).await?;
+                // Re-check the connection policy: it may have changed since the proposal.
+                self.authorize_change_sql(caller, &existing.connection, adapter.capabilities().engine, &existing.sql)?;
                 let mode = self.policy.effective_config(&existing.connection).mode;
+                let options = ApplyChangeOptions {
+                    // Fail closed: production changes only run on keyed (unforgeable) approvals.
+                    require_approval_mac: mode == db_mcp_core::OperatingMode::GovernedProduction,
+                    ..ApplyChangeOptions::default()
+                };
+                let outcome = self
+                    .changes
+                    .apply_change_with_options(&change_id, caller, adapter.as_ref(), options)
+                    .await?;
                 let _ = self.audit.record(create_audit_event(
                     req_id,
                     caller,
@@ -1264,10 +1368,9 @@ impl DbMcpRuntime {
                     outcome.post_schema_fingerprint.clone(),
                     None,
                 ));
-                to_json(ChangeManager::proposal_to_response(
-                    req_id,
-                    &outcome.proposal,
-                ))
+                let mut resp = ChangeManager::proposal_to_response(req_id, &outcome.proposal);
+                resp.warnings.extend(outcome.warnings);
+                to_json(resp)
             }
             "capture_schema" => {
                 let conn = req_str("connection")?;
@@ -1997,6 +2100,110 @@ mod tests {
             .await;
         assert_eq!(applied["status"], "ok");
         assert_eq!(applied["data"]["state"], "applied");
+        assert_eq!(applied["data"]["applied_by"], "local-agent");
+        assert_eq!(applied["data"]["rows_affected"], 1);
         assert!(!handler.audit_events().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn propose_change_enforces_connection_policy_like_execute_query() {
+        let handler = McpProtocolHandler::default_demo().expect("demo handler");
+        let agent = CallerIdentity::local_agent("local-agent");
+        let cases = [
+            ("prod-postgres", "SELECT id FROM users", "NOT_A_CHANGE"),
+            (
+                "local-sqlite",
+                "UPDATE orders SET status = 'x' WHERE id = 101; UPDATE orders SET status = 'y' WHERE id = 102",
+                "MULTI_STATEMENT_FORBIDDEN",
+            ),
+            ("analytics-mysql", "DELETE FROM orders WHERE id = 101", "MUTATION_NOT_ALLOWED_IN_READ_ONLY"),
+            ("local-sqlite", "DELETE FROM internal_secrets", "RESTRICTED_TABLE_FORBIDDEN"),
+        ];
+        for (conn, sql, code) in cases {
+            let r = handler
+                .call_tool("propose_change", json!({ "connection": conn, "sql": sql }), &agent)
+                .await;
+            assert_eq!(r["status"], "denied", "{conn}: {sql} -> {r}");
+            assert_eq!(r["code"], code, "{conn}: {sql} -> {r}");
+        }
+        let vacuum = handler
+            .call_tool("propose_change", json!({ "connection": "local-sqlite", "sql": "VACUUM" }), &agent)
+            .await;
+        assert_eq!(vacuum["status"], "denied", "{vacuum}");
+        let ttl = handler
+            .call_tool(
+                "propose_change",
+                json!({ "connection": "local-sqlite", "sql": "UPDATE orders SET status = 'x' WHERE id = 101", "ttl_seconds": 1.5 }),
+                &agent,
+            )
+            .await;
+        assert_eq!(ttl["code"], "INVALID_ARGUMENT", "{ttl}");
+    }
+
+    #[tokio::test]
+    async fn apply_change_rechecks_policy_and_requires_keyed_approval_in_production() {
+        if std::env::var(APPROVAL_KEY_ENV).is_ok() {
+            eprintln!("skipped: {APPROVAL_KEY_ENV} is set in the environment, so no runtime is unkeyed");
+            return;
+        }
+        let store = std::env::temp_dir().join(format!("db_mcp_mcp_keyed_{}.db", Uuid::new_v4().simple()));
+        let agent = CallerIdentity::local_agent("local-agent");
+        let admin = CallerIdentity::admin("dba-approver");
+        let mut cfg = ServerConfig::default_demo();
+        cfg.changes.storage_path = Some(store.display().to_string());
+        let unkeyed = DbMcpRuntime::from_config(cfg.clone()).expect("unkeyed runtime");
+
+        // GovernedProduction + persistent store without a key: apply is refused (fail closed).
+        let prop = unkeyed
+            .call_tool(
+                "propose_change",
+                json!({ "connection": "prod-postgres", "sql": "UPDATE orders SET status = 'shipped' WHERE id = 102" }),
+                &agent,
+            )
+            .await;
+        let prod_id = prop["data"]["change_id"].as_str().unwrap().to_string();
+        let early = unkeyed.call_tool("apply_change", json!({ "change_id": prod_id }), &agent).await;
+        assert_eq!(early["code"], "APPROVAL_REQUIRED", "{early}");
+        assert!(early["next_action"].as_str().unwrap().contains("db-mcp approve --change-id"), "{early}");
+        unkeyed.approve_change(&prod_id, &admin, None).unwrap();
+        assert!(!unkeyed.approval_warnings().is_empty());
+        let refused = unkeyed.call_tool("apply_change", json!({ "change_id": prod_id }), &agent).await;
+        assert_eq!(refused["code"], "APPROVAL_KEY_REQUIRED", "{refused}");
+
+        // Development connection without a key: applies, with an "approval records are not keyed" warning.
+        let dev = unkeyed
+            .call_tool(
+                "propose_change",
+                json!({ "connection": "local-sqlite", "sql": "UPDATE orders SET status = 'dev' WHERE id = 101" }),
+                &agent,
+            )
+            .await;
+        let dev_id = dev["data"]["change_id"].as_str().unwrap().to_string();
+        unkeyed.approve_change(&dev_id, &admin, None).unwrap();
+        let dev_applied = unkeyed.call_tool("apply_change", json!({ "change_id": dev_id }), &agent).await;
+        assert_eq!(dev_applied["status"], "ok", "{dev_applied}");
+        assert!(dev_applied["warnings"].to_string().contains("approval records are not keyed"));
+
+        // Keyed runtime on the same store: the unkeyed approval is not trusted, a fresh one is.
+        cfg.changes.approval_key = Some("unit-test-approval-key-0123456789".to_string());
+        let keyed = DbMcpRuntime::from_config(cfg).expect("keyed runtime");
+        assert!(keyed.approval_warnings().is_empty());
+        let stale = keyed.call_tool("apply_change", json!({ "change_id": prod_id }), &agent).await;
+        assert_eq!(stale["code"], "APPROVAL_HASH_MISMATCH", "{stale}");
+        let prop2 = keyed
+            .call_tool(
+                "propose_change",
+                json!({ "connection": "prod-postgres", "sql": "UPDATE orders SET status = 'shipped' WHERE id = 102" }),
+                &agent,
+            )
+            .await;
+        let id2 = prop2["data"]["change_id"].as_str().unwrap().to_string();
+        let approved = keyed.approve_change(&id2, &admin, None).unwrap();
+        assert!(approved.approval.as_ref().unwrap().approval_mac.is_some());
+        let second = keyed.approve_change(&id2, &CallerIdentity::admin("dba-other"), None).unwrap_err();
+        assert_eq!(second.code(), "CHANGE_NOT_PENDING");
+        let applied = keyed.call_tool("apply_change", json!({ "change_id": id2 }), &agent).await;
+        assert_eq!(applied["status"], "ok", "{applied}");
+        let _ = std::fs::remove_file(&store);
     }
 }

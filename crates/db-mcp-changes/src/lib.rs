@@ -10,6 +10,10 @@
 //! - Atomically claims execution (`ChangeState::Executing`) to prevent replay attacks (`APPROVAL_ALREADY_CONSUMED`).
 //! - Verifies schema fingerprint and cryptographic approval hash immediately prior to execution
 //!   (`SCHEMA_DRIFT_DETECTED`, `APPROVAL_HASH_MISMATCH`).
+//! - Signs every approval record with a keyed HMAC-SHA256 (`approval_mac`) when an approval key is
+//!   configured, so approvals forged by editing the change store are rejected at apply time.
+//! - Approves only `proposed` changes, with a compare-and-swap on the stored state so a second or
+//!   concurrent approval can never replace the first one (`CHANGE_NOT_PENDING`).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -19,9 +23,10 @@ use std::sync::{Arc, Mutex};
 use chrono::{DateTime, Duration, Utc};
 use db_mcp_catalog::capture_schema_via_adapter;
 use db_mcp_core::{
-    ApprovalRecord, AuthorizedQuery, CallerIdentity, ChangeProposal, ChangeState, ColumnMetadata,
-    DatabaseAdapter, DatabaseEngine, DbMcpError, DbMcpResult, ExecutionId, ExecutionLimits,
-    McpSuccessResponse, QueryResult, ReversalSafety, SqlStatementClass,
+    constant_time_eq, hmac_sha256_hex, ApprovalRecord, AuthorizedQuery, CallerIdentity,
+    ChangeProposal, ChangeState, ColumnMetadata, DatabaseAdapter, DatabaseEngine, DbMcpError,
+    DbMcpResult, ExecutionId, ExecutionLimits, McpSuccessResponse, QueryResult, ReversalSafety,
+    SqlStatementClass,
 };
 use db_mcp_sql::{hash_sql, normalize_sql, parse_and_analyze_sql, SqlAnalysis};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -33,6 +38,21 @@ pub const DEFAULT_PROPOSAL_TTL_SECONDS: i64 = 3_600;
 
 /// Default policy revision identifier when not explicitly configured.
 pub const DEFAULT_POLICY_REVISION: &str = "policy_v1";
+
+/// Denial code: the change is not in the `proposed` state, so it cannot be approved (again).
+pub const CODE_CHANGE_NOT_PENDING: &str = "CHANGE_NOT_PENDING";
+
+/// Denial code: a read-only statement was proposed; it changes nothing and is not governed.
+pub const CODE_NOT_A_CHANGE: &str = "NOT_A_CHANGE";
+
+/// Denial code: keyed approvals are required (GovernedProduction) but no approval key is configured.
+pub const CODE_APPROVAL_KEY_REQUIRED: &str = "APPROVAL_KEY_REQUIRED";
+
+/// Warning attached to approve/apply results when the change store has no approval key.
+pub const UNKEYED_APPROVAL_WARNING: &str = "approval records are not keyed: anyone who can write the change store can forge an approval; set changes.approval_key (or DB_MCP_APPROVAL_KEY)";
+
+/// Minimum accepted approval key length in bytes.
+pub const MIN_APPROVAL_KEY_BYTES: usize = 16;
 
 /// Request parameters to create a new governed `ChangeProposal`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -71,6 +91,10 @@ pub struct ApplyChangeOptions {
     pub verify_params: Option<Vec<serde_json::Value>>,
     /// Execution limits applied when running the change on the adapter.
     pub execution_limits: Option<ExecutionLimits>,
+    /// Refuse to apply unless the approval carries a valid keyed `approval_mac` (fail closed when
+    /// no approval key is configured). Set for GovernedProduction connections.
+    #[serde(default)]
+    pub require_approval_mac: bool,
 }
 
 /// Outcome returned when a governed `ChangeProposal` is successfully executed via `apply_change`.
@@ -79,6 +103,9 @@ pub struct ApplyChangeOutcome {
     pub proposal: ChangeProposal,
     pub query_result: QueryResult,
     pub post_schema_fingerprint: Option<String>,
+    /// Non-fatal governance warnings (for example unkeyed approval records).
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +122,9 @@ pub struct ChangeManager {
     memory_store: Arc<Mutex<BTreeMap<String, ChangeProposal>>>,
     policy_revision: String,
     default_ttl_seconds: i64,
+    /// Secret key for the approval HMAC. In-memory stores use a random per-process key (their
+    /// records cannot be edited from outside the process); persistent stores need a configured key.
+    approval_key: Option<Arc<Vec<u8>>>,
 }
 
 impl Default for ChangeManager {
@@ -111,6 +141,7 @@ impl ChangeManager {
             memory_store: Arc::new(Mutex::new(BTreeMap::new())),
             policy_revision: DEFAULT_POLICY_REVISION.to_string(),
             default_ttl_seconds: DEFAULT_PROPOSAL_TTL_SECONDS,
+            approval_key: Some(Arc::new(ephemeral_approval_key())),
         }
     }
 
@@ -133,6 +164,7 @@ impl ChangeManager {
             memory_store: Arc::new(Mutex::new(BTreeMap::new())),
             policy_revision: DEFAULT_POLICY_REVISION.to_string(),
             default_ttl_seconds: DEFAULT_PROPOSAL_TTL_SECONDS,
+            approval_key: None,
         };
         mgr.init_sqlite_schema()?;
         Ok(mgr)
@@ -156,6 +188,7 @@ impl ChangeManager {
             memory_store: Arc::new(Mutex::new(BTreeMap::new())),
             policy_revision: DEFAULT_POLICY_REVISION.to_string(),
             default_ttl_seconds: DEFAULT_PROPOSAL_TTL_SECONDS,
+            approval_key: None,
         };
         if !path_buf.exists() {
             mgr.save_all_to_json(&BTreeMap::new())?;
@@ -191,6 +224,35 @@ impl ChangeManager {
         self
     }
 
+    /// Configure the secret key that signs approval records (`approval_mac`, HMAC-SHA256).
+    ///
+    /// Keys shorter than `MIN_APPROVAL_KEY_BYTES` are rejected (fail closed).
+    pub fn with_approval_key(mut self, key: impl Into<Vec<u8>>) -> DbMcpResult<Self> {
+        let key = key.into();
+        if key.len() < MIN_APPROVAL_KEY_BYTES {
+            return Err(DbMcpError::ConfigurationError(format!(
+                "approval key must be at least {MIN_APPROVAL_KEY_BYTES} bytes (got {})",
+                key.len()
+            )));
+        }
+        self.approval_key = Some(Arc::new(key));
+        Ok(self)
+    }
+
+    /// True when approval records are signed and verified with a secret key.
+    pub fn has_approval_key(&self) -> bool {
+        self.approval_key.is_some()
+    }
+
+    /// Governance warnings for approve/apply results (empty when approvals are keyed).
+    pub fn approval_warnings(&self) -> Vec<String> {
+        if self.has_approval_key() {
+            Vec::new()
+        } else {
+            vec![UNKEYED_APPROVAL_WARNING.to_string()]
+        }
+    }
+
     /// Return the active policy revision configured on this manager.
     pub fn policy_revision(&self) -> &str {
         &self.policy_revision
@@ -206,25 +268,7 @@ impl ChangeManager {
         }
 
         let analysis = parse_and_analyze_sql(request.engine, &request.sql)?;
-        if analysis.has_privileged_functions {
-            return Err(DbMcpError::PolicyDenied {
-                code: "PRIVILEGED_FUNCTION_FORBIDDEN".to_string(),
-                message: format!(
-                    "Side-effecting or privileged function(s) {:?} cannot be proposed in governed changes",
-                    analysis.privileged_functions
-                ),
-                next_action: Some("remove_privileged_function".to_string()),
-            });
-        }
-        if analysis.overall_class == SqlStatementClass::Unknown {
-            return Err(DbMcpError::PolicyDenied {
-                code: "UNKNOWN_SQL_CONSTRUCT".to_string(),
-                message:
-                    "Unclassified or vendor-specific SQL construct cannot be proposed in governed mode"
-                        .to_string(),
-                next_action: None,
-            });
-        }
+        validate_change_statement(&analysis)?;
 
         let (transactional, reversal_safety, compensating_sql) =
             classify_change_reversibility(request.engine, &analysis);
@@ -278,6 +322,8 @@ impl ChangeManager {
             expires_at,
             approval: None,
             applied_at: None,
+            applied_by: None,
+            rows_affected: None,
             execution_error: None,
         };
 
@@ -361,7 +407,10 @@ impl ChangeManager {
             )));
         }
 
-        if proposal.state == ChangeState::Expired || Utc::now() >= proposal.expires_at {
+        if proposal.state == ChangeState::Expired
+            || (matches!(proposal.state, ChangeState::Proposed | ChangeState::Approved)
+                && Utc::now() >= proposal.expires_at)
+        {
             proposal.state = ChangeState::Expired;
             let _ = self.store_proposal(&proposal);
             return Err(DbMcpError::ApprovalExpired(format!(
@@ -369,6 +418,12 @@ impl ChangeManager {
                 change_id,
                 proposal.expires_at.to_rfc3339()
             )));
+        }
+
+        // Only a pending proposal can be approved: a second approval must never replace the first,
+        // and rejected/failed changes cannot be revived.
+        if proposal.state != ChangeState::Proposed {
+            return Err(change_not_pending(change_id, &proposal));
         }
 
         // 3. Recompute approval hash to verify the stored proposal was not tampered with prior to approval
@@ -389,15 +444,25 @@ impl ChangeManager {
             )));
         }
 
-        proposal.state = ChangeState::Approved;
-        proposal.approval = Some(ApprovalRecord {
+        let mut record = ApprovalRecord {
             approved_by: approver.principal.clone(),
             approved_at: Utc::now(),
             approval_hash: expected_hash,
             comment,
-        });
+            approval_mac: None,
+        };
+        if let Some(key) = &self.approval_key {
+            record.approval_mac = Some(compute_approval_mac(key, change_id, &record));
+        }
+        proposal.state = ChangeState::Approved;
+        proposal.approval = Some(record);
 
-        self.store_proposal(&proposal)?;
+        // 4. Persist only if the stored proposal is still pending (compare-and-swap), so concurrent
+        // approvals cannot both succeed.
+        if !self.store_if_state(&proposal, ChangeState::Proposed)? {
+            let current = self.load_proposal(change_id)?;
+            return Err(change_not_pending(change_id, &current));
+        }
         Ok(proposal)
     }
 
@@ -529,10 +594,22 @@ impl ChangeManager {
         }
 
         if proposal.state != ChangeState::Approved {
-            return Err(DbMcpError::ApprovalRequired(format!(
-                "Change '{}' is in state '{:?}' and has not been approved",
-                change_id, proposal.state
-            )));
+            // Same APPROVAL_REQUIRED code, but the next step for a pending proposal is the
+            // out-of-band approval, not another proposal.
+            let next_action = if proposal.state == ChangeState::Proposed {
+                format!("db-mcp approve --change-id {change_id} --approver <admin>")
+            } else {
+                "propose_change".to_string()
+            };
+            return Err(DbMcpError::PolicyDenied {
+                code: "APPROVAL_REQUIRED".to_string(),
+                message: format!(
+                    "Change '{}' is in state '{}' and has not been approved; an administrator must approve it out of band (`db-mcp approve` or POST /admin/approve)",
+                    change_id,
+                    state_to_str(proposal.state)
+                ),
+                next_action: Some(next_action),
+            });
         }
 
         let approval_record = proposal.approval.as_ref().ok_or_else(|| {
@@ -552,6 +629,39 @@ impl ChangeManager {
                 "Change '{}' has an invalid self-approval record by '{}'",
                 change_id, approval_record.approved_by
             )));
+        }
+
+        // Verify the keyed approval MAC before anything else touches the database: an approval
+        // record written directly into the change store carries no valid MAC.
+        let mut warnings = Vec::new();
+        match &self.approval_key {
+            Some(key) => {
+                let expected_mac = compute_approval_mac(key, change_id, approval_record);
+                let valid = approval_record
+                    .approval_mac
+                    .as_deref()
+                    .map(|mac| constant_time_eq(mac.as_bytes(), expected_mac.as_bytes()))
+                    .unwrap_or(false);
+                if !valid {
+                    return Err(DbMcpError::ApprovalHashMismatch(format!(
+                        "Approval record for change '{}' has no valid approval_mac: it was not issued by `db-mcp approve` with the configured approval key (forged record or rotated key; re-approve the change)",
+                        change_id
+                    )));
+                }
+            }
+            None if options.require_approval_mac => {
+                return Err(DbMcpError::PolicyDenied {
+                    code: CODE_APPROVAL_KEY_REQUIRED.to_string(),
+                    message: format!(
+                        "Change '{}' cannot be applied on connection '{}': governed production changes require keyed approvals, but no approval key is configured",
+                        change_id, proposal.connection
+                    ),
+                    next_action: Some(
+                        "set changes.approval_key (e.g. \"env:DB_MCP_APPROVAL_KEY\") or DB_MCP_APPROVAL_KEY for the server and `db-mcp approve`, then re-approve".to_string(),
+                    ),
+                });
+            }
+            None => warnings.push(UNKEYED_APPROVAL_WARNING.to_string()),
         }
 
         // Step 3: Revalidate current schema fingerprint and cryptographic approval hash
@@ -640,6 +750,8 @@ impl ChangeManager {
             Ok(query_result) => {
                 proposal.state = ChangeState::Applied;
                 proposal.applied_at = Some(Utc::now());
+                proposal.applied_by = Some(caller.principal.clone());
+                proposal.rows_affected = query_result.rows_affected;
                 proposal.execution_error = None;
                 self.store_proposal(&proposal)?;
 
@@ -653,6 +765,7 @@ impl ChangeManager {
                     proposal,
                     query_result,
                     post_schema_fingerprint,
+                    warnings,
                 })
             }
             Err(exec_err) => {
@@ -778,6 +891,79 @@ impl ChangeManager {
                 let mut all = self.load_all_from_json()?;
                 all.insert(proposal.change_id.clone(), proposal.clone());
                 self.save_all_to_json(&all)
+            }
+        }
+    }
+
+    /// Compare-and-swap: persist `proposal` only while the stored state still equals `expected`.
+    /// Returns `Ok(false)` (and writes nothing) when another writer changed the state first.
+    fn store_if_state(&self, proposal: &ChangeProposal, expected: ChangeState) -> DbMcpResult<bool> {
+        match &self.backend {
+            StorageBackend::InMemory => {
+                let mut guard = self.memory_store.lock().map_err(|_| {
+                    DbMcpError::InternalError("ChangeManager mutex poisoned".to_string())
+                })?;
+                let current = guard.get(&proposal.change_id).ok_or_else(|| {
+                    DbMcpError::InvalidArgument(format!(
+                        "Change proposal '{}' not found",
+                        proposal.change_id
+                    ))
+                })?;
+                if current.state != expected {
+                    return Ok(false);
+                }
+                guard.insert(proposal.change_id.clone(), proposal.clone());
+                Ok(true)
+            }
+            StorageBackend::Sqlite(path) => {
+                let conn = open_sqlite_conn(path)?;
+                let json_str = serde_json::to_string(proposal).map_err(|e| {
+                    DbMcpError::StorageError(format!("Failed to serialize ChangeProposal: {e}"))
+                })?;
+                let affected = conn
+                    .execute(
+                        "UPDATE change_proposals SET state = ?2, approval_hash = ?3, proposal_json = ?4
+                         WHERE change_id = ?1 AND state = ?5",
+                        params![
+                            proposal.change_id,
+                            state_to_str(proposal.state),
+                            proposal.approval_hash,
+                            json_str,
+                            state_to_str(expected)
+                        ],
+                    )
+                    .map_err(|e| {
+                        DbMcpError::StorageError(format!(
+                            "Failed to persist ChangeProposal '{}': {e}",
+                            proposal.change_id
+                        ))
+                    })?;
+                if affected != 1 {
+                    return Ok(false);
+                }
+                if let Ok(mut guard) = self.memory_store.lock() {
+                    guard.insert(proposal.change_id.clone(), proposal.clone());
+                }
+                Ok(true)
+            }
+            StorageBackend::JsonFile(_) => {
+                let mut guard = self.memory_store.lock().map_err(|_| {
+                    DbMcpError::InternalError("ChangeManager mutex poisoned".to_string())
+                })?;
+                let mut all = self.load_all_from_json()?;
+                let current = all.get(&proposal.change_id).ok_or_else(|| {
+                    DbMcpError::InvalidArgument(format!(
+                        "Change proposal '{}' not found",
+                        proposal.change_id
+                    ))
+                })?;
+                if current.state != expected {
+                    return Ok(false);
+                }
+                all.insert(proposal.change_id.clone(), proposal.clone());
+                self.save_all_to_json(&all)?;
+                guard.insert(proposal.change_id.clone(), proposal.clone());
+                Ok(true)
             }
         }
     }
@@ -1016,6 +1202,102 @@ fn state_to_str(state: ChangeState) -> &'static str {
         ChangeState::Failed => "failed",
         ChangeState::Expired => "expired",
     }
+}
+
+/// Reject statements that can never be a governed change, independent of connection policy:
+/// privileged/side-effecting functions, unclassifiable SQL, plain reads (nothing to govern) and
+/// administrative/privilege statements (`GRANT`, `VACUUM`, ...). Connection policy (restricted
+/// tables, multi-statement, ReadOnly mode) is enforced by the caller's `PolicyEngine`.
+pub fn validate_change_statement(analysis: &SqlAnalysis) -> DbMcpResult<()> {
+    if analysis.has_privileged_functions {
+        return Err(DbMcpError::PolicyDenied {
+            code: "PRIVILEGED_FUNCTION_FORBIDDEN".to_string(),
+            message: format!(
+                "Side-effecting or privileged function(s) {:?} cannot be proposed in governed changes",
+                analysis.privileged_functions
+            ),
+            next_action: Some("remove_privileged_function".to_string()),
+        });
+    }
+    match analysis.overall_class {
+        SqlStatementClass::Unknown => Err(DbMcpError::PolicyDenied {
+            code: "UNKNOWN_SQL_CONSTRUCT".to_string(),
+            message:
+                "Unclassified or vendor-specific SQL construct cannot be proposed in governed mode"
+                    .to_string(),
+            next_action: None,
+        }),
+        SqlStatementClass::Read if !analysis.has_cte_write => Err(DbMcpError::PolicyDenied {
+            code: CODE_NOT_A_CHANGE.to_string(),
+            message: "Read-only statements change nothing and cannot be proposed as governed changes"
+                .to_string(),
+            next_action: Some("execute_query".to_string()),
+        }),
+        SqlStatementClass::PrivilegeOrAdmin => Err(DbMcpError::PolicyDenied {
+            code: "PRIVILEGED_FUNCTION_FORBIDDEN".to_string(),
+            message: "Administrative or privilege statements cannot be proposed as governed changes"
+                .to_string(),
+            next_action: None,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Keyed MAC binding an approval record to its change:
+/// `HMAC-SHA256(key, "v1|change_id=..|approval_hash=..|approved_by=..|approved_at=<rfc3339>|comment=<json>")`.
+pub fn compute_approval_mac(key: &[u8], change_id: &str, record: &ApprovalRecord) -> String {
+    let comment = serde_json::to_string(&record.comment).unwrap_or_else(|_| "null".to_string());
+    let payload = format!(
+        "v1|change_id={change_id}|approval_hash={}|approved_by={}|approved_at={}|comment={comment}",
+        record.approval_hash,
+        record.approved_by,
+        record.approved_at.to_rfc3339()
+    );
+    hmac_sha256_hex(key, payload.as_bytes())
+}
+
+/// Denial for approving a change that is no longer pending.
+fn change_not_pending(change_id: &str, proposal: &ChangeProposal) -> DbMcpError {
+    match (proposal.state, proposal.approval.as_ref()) {
+        (ChangeState::Applied | ChangeState::Executing, _) => {
+            DbMcpError::ApprovalAlreadyConsumed(format!(
+                "Change '{}' has already been executed (state: {:?})",
+                change_id, proposal.state
+            ))
+        }
+        (ChangeState::Expired, _) => DbMcpError::ApprovalExpired(format!(
+            "Change proposal '{}' expired at {}",
+            change_id,
+            proposal.expires_at.to_rfc3339()
+        )),
+        (ChangeState::Approved, Some(record)) => DbMcpError::PolicyDenied {
+            code: CODE_CHANGE_NOT_PENDING.to_string(),
+            message: format!(
+                "Change '{}' was already approved by '{}' at {}; an approval cannot be replaced",
+                change_id,
+                record.approved_by,
+                record.approved_at.to_rfc3339()
+            ),
+            next_action: Some("get_change".to_string()),
+        },
+        (state, _) => DbMcpError::PolicyDenied {
+            code: CODE_CHANGE_NOT_PENDING.to_string(),
+            message: format!(
+                "Change '{}' is in state '{}'; only proposed changes can be approved",
+                change_id,
+                state_to_str(state)
+            ),
+            next_action: Some("propose_change".to_string()),
+        },
+    }
+}
+
+/// Random per-process approval key for in-memory stores (not shared with any other process).
+fn ephemeral_approval_key() -> Vec<u8> {
+    let mut key = Vec::with_capacity(32);
+    key.extend_from_slice(Uuid::new_v4().as_bytes());
+    key.extend_from_slice(Uuid::new_v4().as_bytes());
+    key
 }
 
 /// Classify whether a proposed SQL change is transactional and its `ReversalSafety` level
@@ -1558,5 +1840,152 @@ mod tests {
         assert_eq!(resp.columns[6].name, "expires_at");
 
         let _ = fs::remove_file(&temp_json);
+    }
+
+    const TEST_KEY: &str = "unit-test-approval-key-0123456789";
+
+    fn temp_store(ext: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("db_mcp_changes_test_{}.{ext}", Uuid::new_v4().simple()))
+    }
+
+    async fn propose(mgr: &ChangeManager, adapter: &MockChangeAdapter, sql: &str) -> ChangeProposal {
+        mgr.propose_change_with_adapter(
+            &CallerIdentity::local_agent("agent:cursor"),
+            adapter,
+            sql,
+            Vec::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[test]
+    fn test_validate_change_statement_rejects_reads_and_admin_statements() {
+        let select = parse_and_analyze_sql(DatabaseEngine::Postgres, "SELECT id FROM users").unwrap();
+        assert_eq!(validate_change_statement(&select).unwrap_err().code(), CODE_NOT_A_CHANGE);
+        let vacuum = parse_and_analyze_sql(DatabaseEngine::Sqlite, "VACUUM").unwrap();
+        assert_eq!(vacuum.overall_class, SqlStatementClass::PrivilegeOrAdmin);
+        assert!(validate_change_statement(&vacuum).is_err());
+        let update = parse_and_analyze_sql(DatabaseEngine::Postgres, "UPDATE users SET role = 'x' WHERE id = 1").unwrap();
+        assert!(validate_change_statement(&update).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_second_rejected_and_concurrent_approvals_only_one_wins() {
+        let path = temp_store("db");
+        let adapter = MockChangeAdapter::new("prod-pg", DatabaseEngine::Postgres);
+        let mgr = ChangeManager::with_sqlite_path(&path).unwrap().with_approval_key(TEST_KEY).unwrap();
+
+        // Second approval never replaces the first.
+        let p = propose(&mgr, &adapter, "CREATE INDEX idx_users_role ON public.users (role)").await;
+        mgr.approve_change(&p.change_id, &CallerIdentity::admin("admin:alice"), Some("first".to_string()))
+            .unwrap();
+        let err = mgr
+            .approve_change(&p.change_id, &CallerIdentity::admin("admin:bob"), None)
+            .unwrap_err();
+        assert_eq!(err.code(), CODE_CHANGE_NOT_PENDING);
+        let kept = mgr.get_change(&p.change_id).unwrap().approval.unwrap();
+        assert_eq!(kept.approved_by, "admin:alice");
+        assert_eq!(kept.comment.as_deref(), Some("first"));
+
+        // A rejected change cannot be re-approved.
+        let r = propose(&mgr, &adapter, "ALTER TABLE public.users ADD COLUMN bio TEXT").await;
+        mgr.reject_change(&r.change_id, &CallerIdentity::admin("admin:alice"), None).unwrap();
+        let err = mgr
+            .approve_change(&r.change_id, &CallerIdentity::admin("admin:bob"), None)
+            .unwrap_err();
+        assert_eq!(err.code(), CODE_CHANGE_NOT_PENDING);
+
+        // Concurrent approvals from separate managers (processes) over one store: exactly one wins.
+        let c = propose(&mgr, &adapter, "UPDATE public.users SET role = 'x' WHERE id = 1").await;
+        let handles: Vec<_> = (0..6)
+            .map(|i| {
+                let path = path.clone();
+                let id = c.change_id.clone();
+                std::thread::spawn(move || {
+                    let m = ChangeManager::with_sqlite_path(&path).unwrap().with_approval_key(TEST_KEY).unwrap();
+                    m.approve_change(&id, &CallerIdentity::admin(format!("admin:{i}")), None).is_ok()
+                })
+            })
+            .collect();
+        let wins = handles.into_iter().map(|h| h.join().unwrap()).filter(|ok| *ok).count();
+        assert_eq!(wins, 1);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_forged_or_unkeyed_approval_rejected_and_apply_records_outcome() {
+        let path = temp_store("db");
+        let adapter = MockChangeAdapter::new("prod-pg", DatabaseEngine::Postgres);
+        let agent = CallerIdentity::local_agent("agent:cursor");
+        let keyed = ChangeManager::with_sqlite_path(&path).unwrap().with_approval_key(TEST_KEY).unwrap();
+
+        // Approval record forged directly in the store (no MAC) is rejected before execution.
+        let p = propose(&keyed, &adapter, "UPDATE public.users SET role = 'x' WHERE id = 1").await;
+        let mut forged = p.clone();
+        forged.state = ChangeState::Approved;
+        forged.approval = Some(ApprovalRecord {
+            approved_by: "ghost".to_string(),
+            approved_at: Utc::now(),
+            approval_hash: p.approval_hash.clone(),
+            comment: None,
+            approval_mac: Some("00".repeat(32)),
+        });
+        keyed.overwrite_proposal_unchecked(&forged).unwrap();
+        let err = keyed.apply_change(&p.change_id, &agent, &adapter).await.unwrap_err();
+        assert_eq!(err.code(), "APPROVAL_HASH_MISMATCH");
+
+        // A MAC made with another key is rejected too.
+        let other = ChangeManager::with_sqlite_path(&path)
+            .unwrap()
+            .with_approval_key("another-approval-key-9876543210")
+            .unwrap();
+        let q = propose(&keyed, &adapter, "UPDATE public.users SET role = 'y' WHERE id = 1").await;
+        other.approve_change(&q.change_id, &CallerIdentity::admin("admin:alice"), None).unwrap();
+        let err = keyed.apply_change(&q.change_id, &agent, &adapter).await.unwrap_err();
+        assert_eq!(err.code(), "APPROVAL_HASH_MISMATCH");
+        assert_eq!(adapter.execute_count.load(Ordering::SeqCst), 0);
+
+        // Unkeyed store: refused when keyed approvals are required, warned otherwise.
+        let unkeyed = ChangeManager::with_sqlite_path(&path).unwrap();
+        assert!(!unkeyed.approval_warnings().is_empty());
+        let u = propose(&unkeyed, &adapter, "UPDATE public.users SET role = 'z' WHERE id = 1").await;
+        let approved = unkeyed.approve_change(&u.change_id, &CallerIdentity::admin("admin:alice"), None).unwrap();
+        assert!(approved.approval.unwrap().approval_mac.is_none());
+        let strict = ApplyChangeOptions { require_approval_mac: true, ..ApplyChangeOptions::default() };
+        let err = unkeyed
+            .apply_change_with_options(&u.change_id, &agent, &adapter, strict)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), CODE_APPROVAL_KEY_REQUIRED);
+        let outcome = unkeyed.apply_change(&u.change_id, &agent, &adapter).await.unwrap();
+        assert_eq!(outcome.warnings, vec![UNKEYED_APPROVAL_WARNING.to_string()]);
+        assert_eq!(outcome.proposal.applied_by.as_deref(), Some("agent:cursor"));
+        assert_eq!(outcome.proposal.rows_affected, Some(1));
+        let stored = unkeyed.get_change(&u.change_id).unwrap();
+        assert_eq!(stored.applied_by.as_deref(), Some("agent:cursor"));
+        assert_eq!(stored.rows_affected, Some(1));
+
+        // Short keys are refused (fail closed).
+        assert!(ChangeManager::new_in_memory().with_approval_key("short").is_err());
+        let _ = fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_apply_before_approval_points_to_out_of_band_approval() {
+        let adapter = MockChangeAdapter::new("prod-pg", DatabaseEngine::Postgres);
+        let mgr = ChangeManager::new_in_memory();
+        let p = propose(&mgr, &adapter, "CREATE INDEX idx_users_role ON public.users (role)").await;
+        let err = mgr
+            .apply_change(&p.change_id, &CallerIdentity::local_agent("agent:cursor"), &adapter)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "APPROVAL_REQUIRED");
+        assert_eq!(
+            err.next_action(),
+            Some(format!("db-mcp approve --change-id {} --approver <admin>", p.change_id).as_str())
+        );
     }
 }
