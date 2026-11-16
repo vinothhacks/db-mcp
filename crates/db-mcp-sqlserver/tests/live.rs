@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use db_mcp_core::{
     AuthorizedQuery, CallerIdentity, CatalogObjectType, CatalogRequest, DatabaseAdapter, ExecutionLimits, ExplainFormat,
-    ExplainRequest,
+    ExplainRequest, HealthSeverity,
 };
-use db_mcp_sqlserver::{SqlServerAdapter, SqlServerConfig};
+use db_mcp_sqlserver::{diagnostics, SqlServerAdapter, SqlServerConfig};
 use serde_json::json;
 
 fn dsn(var: &str) -> Option<String> {
@@ -167,3 +167,40 @@ async fn explain_needs_showplan_and_returns_estimated_plans() {
     let r = full.execute(query("SELECT COUNT(*) FROM dbo.users", vec![], 1)).await.unwrap();
     assert_eq!(r.rows[0][0], json!(3));
 }
+
+#[tokio::test]
+async fn health_degrades_without_grants_and_is_complete_with_them() {
+    let Some(ro) = adapter("DB_MCP_MSSQL_TEST_DSN", true) else { return };
+    let h = diagnostics::database_health(&ro).await.unwrap();
+    let ids: Vec<&str> = h.findings.iter().map(|f| f.check_id.as_str()).collect();
+    for id in ["tables_without_primary_key", "heap_tables", "duplicate_indexes", "server_version", "server_state_checks"] {
+        assert!(ids.contains(&id), "{id} missing from {ids:?}");
+    }
+    let heaps = h.findings.iter().find(|f| f.check_id == "heap_tables").unwrap();
+    assert_eq!(heaps.evidence["tables"], json!(["dbo.event_staging"]));
+    assert_eq!(heaps.severity, HealthSeverity::Warning);
+    assert!(h.findings.iter().any(|f| f.remediation.as_deref().unwrap_or("").contains("GRANT VIEW SERVER STATE")));
+    let Some(full) = adapter("DB_MCP_MSSQL_FULL_TEST_DSN", true) else { return };
+    let h = diagnostics::database_health(&full).await.unwrap();
+    assert!(h.active_connections.is_some(), "{:?}", h.findings);
+    assert!(h.findings.iter().any(|f| f.check_id == "page_life_expectancy"));
+    assert!(!h.findings.iter().any(|f| f.check_id == "server_state_checks"));
+}
+
+#[tokio::test]
+async fn workload_reads_query_store_with_grants() {
+    let Some(full) = adapter("DB_MCP_MSSQL_FULL_TEST_DSN", true) else { return };
+    for _ in 0..3 {
+        full.execute(query("SELECT id, total_cents FROM dbo.orders WHERE status = @P1", vec![json!("completed")], 10)).await.unwrap();
+    }
+    let (found, notes) = diagnostics::server_workload(&full, 10).await.unwrap();
+    let (source, stats) = found.unwrap_or_else(|| panic!("no workload: {notes:?}"));
+    assert!(source == "query_store" || source == "sys.dm_exec_query_stats", "{source}");
+    assert!(stats.iter().any(|s| s.normalized_query.to_ascii_lowercase().contains("dbo.orders")), "{stats:?}");
+    assert!(!stats.iter().any(|s| s.normalized_query.contains("db-mcp:internal")));
+    let Some(ro) = adapter("DB_MCP_MSSQL_TEST_DSN", true) else { return };
+    let (found, notes) = diagnostics::server_workload(&ro, 10).await.unwrap();
+    assert!(found.is_none());
+    assert!(notes.iter().any(|n| n.contains("VIEW DATABASE STATE")), "{notes:?}");
+}
+

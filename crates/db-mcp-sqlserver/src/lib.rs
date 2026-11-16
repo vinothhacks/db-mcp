@@ -8,6 +8,7 @@
 //! server fails closed with `CONNECTION_UNAVAILABLE`.
 
 pub mod catalog;
+pub mod diagnostics;
 pub mod dsn;
 pub mod showplan;
 pub mod values;

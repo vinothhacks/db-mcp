@@ -566,6 +566,68 @@ impl DbMcpRuntime {
         db_mcp_changes::validate_change_statement(&analysis)
     }
 
+    /// SQL Server workload: Query Store, else the plan cache, else DB-MCP's recorded history.
+    /// Never synthesizes statistics for a live server.
+    async fn sqlserver_workload(
+        &self,
+        live: &SqlServerAdapter,
+        conn: &str,
+        top_n: usize,
+    ) -> DbMcpResult<db_mcp_core::WorkloadAnalysis> {
+        let (found, mut notes) = db_mcp_sqlserver::diagnostics::server_workload(live, top_n).await?;
+        if let Some((source, stats)) = found {
+            return Ok(db_mcp_sqlserver::diagnostics::workload_from_stats(conn, source, stats, top_n, notes));
+        }
+        let mut recorded = self.pg_insights.analyze_workload(conn, top_n).await?;
+        if recorded.source != "recorded_workload_history" {
+            recorded.top_queries.clear();
+            recorded.hot_tables.clear();
+            recorded.total_queries_analyzed = 0;
+            recorded.source = "unavailable".to_string();
+            recorded.notes.clear();
+            notes.push("No server workload statistics are readable and no queries were recorded through DB-MCP yet.".to_string());
+        } else {
+            notes.push("Showing statements recorded through DB-MCP in this session (server statistics unavailable).".to_string());
+        }
+        recorded.notes.extend(notes);
+        Ok(recorded)
+    }
+
+    /// SQL Server index advice: missing-index DMVs + showplan hints + the heuristic advisor,
+    /// T-SQL DDL, advisory only.
+    async fn sqlserver_index_advice(
+        &self,
+        live: &SqlServerAdapter,
+        conn: &str,
+        queries: Vec<String>,
+        max_recs: usize,
+    ) -> DbMcpResult<(Vec<db_mcp_core::IndexRecommendation>, Vec<String>)> {
+        use db_mcp_sqlserver::diagnostics as diag;
+        let info = live.server_info().await?;
+        let objects = live.catalog_objects().await?;
+        let mut notes = Vec::new();
+        let (dmv, dmv_notes) = diag::missing_index_dmv(live, &info).await;
+        notes.extend(dmv_notes);
+        let mut server: Vec<db_mcp_core::IndexRecommendation> = dmv
+            .into_iter()
+            .map(|(hint, evidence)| diag::hint_to_recommendation(&hint, evidence, Vec::new(), "Missing-index DMV"))
+            .collect();
+        if !queries.is_empty() {
+            if info.can_showplan() {
+                let (recs, plan_notes) = diag::showplan_hints(live, &queries).await;
+                server.extend(recs);
+                notes.extend(plan_notes);
+            } else {
+                notes.push(format!(
+                    "optimizer missing-index hints need GRANT SHOWPLAN TO [{}]",
+                    info.database_user
+                ));
+            }
+        }
+        let heuristic = self.pg_insights.recommend_indexes(conn, queries, max_recs).await?;
+        Ok((diag::merge_recommendations(&objects, server, heuristic, max_recs), notes))
+    }
+
     /// Live SQL Server adapter for a connection id (check-connection and diagnostics).
     pub fn sqlserver_adapter(&self, connection: &str) -> Option<Arc<SqlServerAdapter>> {
         self.sqlserver.get(connection).cloned()
@@ -1401,7 +1463,10 @@ impl DbMcpRuntime {
                         "supports_health_diagnostics",
                     ));
                 }
-                let report = self.pg_insights.database_health(&conn).await?;
+                let report = match self.sqlserver.get(&conn).cloned() {
+                    Some(live) => db_mcp_sqlserver::diagnostics::database_health(&live).await?,
+                    None => self.pg_insights.database_health(&conn).await?,
+                };
                 let mut val = to_json(PgInsightsEngine::health_report_to_response(
                     req_id,
                     "snapshot_health",
@@ -1418,7 +1483,10 @@ impl DbMcpRuntime {
                 let conn = req_str("connection")?;
                 let _adapter = self.get_authorized_adapter(caller, &conn)?;
                 let top_n = arg_positive_u64(args, "top_n")?.unwrap_or(10) as usize;
-                let workload = self.pg_insights.analyze_workload(&conn, top_n).await?;
+                let workload = match self.sqlserver.get(&conn).cloned() {
+                    Some(live) => self.sqlserver_workload(&live, &conn, top_n).await?,
+                    None => self.pg_insights.analyze_workload(&conn, top_n).await?,
+                };
                 let mut val = to_json(PgInsightsEngine::workload_to_response(
                     req_id,
                     "snapshot_workload",
@@ -1455,13 +1523,13 @@ impl DbMcpRuntime {
                         next_action: Some("Remove restricted tables from the workload".to_string()),
                     });
                 }
-                let recs = self.pg_insights.recommend_indexes(&conn, queries, max_recs).await?;
-                let mut val = to_json(PgInsightsEngine::recommendations_to_response(
-                    req_id,
-                    &conn,
-                    "snapshot_indexes",
-                    recs,
-                ))?;
+                let (recs, advice_notes) = match self.sqlserver.get(&conn).cloned() {
+                    Some(live) => self.sqlserver_index_advice(&live, &conn, queries, max_recs).await?,
+                    None => (self.pg_insights.recommend_indexes(&conn, queries, max_recs).await?, Vec::new()),
+                };
+                let mut resp = PgInsightsEngine::recommendations_to_response(req_id, &conn, "snapshot_indexes", recs);
+                resp.warnings.extend(advice_notes);
+                let mut val = to_json(resp)?;
                 if scrub_restricted(&mut val, &cfg) > 0 {
                     if let Some(rows) = val.get("rows").and_then(|r| r.as_array()).map(|r| r.len()) {
                         val["returned_rows"] = json!(rows);
