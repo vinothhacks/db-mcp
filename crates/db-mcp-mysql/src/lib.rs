@@ -552,84 +552,6 @@ fn bootstrap_mysql_system_tables(conn: &Connection) -> DbMcpResult<()> {
             comment TEXT
         );
 
-        INSERT OR IGNORE INTO __mysql_routines (routine_name, routine_schema, routine_type, definition, comment)
-        VALUES
-            (
-                'record_order_audit',
-                'app',
-                'PROCEDURE',
-                'CREATE PROCEDURE record_order_audit(IN order_id BIGINT, IN event_type VARCHAR(64))
-BEGIN
-    INSERT INTO audit_logs (order_id, event_type, created_at)
-    SELECT o.id, event_type, NOW()
-    FROM orders o
-    WHERE o.id = order_id;
-END;',
-                'Records an order lifecycle event in audit_logs'
-            ),
-            (
-                'reserve_inventory',
-                'app',
-                'PROCEDURE',
-                'CREATE PROCEDURE reserve_inventory(IN order_id BIGINT)
-BEGIN
-    UPDATE inventory
-    SET reserved_qty = reserved_qty + 1
-    WHERE sku IN (
-        SELECT oi.sku
-        FROM order_items oi
-        WHERE oi.order_id = order_id
-    );
-
-    CALL record_order_audit(order_id, ''INVENTORY_RESERVED'');
-END;',
-                'Reserves inventory items for an order and writes an audit record'
-            ),
-            (
-                'calculate_order_discount',
-                'app',
-                'FUNCTION',
-                'CREATE FUNCTION calculate_order_discount(order_id BIGINT)
-RETURNS DECIMAL(10, 2)
-DETERMINISTIC
-BEGIN
-    DECLARE v_discount DECIMAL(10, 2) DEFAULT 0.00;
-    SELECT CASE WHEN u.status = ''vip'' THEN o.total_cents * 0.10 ELSE 0 END
-    INTO v_discount
-    FROM orders o
-    JOIN users u ON u.id = o.user_id
-    WHERE o.id = order_id;
-    RETURN COALESCE(v_discount, 0.00);
-END;',
-                'Calculates loyalty discount for an order from users and orders'
-            ),
-            (
-                'checkout_order',
-                'app',
-                'PROCEDURE',
-                'CREATE PROCEDURE checkout_order(IN order_id BIGINT)
-BEGIN
-    SELECT calculate_order_discount(order_id);
-
-    UPDATE orders
-    SET status = ''completed''
-    WHERE id = order_id
-      AND user_id IN (
-          SELECT u.id
-          FROM users u
-          WHERE u.status = ''active''
-      );
-
-    SELECT o.id, u.email
-    FROM orders o
-    JOIN users u ON u.id = o.user_id
-    WHERE o.id = order_id;
-
-    CALL reserve_inventory(order_id);
-    CALL record_order_audit(order_id, ''ORDER_CHECKED_OUT'');
-END;',
-                'Orchestrates order checkout, discount calculation, inventory reservation, and audit logging'
-            );
         "#,
     )
     .map_err(|e| DbMcpError::AdapterError(e.to_string()))?;
@@ -790,7 +712,60 @@ fn find_mysql_routine_ddl_end(sql: &str, after_open_paren: usize) -> usize {
     len
 }
 
+/// Parse a `DELIMITER <x>` client directive line; returns the new delimiter.
+fn parse_delimiter_directive(line: &str) -> Option<String> {
+    let t = line.trim();
+    let head = t.get(..9)?;
+    if !head.eq_ignore_ascii_case("DELIMITER") {
+        return None;
+    }
+    let rest = t[9..].trim();
+    if rest.is_empty() || !t[9..].starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
+/// Strip client-side `DELIMITER <x>` directives and split the text on the active
+/// delimiter, re-terminating each statement with `;` so the routine splitter and
+/// the embedded engine see plain SQL. Text without `DELIMITER` lines is returned unchanged.
+fn normalize_mysql_delimiters(sql: &str) -> String {
+    if !sql.lines().any(|l| parse_delimiter_directive(l).is_some()) {
+        return sql.to_string();
+    }
+    let mut result = String::new();
+    let mut active = ";".to_string();
+    let mut in_quote: Option<char> = None;
+    for line in sql.split_inclusive('\n') {
+        if in_quote.is_none() {
+            if let Some(d) = parse_delimiter_directive(line) {
+                active = d;
+                continue;
+            }
+        }
+        let mut rest = line;
+        while !rest.is_empty() {
+            if in_quote.is_none() && active != ";" && rest.starts_with(active.as_str()) {
+                result.push_str(";\n");
+                rest = &rest[active.len()..];
+                continue;
+            }
+            let c = rest.chars().next().unwrap();
+            match in_quote {
+                Some(q) if c == q => in_quote = None,
+                None if c == '\'' || c == '"' || c == '`' => in_quote = Some(c),
+                _ => {}
+            }
+            result.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    result
+}
+
 fn rewrite_mysql_sql_for_embedded(sql: &str, default_schema: &str) -> String {
+    let normalized = normalize_mysql_delimiters(sql);
+    let sql = normalized.as_str();
     let header_re = Regex::new(
         r#"(?im)(?:^|;)\s*(CREATE\s+(?:OR\s+REPLACE\s+)?(?:DEFINER\s*=\s*\S+\s+)?(PROCEDURE|FUNCTION)\s+(?:IF\s+NOT\s+EXISTS\s+)?([A-Za-z_"\[`][A-Za-z0-9_."\]`]*)\s*\()"#,
     )
@@ -1821,9 +1796,43 @@ mod tests {
         assert!(query_sql.contains("ROUTINE_DEFINITION"));
 
         let adapter = MySqlAdapter::simulated_with_seed("mysql-app", MYSQL_SEED).unwrap();
+        let none = adapter
+            .discover(CatalogRequest {
+                connection: "mysql-app".to_string(),
+                schema_pattern: Some("app".to_string()),
+                name_pattern: None,
+                object_types: vec![CatalogObjectType::Procedure, CatalogObjectType::Function],
+                detail_level: CatalogDetailLevel::Full,
+                limit: 20,
+                offset: 0,
+            })
+            .await
+            .unwrap();
+        assert!(none.objects.is_empty(), "no phantom routines without init_sql DDL");
         adapter
             .execute_batch(
                 r#"
+                DELIMITER //
+                CREATE PROCEDURE record_order_audit(IN order_id BIGINT, IN event_type VARCHAR(64))
+                BEGIN
+                    INSERT INTO audit_logs (order_id, event_type, created_at) VALUES (order_id, event_type, NOW());
+                END //
+                CREATE PROCEDURE reserve_inventory(IN order_id BIGINT)
+                BEGIN
+                    CALL record_order_audit(order_id, 'INVENTORY_RESERVED');
+                END //
+                CREATE FUNCTION calculate_order_discount(order_id BIGINT)
+                RETURNS DECIMAL(10, 2)
+                BEGIN
+                    RETURN (SELECT o.total_cents * 0.10 FROM orders o JOIN users u ON u.id = o.user_id WHERE o.id = order_id);
+                END //
+                CREATE PROCEDURE checkout_order(IN order_id BIGINT)
+                BEGIN
+                    SELECT calculate_order_discount(order_id);
+                    CALL reserve_inventory(order_id);
+                    CALL record_order_audit(order_id, 'ORDER_CHECKED_OUT');
+                END //
+                DELIMITER ;
                 CREATE PROCEDURE app.archive_paid_invoices(IN cutoff_days INT)
                 BEGIN
                     CALL record_order_audit(cutoff_days, 'INVOICES_ARCHIVED');
@@ -1869,5 +1878,34 @@ mod tests {
         let def = checkout_proc.definition.as_deref().unwrap();
         assert!(def.contains("CALL reserve_inventory(order_id)"));
         assert!(def.contains("CALL record_order_audit(order_id, 'ORDER_CHECKED_OUT')"));
+    }
+
+    #[test]
+    fn test_delimiter_blocks_are_normalized() {
+        let sql = "CREATE TABLE t (a INT);
+DELIMITER //
+CREATE PROCEDURE p(IN x INT)
+BEGIN
+    INSERT INTO t VALUES (x);
+END //
+DELIMITER ;
+INSERT INTO t VALUES (1);
+";
+        let out = normalize_mysql_delimiters(sql);
+        assert!(!out.to_ascii_uppercase().contains("DELIMITER"), "{out}");
+        assert!(!out.contains("//"), "{out}");
+        assert!(out.contains("END ;"), "{out}");
+        let adapter = MySqlAdapter::simulated_with_seed("m", sql).unwrap();
+        adapter.execute_batch("SELECT 1;").unwrap();
+    }
+
+    #[test]
+    fn test_no_phantom_routines_seeded() {
+        let adapter = MySqlAdapter::simulated("m").unwrap();
+        let guard = adapter.engine_conn.lock().unwrap();
+        let n: i64 = guard
+            .query_row("SELECT COUNT(*) FROM __mysql_routines", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 }

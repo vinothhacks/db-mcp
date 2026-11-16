@@ -8,7 +8,7 @@ use chrono::Utc;
 use db_mcp_core::{
     CatalogDetailLevel, CatalogObject, CatalogObjectType, CatalogRequest, CatalogResponse,
     ColumnSpec, DatabaseAdapter, DatabaseEngine, DbMcpError, DbMcpResult, DiffOperationKind,
-    IndexSpec, ReversalSafety, SchemaDiff, SchemaDiffItem, SchemaSnapshot,
+    ForeignKeySpec, IndexSpec, ReversalSafety, SchemaDiff, SchemaDiffItem, SchemaSnapshot,
 };
 use sha2::{Digest, Sha256};
 
@@ -218,8 +218,13 @@ pub fn capture_schema(
     engine: DatabaseEngine,
     objects: Vec<CatalogObject>,
 ) -> SchemaSnapshot {
-    let canonical = canonicalize_objects(&objects);
+    let mut canonical = canonicalize_objects(&objects);
     let (schema_version, full_hash) = compute_schema_hashes(&canonical);
+    // Row statistics are data, not schema: keep them out of the snapshot payload too.
+    for obj in &mut canonical {
+        obj.estimated_rows = None;
+        obj.size_bytes = None;
+    }
     SchemaSnapshot {
         connection: connection.into(),
         engine,
@@ -261,14 +266,27 @@ pub fn diff_schema(base: &SchemaSnapshot, target: &SchemaSnapshot) -> SchemaDiff
 
     let mut items = Vec::new();
 
+    // Cross-engine diffs compare logical names: the engine default schema (main/public/dbo)
+    // is stripped so `main.users` and `public.users` are the same table.
+    let cross_engine = base.engine != target.engine;
+    let key_of = |obj: &CatalogObject, eng: DatabaseEngine| -> String {
+        if cross_engine && is_default_schema(eng, &obj.schema) {
+            obj.name.to_ascii_lowercase()
+        } else {
+            obj.qualified_name().to_ascii_lowercase()
+        }
+    };
+
     // Index base and target objects by (object_type, qualified_name_lower)
     let mut base_tables: BTreeMap<String, &CatalogObject> = BTreeMap::new();
     let mut target_tables: BTreeMap<String, &CatalogObject> = BTreeMap::new();
     let mut base_views: BTreeMap<String, &CatalogObject> = BTreeMap::new();
     let mut target_views: BTreeMap<String, &CatalogObject> = BTreeMap::new();
+    let mut base_other: BTreeMap<(CatalogObjectType, String), &CatalogObject> = BTreeMap::new();
+    let mut target_other: BTreeMap<(CatalogObjectType, String), &CatalogObject> = BTreeMap::new();
 
     for obj in &base.objects {
-        let key = obj.qualified_name().to_ascii_lowercase();
+        let key = key_of(obj, base.engine);
         match obj.object_type {
             CatalogObjectType::Table => {
                 base_tables.insert(key, obj);
@@ -276,18 +294,28 @@ pub fn diff_schema(base: &SchemaSnapshot, target: &SchemaSnapshot) -> SchemaDiff
             CatalogObjectType::View | CatalogObjectType::MaterializedView => {
                 base_views.insert(key, obj);
             }
+            CatalogObjectType::Function
+            | CatalogObjectType::Procedure
+            | CatalogObjectType::Trigger => {
+                base_other.insert((obj.object_type, key), obj);
+            }
             _ => {}
         }
     }
 
     for obj in &target.objects {
-        let key = obj.qualified_name().to_ascii_lowercase();
+        let key = key_of(obj, target.engine);
         match obj.object_type {
             CatalogObjectType::Table => {
                 target_tables.insert(key, obj);
             }
             CatalogObjectType::View | CatalogObjectType::MaterializedView => {
                 target_views.insert(key, obj);
+            }
+            CatalogObjectType::Function
+            | CatalogObjectType::Procedure
+            | CatalogObjectType::Trigger => {
+                target_other.insert((obj.object_type, key), obj);
             }
             _ => {}
         }
@@ -301,6 +329,15 @@ pub fn diff_schema(base: &SchemaSnapshot, target: &SchemaSnapshot) -> SchemaDiff
                 &qname,
                 &base_tbl.columns,
                 &target_tbl.columns,
+                engine,
+                engine_transactional_ddl,
+                &mut items,
+            );
+            diff_table_foreign_keys(
+                &qname,
+                &base_tbl.foreign_keys,
+                &target_tbl.foreign_keys,
+                engine,
                 engine_transactional_ddl,
                 &mut items,
             );
@@ -424,6 +461,9 @@ pub fn diff_schema(base: &SchemaSnapshot, target: &SchemaSnapshot) -> SchemaDiff
         }
     }
 
+    // 3. Compare routines (procedures/functions, on definition) and triggers
+    diff_routines_and_triggers(&base_other, &target_other, engine_transactional_ddl, &mut items);
+
     let is_identical = items.is_empty();
     let has_destructive_changes = items.iter().any(|i| i.destructive);
     let all_transactional = items.iter().all(|i| i.transactional);
@@ -459,6 +499,7 @@ fn diff_table_columns(
     table_qname: &str,
     base_cols: &[ColumnSpec],
     target_cols: &[ColumnSpec],
+    engine: DatabaseEngine,
     engine_transactional_ddl: bool,
     items: &mut Vec<SchemaDiffItem>,
 ) {
@@ -474,6 +515,23 @@ fn diff_table_columns(
     for (col_key, t_col) in &target_map {
         if let Some(b_col) = base_map.get(col_key) {
             if !b_col.data_type.eq_ignore_ascii_case(&t_col.data_type) {
+                let (suggested_ddl, compensating_ddl) = match engine {
+                    DatabaseEngine::Postgres => (
+                        Some(format!(
+                            "ALTER TABLE {table_qname} ALTER COLUMN {} TYPE {};",
+                            t_col.name, t_col.data_type
+                        )),
+                        Some(format!(
+                            "ALTER TABLE {table_qname} ALTER COLUMN {} TYPE {};",
+                            b_col.name, b_col.data_type
+                        )),
+                    ),
+                    DatabaseEngine::MySql => (
+                        Some(mysql_modify_column(table_qname, t_col)),
+                        Some(mysql_modify_column(table_qname, b_col)),
+                    ),
+                    DatabaseEngine::Sqlite => (None, None),
+                };
                 items.push(SchemaDiffItem {
                     kind: DiffOperationKind::AlterColumnType,
                     object_name: table_qname.to_string(),
@@ -483,26 +541,32 @@ fn diff_table_columns(
                     destructive: true,
                     transactional: engine_transactional_ddl,
                     reversal_safety: ReversalSafety::CompensatingMigrationRequired,
-                    suggested_ddl: Some(format!(
-                        "ALTER TABLE {table_qname} ALTER COLUMN {} TYPE {};",
-                        t_col.name, t_col.data_type
-                    )),
-                    compensating_ddl: Some(format!(
-                        "ALTER TABLE {table_qname} ALTER COLUMN {} TYPE {};",
-                        b_col.name, b_col.data_type
-                    )),
+                    suggested_ddl,
+                    compensating_ddl,
                 });
             }
             if b_col.nullable != t_col.nullable {
-                let action = if t_col.nullable {
-                    "DROP NOT NULL"
-                } else {
-                    "SET NOT NULL"
-                };
-                let reverse_action = if b_col.nullable {
-                    "DROP NOT NULL"
-                } else {
-                    "SET NOT NULL"
+                let (suggested_ddl, compensating_ddl) = match engine {
+                    DatabaseEngine::Postgres => {
+                        let action = if t_col.nullable { "DROP NOT NULL" } else { "SET NOT NULL" };
+                        let reverse_action =
+                            if b_col.nullable { "DROP NOT NULL" } else { "SET NOT NULL" };
+                        (
+                            Some(format!(
+                                "ALTER TABLE {table_qname} ALTER COLUMN {} {action};",
+                                t_col.name
+                            )),
+                            Some(format!(
+                                "ALTER TABLE {table_qname} ALTER COLUMN {} {reverse_action};",
+                                b_col.name
+                            )),
+                        )
+                    }
+                    DatabaseEngine::MySql => (
+                        Some(mysql_modify_column(table_qname, t_col)),
+                        Some(mysql_modify_column(table_qname, b_col)),
+                    ),
+                    DatabaseEngine::Sqlite => (None, None),
                 };
                 items.push(SchemaDiffItem {
                     kind: DiffOperationKind::AlterColumnNullability,
@@ -513,14 +577,22 @@ fn diff_table_columns(
                     destructive: false,
                     transactional: engine_transactional_ddl,
                     reversal_safety: ReversalSafety::CompensatingMigrationRequired,
-                    suggested_ddl: Some(format!(
-                        "ALTER TABLE {table_qname} ALTER COLUMN {} {action};",
-                        t_col.name
-                    )),
-                    compensating_ddl: Some(format!(
-                        "ALTER TABLE {table_qname} ALTER COLUMN {} {reverse_action};",
-                        b_col.name
-                    )),
+                    suggested_ddl,
+                    compensating_ddl,
+                });
+            }
+            if b_col.is_primary_key != t_col.is_primary_key {
+                items.push(SchemaDiffItem {
+                    kind: DiffOperationKind::AlterColumnPrimaryKey,
+                    object_name: table_qname.to_string(),
+                    target_name: Some(t_col.name.clone()),
+                    before: Some(format!("primary_key={}", b_col.is_primary_key)),
+                    after: Some(format!("primary_key={}", t_col.is_primary_key)),
+                    destructive: false,
+                    transactional: engine_transactional_ddl,
+                    reversal_safety: ReversalSafety::CompensatingMigrationRequired,
+                    suggested_ddl: None,
+                    compensating_ddl: None,
                 });
             }
             if b_col.default_value != t_col.default_value {
@@ -537,8 +609,18 @@ fn diff_table_columns(
                     } else {
                         ReversalSafety::CompensatingMigrationRequired
                     },
-                    suggested_ddl: None,
-                    compensating_ddl: None,
+                    suggested_ddl: set_default_ddl(
+                        engine,
+                        table_qname,
+                        &t_col.name,
+                        &t_col.default_value,
+                    ),
+                    compensating_ddl: set_default_ddl(
+                        engine,
+                        table_qname,
+                        &b_col.name,
+                        &b_col.default_value,
+                    ),
                 });
             }
         } else {
@@ -702,6 +784,339 @@ fn diff_table_indexes(
                 compensating_ddl: Some(recreate_ddl),
             });
         }
+    }
+}
+
+/// True when `schema` is the implicit default schema of `engine` (or SQL Server's `dbo`).
+fn is_default_schema(engine: DatabaseEngine, schema: &str) -> bool {
+    let default = match engine {
+        DatabaseEngine::Sqlite => "main",
+        DatabaseEngine::Postgres => "public",
+        DatabaseEngine::MySql => "",
+    };
+    schema.is_empty()
+        || schema.eq_ignore_ascii_case("dbo")
+        || (!default.is_empty() && schema.eq_ignore_ascii_case(default))
+}
+
+/// MySQL `MODIFY COLUMN` restating the full column definition.
+fn mysql_modify_column(table_qname: &str, col: &ColumnSpec) -> String {
+    let null_clause = if col.nullable { "" } else { " NOT NULL" };
+    let default_clause = col
+        .default_value
+        .as_ref()
+        .map(|d| format!(" DEFAULT {d}"))
+        .unwrap_or_default();
+    format!(
+        "ALTER TABLE {table_qname} MODIFY COLUMN {} {}{null_clause}{default_clause};",
+        col.name, col.data_type
+    )
+}
+
+/// `SET DEFAULT` / `DROP DEFAULT` for engines that support it; SQLite needs a table rebuild.
+fn set_default_ddl(
+    engine: DatabaseEngine,
+    table_qname: &str,
+    column: &str,
+    default: &Option<String>,
+) -> Option<String> {
+    if engine == DatabaseEngine::Sqlite {
+        return None;
+    }
+    Some(match default {
+        Some(d) => format!("ALTER TABLE {table_qname} ALTER COLUMN {column} SET DEFAULT {d};"),
+        None => format!("ALTER TABLE {table_qname} ALTER COLUMN {column} DROP DEFAULT;"),
+    })
+}
+
+fn fk_signature(fk: &ForeignKeySpec) -> String {
+    format!(
+        "({})->{}({})",
+        fk.columns.join(",").to_ascii_lowercase(),
+        fk.referenced_table.to_ascii_lowercase(),
+        fk.referenced_columns.join(",").to_ascii_lowercase()
+    )
+}
+
+fn fk_describe(fk: &ForeignKeySpec) -> String {
+    format!(
+        "{} on_delete={} on_update={}",
+        fk_signature(fk),
+        fk.on_delete.as_deref().unwrap_or("-"),
+        fk.on_update.as_deref().unwrap_or("-")
+    )
+}
+
+fn fk_add_ddl(engine: DatabaseEngine, table_qname: &str, fk: &ForeignKeySpec) -> Option<String> {
+    if engine == DatabaseEngine::Sqlite {
+        return None;
+    }
+    let name = fk.name.clone().unwrap_or_else(|| {
+        format!(
+            "fk_{}_{}",
+            table_qname.rsplit('.').next().unwrap_or(table_qname),
+            fk.columns.join("_")
+        )
+    });
+    let mut ddl = format!(
+        "ALTER TABLE {table_qname} ADD CONSTRAINT {name} FOREIGN KEY ({}) REFERENCES {} ({})",
+        fk.columns.join(", "),
+        fk.referenced_table,
+        fk.referenced_columns.join(", ")
+    );
+    if let Some(d) = &fk.on_delete {
+        ddl.push_str(&format!(" ON DELETE {d}"));
+    }
+    if let Some(u) = &fk.on_update {
+        ddl.push_str(&format!(" ON UPDATE {u}"));
+    }
+    ddl.push(';');
+    Some(ddl)
+}
+
+fn fk_drop_ddl(engine: DatabaseEngine, table_qname: &str, fk: &ForeignKeySpec) -> Option<String> {
+    let name = fk.name.as_ref()?;
+    match engine {
+        DatabaseEngine::Postgres => {
+            Some(format!("ALTER TABLE {table_qname} DROP CONSTRAINT {name};"))
+        }
+        DatabaseEngine::MySql => {
+            Some(format!("ALTER TABLE {table_qname} DROP FOREIGN KEY {name};"))
+        }
+        DatabaseEngine::Sqlite => None,
+    }
+}
+
+fn diff_table_foreign_keys(
+    table_qname: &str,
+    base_fks: &[ForeignKeySpec],
+    target_fks: &[ForeignKeySpec],
+    engine: DatabaseEngine,
+    engine_transactional_ddl: bool,
+    items: &mut Vec<SchemaDiffItem>,
+) {
+    let base_map: BTreeMap<String, &ForeignKeySpec> =
+        base_fks.iter().map(|f| (fk_signature(f), f)).collect();
+    let target_map: BTreeMap<String, &ForeignKeySpec> =
+        target_fks.iter().map(|f| (fk_signature(f), f)).collect();
+
+    for (sig, t_fk) in &target_map {
+        match base_map.get(sig) {
+            None => items.push(SchemaDiffItem {
+                kind: DiffOperationKind::AddForeignKey,
+                object_name: table_qname.to_string(),
+                target_name: t_fk.name.clone(),
+                before: None,
+                after: Some(fk_describe(t_fk)),
+                destructive: false,
+                transactional: engine_transactional_ddl,
+                reversal_safety: if engine_transactional_ddl {
+                    ReversalSafety::TransactionalRollback
+                } else {
+                    ReversalSafety::CompensatingMigrationRequired
+                },
+                suggested_ddl: fk_add_ddl(engine, table_qname, t_fk),
+                compensating_ddl: fk_drop_ddl(engine, table_qname, t_fk),
+            }),
+            Some(b_fk) if b_fk.on_delete != t_fk.on_delete || b_fk.on_update != t_fk.on_update => {
+                let suggested = match (
+                    fk_drop_ddl(engine, table_qname, b_fk),
+                    fk_add_ddl(engine, table_qname, t_fk),
+                ) {
+                    (Some(d), Some(a)) => Some(format!("{d} {a}")),
+                    _ => None,
+                };
+                let compensating = match (
+                    fk_drop_ddl(engine, table_qname, t_fk),
+                    fk_add_ddl(engine, table_qname, b_fk),
+                ) {
+                    (Some(d), Some(a)) => Some(format!("{d} {a}")),
+                    _ => None,
+                };
+                items.push(SchemaDiffItem {
+                    kind: DiffOperationKind::AlterForeignKey,
+                    object_name: table_qname.to_string(),
+                    target_name: t_fk.name.clone(),
+                    before: Some(fk_describe(b_fk)),
+                    after: Some(fk_describe(t_fk)),
+                    destructive: false,
+                    transactional: engine_transactional_ddl,
+                    reversal_safety: ReversalSafety::CompensatingMigrationRequired,
+                    suggested_ddl: suggested,
+                    compensating_ddl: compensating,
+                });
+            }
+            Some(_) => {}
+        }
+    }
+
+    for (sig, b_fk) in &base_map {
+        if !target_map.contains_key(sig) {
+            items.push(SchemaDiffItem {
+                kind: DiffOperationKind::DropForeignKey,
+                object_name: table_qname.to_string(),
+                target_name: b_fk.name.clone(),
+                before: Some(fk_describe(b_fk)),
+                after: None,
+                destructive: false,
+                transactional: engine_transactional_ddl,
+                reversal_safety: ReversalSafety::CompensatingMigrationRequired,
+                suggested_ddl: fk_drop_ddl(engine, table_qname, b_fk),
+                compensating_ddl: fk_add_ddl(engine, table_qname, b_fk),
+            });
+        }
+    }
+}
+
+fn routine_keyword(object_type: CatalogObjectType) -> &'static str {
+    match object_type {
+        CatalogObjectType::Function => "FUNCTION",
+        CatalogObjectType::Procedure => "PROCEDURE",
+        _ => "TRIGGER",
+    }
+}
+
+/// DDL that (re)creates a routine/trigger from `definition`: used as-is when it already
+/// says `CREATE OR REPLACE`, otherwise preceded by a `DROP`.
+fn recreate_ddl(object_type: CatalogObjectType, qname: &str, definition: Option<&str>) -> Option<String> {
+    let definition = definition?;
+    if definition.to_ascii_uppercase().contains("CREATE OR REPLACE") {
+        return Some(definition.to_string());
+    }
+    Some(format!("DROP {} {qname}; {definition}", routine_keyword(object_type)))
+}
+
+fn diff_routines_and_triggers(
+    base: &BTreeMap<(CatalogObjectType, String), &CatalogObject>,
+    target: &BTreeMap<(CatalogObjectType, String), &CatalogObject>,
+    engine_transactional_ddl: bool,
+    items: &mut Vec<SchemaDiffItem>,
+) {
+    let norm = |d: &Option<String>| d.as_deref().map(|s| s.trim().to_string());
+    for ((ty, key), t_obj) in target {
+        let is_trigger = *ty == CatalogObjectType::Trigger;
+        let qname = t_obj.qualified_name();
+        let kw = routine_keyword(*ty);
+        match base.get(&(*ty, key.clone())) {
+            None => items.push(SchemaDiffItem {
+                kind: if is_trigger {
+                    DiffOperationKind::AddTrigger
+                } else {
+                    DiffOperationKind::AddRoutine
+                },
+                object_name: qname.clone(),
+                target_name: Some(ty.as_str().to_string()),
+                before: None,
+                after: t_obj.definition.clone(),
+                destructive: false,
+                transactional: engine_transactional_ddl,
+                reversal_safety: if engine_transactional_ddl {
+                    ReversalSafety::TransactionalRollback
+                } else {
+                    ReversalSafety::CompensatingMigrationRequired
+                },
+                suggested_ddl: t_obj.definition.clone(),
+                compensating_ddl: Some(format!("DROP {kw} {qname};")),
+            }),
+            Some(b_obj) if norm(&b_obj.definition) != norm(&t_obj.definition) => {
+                items.push(SchemaDiffItem {
+                    kind: if is_trigger {
+                        DiffOperationKind::AlterTrigger
+                    } else {
+                        DiffOperationKind::AlterRoutine
+                    },
+                    object_name: qname.clone(),
+                    target_name: Some(ty.as_str().to_string()),
+                    before: b_obj.definition.clone(),
+                    after: t_obj.definition.clone(),
+                    destructive: false,
+                    transactional: engine_transactional_ddl,
+                    reversal_safety: ReversalSafety::CompensatingMigrationRequired,
+                    suggested_ddl: recreate_ddl(*ty, &qname, t_obj.definition.as_deref()),
+                    compensating_ddl: recreate_ddl(*ty, &qname, b_obj.definition.as_deref()),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    for ((ty, key), b_obj) in base {
+        if target.contains_key(&(*ty, key.clone())) {
+            continue;
+        }
+        let qname = b_obj.qualified_name();
+        items.push(SchemaDiffItem {
+            kind: if *ty == CatalogObjectType::Trigger {
+                DiffOperationKind::DropTrigger
+            } else {
+                DiffOperationKind::DropRoutine
+            },
+            object_name: qname.clone(),
+            target_name: Some(ty.as_str().to_string()),
+            before: b_obj.definition.clone(),
+            after: None,
+            destructive: false,
+            transactional: engine_transactional_ddl,
+            reversal_safety: ReversalSafety::CompensatingMigrationRequired,
+            suggested_ddl: Some(format!("DROP {} {qname};", routine_keyword(*ty))),
+            compensating_ddl: b_obj.definition.clone(),
+        });
+    }
+}
+
+/// Warnings that accompany a `diff_schema` result: unexplained hash differences, mixed engines,
+/// and engine limitations that leave `suggested_ddl` empty.
+pub fn schema_diff_warnings(
+    base: &SchemaSnapshot,
+    target: &SchemaSnapshot,
+    diff: &SchemaDiff,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if diff.is_identical && base.full_hash != target.full_hash {
+        warnings.push(format!(
+            "Snapshot hashes differ ({} vs {}) but no structural differences were found; the difference may be in an object type or attribute diff_schema does not compare.",
+            base.schema_version, target.schema_version
+        ));
+    }
+    if diff.engine == DatabaseEngine::Sqlite
+        && diff.items.iter().any(|i| {
+            matches!(
+                i.kind,
+                DiffOperationKind::AlterColumnType
+                    | DiffOperationKind::AlterColumnNullability
+                    | DiffOperationKind::AlterColumnDefault
+                    | DiffOperationKind::AlterColumnPrimaryKey
+                    | DiffOperationKind::AddForeignKey
+                    | DiffOperationKind::AlterForeignKey
+                    | DiffOperationKind::DropForeignKey
+            ) && i.suggested_ddl.is_none()
+        })
+    {
+        warnings.push("SQLite cannot ALTER COLUMN or change constraints in place: items with suggested_ddl=null need a table rebuild (create new table, copy rows, drop old, rename).".to_string());
+    }
+    if diff.engine != DatabaseEngine::Sqlite
+        && diff
+            .items
+            .iter()
+            .any(|i| i.kind == DiffOperationKind::AlterColumnPrimaryKey)
+    {
+        warnings.push(
+            "Primary-key changes have no generated DDL; write a manual migration.".to_string(),
+        );
+    }
+    warnings
+}
+
+/// Recompute a snapshot's schema hashes from its objects; returns a warning when they do not
+/// match the supplied `schema_version` / `full_hash` (tampered or hand-edited snapshot).
+pub fn verify_snapshot_hash(label: &str, snapshot: &SchemaSnapshot) -> Option<String> {
+    let (version, full) = compute_schema_hashes(&snapshot.objects);
+    if full != snapshot.full_hash || version != snapshot.schema_version {
+        Some(format!(
+            "{label} snapshot hash mismatch: supplied {} but its objects hash to {version}; the snapshot was modified or not produced by capture_schema.",
+            snapshot.schema_version
+        ))
+    } else {
+        None
     }
 }
 
@@ -890,5 +1305,137 @@ mod tests {
             .iter()
             .any(|i| i.kind == DiffOperationKind::DropIndex
                 && i.target_name.as_deref() == Some("idx_users_email")));
+    }
+
+    fn snap(engine: DatabaseEngine, objects: Vec<CatalogObject>) -> SchemaSnapshot {
+        capture_schema("c", engine, objects)
+    }
+
+    fn col(name: &str, ty: &str, nullable: bool, pk: bool) -> ColumnSpec {
+        ColumnSpec {
+            name: name.to_string(),
+            data_type: ty.to_string(),
+            nullable,
+            default_value: None,
+            is_primary_key: pk,
+            comment: None,
+            ordinal_position: 1,
+        }
+    }
+
+    fn tbl(schema: &str, name: &str, cols: Vec<ColumnSpec>, fks: Vec<ForeignKeySpec>) -> CatalogObject {
+        CatalogObject {
+            schema: schema.to_string(),
+            name: name.to_string(),
+            object_type: CatalogObjectType::Table,
+            comment: None,
+            estimated_rows: Some(5),
+            size_bytes: Some(9),
+            columns: cols,
+            indexes: vec![],
+            foreign_keys: fks,
+            definition: None,
+        }
+    }
+
+    fn routine(name: &str, ty: CatalogObjectType, def: &str) -> CatalogObject {
+        CatalogObject {
+            schema: "main".to_string(),
+            name: name.to_string(),
+            object_type: ty,
+            comment: None,
+            estimated_rows: None,
+            size_bytes: None,
+            columns: vec![],
+            indexes: vec![],
+            foreign_keys: vec![],
+            definition: Some(def.to_string()),
+        }
+    }
+
+    #[test]
+    fn diff_reports_routines_triggers_fks_and_pk() {
+        let fk = ForeignKeySpec {
+            name: Some("fk_o_u".to_string()),
+            columns: vec!["user_id".to_string()],
+            referenced_table: "users".to_string(),
+            referenced_columns: vec!["id".to_string()],
+            on_delete: None,
+            on_update: None,
+        };
+        let base = snap(
+            DatabaseEngine::Postgres,
+            vec![
+                tbl("main", "orders", vec![col("id", "int", false, true)], vec![fk]),
+                routine("p1", CatalogObjectType::Procedure, "CREATE PROCEDURE p1() BEGIN END;"),
+                routine("f1", CatalogObjectType::Function, "CREATE FUNCTION f1() BEGIN END;"),
+            ],
+        );
+        let target = snap(
+            DatabaseEngine::Postgres,
+            vec![
+                tbl("main", "orders", vec![col("id", "int", false, false)], vec![]),
+                routine("p1", CatalogObjectType::Procedure, "CREATE PROCEDURE p1() BEGIN SELECT 1; END;"),
+                routine("trg", CatalogObjectType::Trigger, "CREATE TRIGGER trg ..."),
+            ],
+        );
+        let diff = diff_schema(&base, &target);
+        let kinds: Vec<DiffOperationKind> = diff.items.iter().map(|i| i.kind).collect();
+        for k in [
+            DiffOperationKind::AlterColumnPrimaryKey,
+            DiffOperationKind::DropForeignKey,
+            DiffOperationKind::AlterRoutine,
+            DiffOperationKind::DropRoutine,
+            DiffOperationKind::AddTrigger,
+        ] {
+            assert!(kinds.contains(&k), "missing {k:?} in {kinds:?}");
+        }
+        assert!(!diff.is_identical);
+    }
+
+    #[test]
+    fn diff_ddl_is_engine_specific_and_defaults_get_ddl() {
+        let mk = |engine, ty: &str, def: Option<&str>| {
+            let mut c = col("qty", ty, true, false);
+            c.default_value = def.map(str::to_string);
+            snap(engine, vec![tbl("main", "t", vec![c], vec![])])
+        };
+        let d = diff_schema(
+            &mk(DatabaseEngine::MySql, "int", None),
+            &mk(DatabaseEngine::MySql, "bigint", Some("0")),
+        );
+        let ty = d.items.iter().find(|i| i.kind == DiffOperationKind::AlterColumnType).unwrap();
+        assert_eq!(ty.suggested_ddl.as_deref(), Some("ALTER TABLE main.t MODIFY COLUMN qty bigint DEFAULT 0;"));
+        let df = d.items.iter().find(|i| i.kind == DiffOperationKind::AlterColumnDefault).unwrap();
+        assert!(df.suggested_ddl.as_deref().unwrap().contains("SET DEFAULT 0"));
+
+        let base = mk(DatabaseEngine::Sqlite, "int", None);
+        let target = mk(DatabaseEngine::Sqlite, "bigint", None);
+        let d = diff_schema(&base, &target);
+        let ty = d.items.iter().find(|i| i.kind == DiffOperationKind::AlterColumnType).unwrap();
+        assert!(ty.suggested_ddl.is_none());
+        assert!(schema_diff_warnings(&base, &target, &d).iter().any(|w| w.contains("rebuild")));
+    }
+
+    #[test]
+    fn cross_engine_diff_strips_default_schema_and_capture_nulls_stats() {
+        let a = snap(DatabaseEngine::Sqlite, vec![tbl("main", "users", vec![col("id", "int", false, true)], vec![])]);
+        let b = snap(DatabaseEngine::Postgres, vec![tbl("public", "users", vec![col("id", "int", false, true)], vec![])]);
+        assert!(a.objects[0].estimated_rows.is_none() && a.objects[0].size_bytes.is_none());
+        let d = diff_schema(&a, &b);
+        assert!(d.items.is_empty(), "{:?}", d.items);
+    }
+
+    #[test]
+    fn tampered_snapshot_hash_and_unexplained_hash_diff_warn() {
+        let mut a = snap(DatabaseEngine::Sqlite, vec![tbl("main", "users", vec![col("id", "int", false, true)], vec![])]);
+        assert!(verify_snapshot_hash("base", &a).is_none());
+        a.objects.clear();
+        assert!(verify_snapshot_hash("base", &a).unwrap().contains("mismatch"));
+        let x = snap(DatabaseEngine::Sqlite, vec![routine("s", CatalogObjectType::Sequence, "x")]);
+        let y = snap(DatabaseEngine::Sqlite, vec![routine("s", CatalogObjectType::Sequence, "y")]);
+        let d = diff_schema(&x, &y);
+        assert!(d.is_identical);
+        assert!(schema_diff_warnings(&x, &y, &d).iter().any(|w| w.contains("hashes differ")));
     }
 }

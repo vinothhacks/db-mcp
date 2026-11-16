@@ -369,6 +369,54 @@ INSERT OR IGNORE INTO order_items (id, order_id, sku, quantity, unit_price_cents
     (1002, 102, 'SKU-STD-2', 1, 1900);
 INSERT OR IGNORE INTO audit_logs (id, order_id, event_type, created_at) VALUES
     (1, 101, 'ORDER_CHECKED_OUT', '2025-01-03T10:01:00Z');
+CREATE PROCEDURE record_order_audit(IN order_id BIGINT, IN event_type VARCHAR(64))
+BEGIN
+    INSERT INTO audit_logs (order_id, event_type, created_at)
+    SELECT o.id, event_type, NOW()
+    FROM orders o
+    WHERE o.id = order_id;
+END;
+CREATE PROCEDURE reserve_inventory(IN order_id BIGINT)
+BEGIN
+    UPDATE inventory
+    SET reserved_qty = reserved_qty + 1
+    WHERE sku IN (
+        SELECT oi.sku
+        FROM order_items oi
+        WHERE oi.order_id = order_id
+    );
+    CALL record_order_audit(order_id, 'INVENTORY_RESERVED');
+END;
+CREATE FUNCTION calculate_order_discount(order_id BIGINT)
+RETURNS DECIMAL(10, 2)
+DETERMINISTIC
+BEGIN
+    DECLARE v_discount DECIMAL(10, 2) DEFAULT 0.00;
+    SELECT CASE WHEN u.role = 'admin' THEN o.total_cents * 0.10 ELSE 0 END
+    INTO v_discount
+    FROM orders o
+    JOIN users u ON u.id = o.user_id
+    WHERE o.id = order_id;
+    RETURN COALESCE(v_discount, 0.00);
+END;
+CREATE PROCEDURE checkout_order(IN order_id BIGINT)
+BEGIN
+    SELECT calculate_order_discount(order_id);
+    UPDATE orders
+    SET status = 'completed'
+    WHERE id = order_id
+      AND user_id IN (
+          SELECT u.id
+          FROM users u
+          WHERE u.role = 'customer'
+      );
+    SELECT o.id, u.email
+    FROM orders o
+    JOIN users u ON u.id = o.user_id
+    WHERE o.id = order_id;
+    CALL reserve_inventory(order_id);
+    CALL record_order_audit(order_id, 'ORDER_CHECKED_OUT');
+END;
 """
 
 [[named_tools]]

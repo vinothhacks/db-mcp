@@ -620,8 +620,6 @@ async function main() {
   closeClient(b);
 
   // ======================= Section C: dollar-quoted PL/pgSQL body =======================
-  // KNOWN-BUG: F04-02 - a `$$`-quoted routine placed AFTER BEGIN...END routines in init_sql swallows every preceding
-  // routine definition (unbounded dollar-quote search in find_routine_ddl_end / find_sqlite_routine_ddl_end).
   const cfgC = makeConfig(appendToInitSql(DOLLAR_FN_SQL));
   const c = await openClient(cfgC);
   for (const [conn, schema] of [["prod-postgres", "public"], ["local-sqlite", "main"], ["analytics-mysql", "analytics"]]) {
@@ -635,7 +633,7 @@ async function main() {
       assert.deepEqual(byName(r.data.nodes, "record_order_audit").direct_callees, []);
       assert.equal(r.data.has_cycles, false, `cycles=${JSON.stringify(r.data.cycles)}`);
       assert.ok(byName(r.data.nodes, "record_order_audit").definition.length < 400, "record_order_audit definition swallowed following statements");
-    }, conn === "analytics-mysql" ? undefined : "F04-02");
+    });
   }
   closeClient(c);
 
@@ -652,8 +650,6 @@ async function main() {
   closeClient(c2);
 
   // ======================= Section D: MySQL DELIMITER body =======================
-  // KNOWN-BUG: F04-03 - `DELIMITER //` client directives in the MySQL init_sql are passed through to the embedded engine,
-  // the adapter fails to bootstrap and the whole server never answers `initialize`.
   await check("MySQL DELIMITER-wrapped procedure in analytics-mysql init_sql: server starts and delim_proc -> record_order_audit edge is reported", async () => {
     const cfgD = makeConfig(appendToInitSql(DELIMITER_SQL, [2]));
     let d;
@@ -669,7 +665,7 @@ async function main() {
     } finally {
       closeClient(d);
     }
-  }, "F04-03");
+  });
 
   // ======================= Summary =======================
   const passed = results.filter((r) => r.ok).length;

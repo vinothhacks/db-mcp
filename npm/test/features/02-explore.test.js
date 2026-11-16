@@ -22,7 +22,7 @@ const { makeIsolatedConfig } = require(path.join(REPO_ROOT, "scripts", "make-iso
 const CONNECTIONS = [
   { id: "local-sqlite", schema: "main", restricted: true, simulated: false, routinesDefined: true, mode: "development", engine: "sqlite" },
   { id: "prod-postgres", schema: "public", restricted: true, simulated: true, routinesDefined: true, mode: "governed_production", engine: "postgres" },
-  { id: "analytics-mysql", schema: "analytics", restricted: false, simulated: true, routinesDefined: false, mode: "read_only", engine: "mysql" },
+  { id: "analytics-mysql", schema: "analytics", restricted: false, simulated: true, routinesDefined: true, mode: "read_only", engine: "mysql" },
 ];
 const BASE_TABLES = ["audit_logs", "inventory", "order_items", "orders", "users"];
 const RESTRICTED_TABLE = "internal_secrets";
@@ -191,7 +191,7 @@ async function main() {
     await check(`${P}-03`, `[${conn.id}] routines discovered match connection init_sql (procedures=${expectedProcs.length}, functions=${expectedFuncs.length})`, () => {
       sortedEq(ofType(names, "procedure"), expectedProcs);
       sortedEq(ofType(names, "function"), expectedFuncs);
-    }, conn.routinesDefined ? undefined : "F02-06"); // KNOWN-BUG: F02-06 simulated MySQL seeds phantom routines from bootstrap_mysql_system_tables
+    });
     await check(`${P}-04`, `[${conn.id}] detail levels: default==summary (columns, no definition/indexes); names (bare); full (definition, fks, indexes)`, () => {
       const dTable = dflt.data.objects.find((o) => o.name === "orders");
       assert.ok(dTable.columns.length === 5 && dTable.definition === undefined && dTable.indexes.length === 0 && dTable.foreign_keys.length === 0, "default/summary projection");
@@ -421,7 +421,7 @@ async function main() {
       await check(`${P}-05`, `[${conn.id}] describe record_order_audit is NOT FOUND (connection init_sql defines no routines)`, async () => {
         const r = await d({ object_name: "record_order_audit" });
         assertDenied(r, "phantom routine");
-      }, "F02-06"); // KNOWN-BUG: F02-06 phantom routines seeded by bootstrap_mysql_system_tables (definition even references users.status which does not exist)
+      });
     }
     await check(`${P}-06`, `[${conn.id}] describe detail levels: summary keeps columns drops definition/indexes/fks; names drops columns`, async () => {
       const s = (await d({ object_name: "order_items", detail_level: "summary" })).data;
@@ -503,13 +503,13 @@ async function main() {
   }
 
   // ---------------------------------------------------------------- cross-engine parity
-  await check("XE-01", "cross-engine parity: sqlite and postgres (same init_sql) expose identical object name/type sets; mysql = same tables + unrestricted internal_secrets, same view, no routines", () => {
+  await check("XE-01", "cross-engine parity: sqlite and postgres (same init_sql) expose identical object name/type sets; mysql = same tables + unrestricted internal_secrets, same view, same routines (defined by its init_sql)", () => {
     const sig = (sc) => sc.data.objects.map((o) => `${o.object_type}:${o.name}`).sort();
     assert.deepEqual(sig(catalogByConn["local-sqlite"].names), sig(catalogByConn["prod-postgres"].names));
     const my = sig(catalogByConn["analytics-mysql"].names);
-    const expectedMy = [...BASE_TABLES, RESTRICTED_TABLE].map((t) => `table:${t}`).concat([`view:${VIEW}`]).concat(sig(catalogByConn["local-sqlite"].names).filter((s) => s.startsWith("index:"))).sort();
+    const expectedMy = [...BASE_TABLES, RESTRICTED_TABLE].map((t) => `table:${t}`).concat([`view:${VIEW}`]).concat(sig(catalogByConn["local-sqlite"].names).filter((s) => s.startsWith("index:") || s.startsWith("procedure:") || s.startsWith("function:"))).sort();
     assert.deepEqual(my, expectedMy);
-  }, "F02-06"); // KNOWN-BUG: F02-06 mysql shows 4 phantom routines
+  });
   await check("XE-02", "cross-engine parity: describe users / orders FK / view identical in structure across engines", () => {
     const pick = (o) => ({ cols: o.columns.map((c) => [c.name, c.nullable, c.is_primary_key]), fks: o.foreign_keys.map((f) => [f.columns, f.referenced_table, f.referenced_columns, f.on_delete]) });
     const [s, p, m] = CONNECTIONS.map((c) => catalogByConn[c.id].full.data.objects.find((o) => o.name === "orders"));
