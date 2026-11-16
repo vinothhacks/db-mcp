@@ -414,7 +414,7 @@ async function chainSuite(cfg) {
     try { resp = await s.call("execute_query", { connection: "local-sqlite", sql: "SELECT 3" }); } finally { s.close(); }
     const stderr = s.client.stderr.join("");
     assert.ok(resp.status !== "ok" || /chain|tamper|integrity/i.test(stderr), "tampered chain accepted silently; no verify_chain exposure (CLI/tool/startup)");
-  }, "F12-05");
+  });
   await check("chain: a malformed JSONL line must not turn an already-executed write into a STORAGE_ERROR denial", async () => {
     const lines = fs.readFileSync(cfg.jsonl, "utf8").split("\n").filter((l) => l.trim());
     lines[1] = lines[1].slice(0, 40);
@@ -445,7 +445,7 @@ async function storesSuite() {
       const r = await s.call("execute_query", { connection: "local-sqlite", sql: "SELECT 1" });
       assert.fail(`server started and served (${r.status}); files=${fs.readdirSync(c.dir).join(",")}`);
     } finally { s.close(); }
-  }, "F12-07");
+  });
   await check("stores: in_memory=false with no paths (Development) falls back to in-memory and still serves", async () => {
     const c = isoConfig("nomem_dev", (t) => noMem(dropPaths(t)));
     const s = await startStdio(c.configPath, "p", "agent");
@@ -501,7 +501,7 @@ async function storesSuite() {
     for (let i = 1; i < rows.length; i++) if (rows[i][0] !== rows[i - 1][1]) sqliteBreaks++;
     assert.ok(vj.valid, `JSONL chain broken at ${vj.at}`);
     assert.equal(sqliteBreaks, 0, `SQLite chain has ${sqliteBreaks} prev_hash breaks (no cross-process lock around read-last/insert)`);
-  }, "F12-09");
+  });
   await check("stores: a 1 MB SQL literal is bounded/truncated in the persisted event", async () => {
     const c = isoConfig("bigsql");
     const s = await startStdio(c.configPath, "p", "agent");

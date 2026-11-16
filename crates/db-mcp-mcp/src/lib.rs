@@ -302,6 +302,15 @@ impl DbMcpRuntime {
             adapters.insert(conn.id.clone(), adapter);
         }
 
+        if config.default_mode == db_mcp_core::OperatingMode::GovernedProduction
+            && !config.audit.in_memory
+            && config.audit.jsonl_path.as_deref().map(str::trim).unwrap_or("").is_empty()
+            && config.audit.sqlite_path.as_deref().map(str::trim).unwrap_or("").is_empty()
+        {
+            return Err(DbMcpError::StorageError(
+                "governed_production requires a durable audit trail: set audit.jsonl_path or audit.sqlite_path (or audit.in_memory=true to opt in to a non-durable trail)".to_string(),
+            ));
+        }
         let base_sink = build_audit_sink(
             config.audit.in_memory,
             config.audit.jsonl_path.as_deref(),
@@ -1780,14 +1789,52 @@ impl DbMcpRuntime {
     }
 
     pub async fn handle_jsonrpc_str(&self, raw_json: &str, caller: &CallerIdentity) -> String {
-        let resp = match serde_json::from_str::<JsonRpcRequest>(raw_json) {
-            Ok(req) => self.handle_jsonrpc(req, caller).await,
+        self.handle_jsonrpc_line(raw_json, caller).await.unwrap_or_default()
+    }
+
+    /// Handle one raw JSON-RPC message. Returns `None` for notifications (no reply allowed).
+    ///
+    /// Invalid JSON -> `-32700`; valid JSON that is not a request object (array batch, missing or
+    /// non-string `method`, bad `id` type) -> `-32600` with the id echoed when available.
+    pub async fn handle_jsonrpc_line(&self, raw_json: &str, caller: &CallerIdentity) -> Option<String> {
+        let resp = match serde_json::from_str::<Value>(raw_json) {
             Err(e) => JsonRpcResponse::err(None, -32700, format!("Parse error: {e}"), None),
+            Ok(Value::Object(map)) => {
+                let has_id = map.contains_key("id");
+                let id = map.get("id").cloned();
+                let id_ok = matches!(id, None | Some(Value::Null) | Some(Value::String(_)) | Some(Value::Number(_)));
+                let echo_id = if id_ok { id.clone() } else { None };
+                if !id_ok || !map.get("method").map(Value::is_string).unwrap_or(false) {
+                    JsonRpcResponse::err(
+                        echo_id,
+                        -32600,
+                        "Invalid Request: expected a JSON-RPC request object with a string 'method'",
+                        None,
+                    )
+                } else {
+                    match serde_json::from_value::<JsonRpcRequest>(Value::Object(map)) {
+                        Ok(req) => {
+                            let resp = self.handle_jsonrpc(req, caller).await;
+                            if !has_id {
+                                return None;
+                            }
+                            resp
+                        }
+                        Err(e) => JsonRpcResponse::err(echo_id, -32600, format!("Invalid Request: {e}"), None),
+                    }
+                }
+            }
+            Ok(_) => JsonRpcResponse::err(
+                None,
+                -32600,
+                "Invalid Request: batch arrays and non-object messages are not supported",
+                None,
+            ),
         };
-        serde_json::to_string(&resp).unwrap_or_else(|_| {
+        Some(serde_json::to_string(&resp).unwrap_or_else(|_| {
             r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"Internal error"}}"#
                 .to_string()
-        })
+        }))
     }
 }
 

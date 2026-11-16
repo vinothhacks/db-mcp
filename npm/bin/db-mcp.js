@@ -402,7 +402,8 @@ function printLauncherHelp() {
       `Server commands (forwarded to db-mcp-server):\n` +
       `  serve --transport stdio|http [--bind host:port] --config <file> [--principal id] [--role role]\n` +
       `  approve --change-id <chg_id> --approver <principal> [--role admin] [--comment text] --config <file>\n` +
-      `  verify-config --config <file>\n\n` +
+      `  verify-config --config <file>\n` +
+      `  verify-audit --config <file>   (verify audit hash chains; non-zero exit on tamper)\n\n` +
       `Environment: DB_MCP_BINARY_PATH, DB_MCP_SKIP_DOWNLOAD=1, DB_MCP_RELEASE_BASE_URL, DB_MCP_CACHE_DIR\n\n`
   );
 }
