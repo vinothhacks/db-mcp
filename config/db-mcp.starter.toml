@@ -70,54 +70,58 @@ CREATE TABLE IF NOT EXISTS notes (
 """
 
 # ---------------------------------------------------------------------------
+# Optional external databases. Uncomment a block and set its environment variable
+# (DATABASE_URL / MYSQL_URL). An `env:` reference whose variable is unset is a
+# configuration error, so these stay commented until you need them.
+# ---------------------------------------------------------------------------
 # PostgreSQL (governed): writes only through propose_change -> approve -> apply_change
 # ---------------------------------------------------------------------------
-[[connections]]
-id = "postgres"
-engine = "Postgres"
-dsn = "env:DATABASE_URL"                  # e.g. postgres://user:pass@localhost:5432/app
-mode = "GovernedProduction"
-read_only = false
-description = "Primary PostgreSQL database"
-default_schema = "public"
-timeout_ms = 10000
-max_rows = 500
-max_bytes = 1048576
-allow_multi_statement = false
-allow_explain_analyze = false
-has_pg_stat_statements = false            # set true when the extension is installed
-has_hypopg = false                        # set true when HypoPG is installed
-restricted_tables = []
-sensitive_tables = []
-sensitive_columns = ["password_hash", "api_key", "secret_token"]
-deny_sensitive_column_access = false
-unrestricted_sql_provenance = false
-allowed_roles = ["agent", "developer", "dba", "admin"]
-allowed_principals = ["*"]
+# [[connections]]
+# id = "postgres"
+# engine = "Postgres"
+# dsn = "env:DATABASE_URL"                  # e.g. postgres://user:pass@localhost:5432/app
+# mode = "GovernedProduction"
+# read_only = false
+# description = "Primary PostgreSQL database"
+# default_schema = "public"
+# timeout_ms = 10000
+# max_rows = 500
+# max_bytes = 1048576
+# allow_multi_statement = false
+# allow_explain_analyze = false
+# has_pg_stat_statements = false            # set true when the extension is installed
+# has_hypopg = false                        # set true when HypoPG is installed
+# restricted_tables = []
+# sensitive_tables = []
+# sensitive_columns = ["password_hash", "api_key", "secret_token"]
+# deny_sensitive_column_access = false
+# unrestricted_sql_provenance = false
+# allowed_roles = ["agent", "developer", "dba", "admin"]
+# allowed_principals = ["*"]
 
 # ---------------------------------------------------------------------------
 # MySQL / MariaDB (read-only replica)
 # ---------------------------------------------------------------------------
-[[connections]]
-id = "mysql"
-engine = "MySql"
-dsn = "env:MYSQL_URL"                     # e.g. mysql://user:pass@localhost:3306/analytics
-mode = "ReadOnly"
-read_only = true
-description = "Read-only MySQL analytics replica"
-default_schema = "analytics"
-timeout_ms = 15000
-max_rows = 1000
-max_bytes = 1048576
-allow_multi_statement = false
-allow_explain_analyze = false
-restricted_tables = []
-sensitive_tables = []
-sensitive_columns = ["password_hash", "api_key", "secret_token"]
-deny_sensitive_column_access = false
-unrestricted_sql_provenance = false
-allowed_roles = ["*"]
-allowed_principals = ["*"]
+# [[connections]]
+# id = "mysql"
+# engine = "MySql"
+# dsn = "env:MYSQL_URL"                     # e.g. mysql://user:pass@localhost:3306/analytics
+# mode = "ReadOnly"
+# read_only = true
+# description = "Read-only MySQL analytics replica"
+# default_schema = "analytics"
+# timeout_ms = 15000
+# max_rows = 1000
+# max_bytes = 1048576
+# allow_multi_statement = false
+# allow_explain_analyze = false
+# restricted_tables = []
+# sensitive_tables = []
+# sensitive_columns = ["password_hash", "api_key", "secret_token"]
+# deny_sensitive_column_access = false
+# unrestricted_sql_provenance = false
+# allowed_roles = ["*"]
+# allowed_principals = ["*"]
 
 # ---------------------------------------------------------------------------
 # Declarative named tools: curated parameterized SQL the agent can call by name

@@ -239,12 +239,12 @@ async function main() {
     for (const k of ["config_path", "server_name", "server_version"]) assert.ok(k in j, k);
   });
   await check("verify: shipped starter config (db-mcp init template) validates", () => {
-    // The starter references env:DATABASE_URL / env:MYSQL_URL; unset variables are an error (F13-B2), so supply them.
-    assert.equal(verify(path.join(REPO, "config", "db-mcp.starter.toml")).status, 1, "starter must demand its env vars");
-    const r = runBin(["verify-config", "--config", path.join(REPO, "config", "db-mcp.starter.toml")], { env: { DATABASE_URL: "postgres://127.0.0.1:1/x", MYSQL_URL: "mysql://127.0.0.1:1/x" } });
+    // The starter must work with no environment set up (first run after `db-mcp init`): only the local SQLite
+    // connection is active; the env:-based PostgreSQL/MySQL blocks ship commented out (unset env refs are an error, F13-B2).
+    const r = verify(path.join(REPO, "config", "db-mcp.starter.toml"));
     assert.equal(r.status, 0, r.stderr);
     const j = JSON.parse(r.stdout);
-    assert.equal(j.connections, 3);
+    assert.equal(j.connections, 1);
     assert.equal(j.named_tools, 1);
   });
   const okJson = JSON.stringify({ server_name: "t", default_mode: "ReadOnly", connections: [{ id: "c1", engine: "Sqlite", dsn: "sqlite://:memory:", mode: "Development", init_sql: "CREATE TABLE t(a INT);" }], named_tools: [{ name: "t1", description: "a", connection: "c1", statement: "SELECT 1 AS one" }] });
