@@ -406,13 +406,13 @@ async function main() {
     assert.equal(r.stdout, "");
     assert.match(r.stderr, /no binary installed yet; run `db-mcp install`/);
   });
-  await check("verify-config through the packed launcher with DB_MCP_BINARY_PATH -> exit 0, JSON status ok, 3 connections", () => {
+  await check("verify-config through the packed launcher with DB_MCP_BINARY_PATH -> exit 0, JSON status ok, 1 active connection", () => {
     if (!HAVE_BINARY) return skip("verify-config via DB_MCP_BINARY_PATH", "no built binary") || "skip";
     const r = runLauncher(PACKED_LAUNCHER, ["verify-config", "--config", "db-mcp.toml"], { cwd: userDir, env: strippedEnv({ DB_MCP_BINARY_PATH: BUILT_BINARY, ...STARTER_ENV }) });
     assert.equal(r.status, 0, r.stderr);
     const j = JSON.parse(r.stdout);
     assert.equal(j.status, "ok");
-    assert.equal(j.connections, 3);
+    assert.equal(j.connections, 1); // starter: local SQLite active, PostgreSQL/MySQL templates commented out
     assert.equal(j.named_tools, 1);
   });
   await check("no binary + DB_MCP_SKIP_DOWNLOAD=1 + no cargo on PATH -> exit 1 with actionable message (DB_MCP_BINARY_PATH, rustup, releases URL)", () => {
@@ -806,15 +806,11 @@ async function main() {
     assert.ok(!/^COPY research \.\/research/m.test(dockerfile), "builder copies the whole research/ tree");
     assert.ok(!/COPY --from=builder \/workspace\/research /.test(dockerfile), "runtime copies the whole research/ tree");
   });
-  await check("docker-compose: db-mcp depends_on postgres/mysql only makes sense if the mounted config can reach them (service hostnames, not localhost)", () => {
-    // KNOWN-BUG: F14-07 - compose waits for healthy postgres/mysql, but the mounted example config dials
-    // postgres://localhost:5432 and mysql://localhost:3306, which inside the db-mcp container is the container itself.
-    // The adapters silently fall back to the embedded simulation, so the side-car databases are never used.
-    assert.match(compose, /depends_on:\s*\n\s*postgres:/);
-    const pgDsn = exampleCfg.match(/^dsn = "(postgres:\/\/[^"]+)"/m)[1];
-    const myDsn = exampleCfg.match(/^dsn = "(mysql:\/\/[^"]+)"/m)[1];
-    assert.ok(!/localhost|127\.0\.0\.1/.test(pgDsn), `example config Postgres DSN ${pgDsn} is unreachable from the db-mcp container`);
-    assert.ok(!/localhost|127\.0\.0\.1/.test(myDsn), `example config MySQL DSN ${myDsn} is unreachable from the db-mcp container`);
+  await check("docker-compose: no postgres/mysql side-cars that the (simulated) adapters can never reach", () => {
+    // F14-07 fixed: the PostgreSQL/MySQL adapters have no wire client (embedded simulation), so side-car databases
+    // and depends_on on them were misleading; compose now runs only db-mcp.
+    assert.ok(!/depends_on:/.test(compose), "compose still declares depends_on");
+    assert.ok(!/^\s{2}(postgres|mysql):/m.test(compose), "compose still declares a postgres/mysql service");
   });
   await check("docker-compose: default bearer tokens are explicit dev placeholders and RUST_LOG is overridable", () => {
     assert.match(compose, /DB_MCP_AUTH_TOKEN: \$\{DB_MCP_AUTH_TOKEN:-dev-agent-token\}/);
