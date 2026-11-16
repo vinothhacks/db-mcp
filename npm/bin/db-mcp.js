@@ -396,7 +396,9 @@ function printLauncherHelp() {
       `Launcher commands:\n` +
       `  init [--output db-mcp.toml] [--force] [--example]   write a starter configuration file\n` +
       `  install                                            download/build the native binary and print its path\n` +
-      `  where                                              print the resolved binary path\n\n` +
+      `  where                                              print the resolved binary path\n` +
+      `  selftest [--json] [--keep]                         end-to-end check of every feature (24 tools, HTTP, audit,\n` +
+      `                                                     governed ontology) on a temporary copy of the example config\n\n` +
       `Server commands (forwarded to db-mcp-server):\n` +
       `  serve --transport stdio|http [--bind host:port] --config <file> [--principal id] [--role role]\n` +
       `  approve --change-id <chg_id> --approver <principal> [--role admin] [--comment text] --config <file>\n` +
@@ -421,6 +423,23 @@ async function runCli() {
       }
       process.stdout.write(`${bin}\n`);
       process.exit(0);
+    } catch (err) {
+      process.stderr.write(`[db-mcp] ${err.message}\n`);
+      process.exit(1);
+    }
+  }
+  if (cmd === "selftest") {
+    // Runs scripts/feature-smoke.js (shipped in the package) against an isolated temp copy of the bundled
+    // example config; it never reads or writes the user's own config, databases, audit logs or ontology store.
+    try {
+      const bin = await ensureBinary();
+      const flags = argv.slice(1).filter((a) => a === "--json" || a === "--keep");
+      const res = spawnSync(process.execPath, [path.join(PKG_ROOT, "scripts", "feature-smoke.js"), ...flags], {
+        cwd: PKG_ROOT,
+        env: { ...process.env, DB_MCP_BINARY_PATH: bin },
+        stdio: "inherit",
+      });
+      process.exit(typeof res.status === "number" ? res.status : 1);
     } catch (err) {
       process.stderr.write(`[db-mcp] ${err.message}\n`);
       process.exit(1);

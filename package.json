@@ -26,7 +26,8 @@
     "test": "node ./npm/test/launcher.test.js && node ./npm/test/e2e.test.js",
     "test:e2e": "node ./npm/test/e2e.test.js",
     "test:launcher": "node ./npm/test/launcher.test.js",
-    "verify:features": "node ./scripts/feature-smoke.js"
+    "verify:features": "node ./scripts/feature-smoke.js",
+    "selftest": "node ./npm/bin/db-mcp.js selftest"
   },
   "files": [
     "npm/bin/db-mcp.js",
@@ -34,7 +35,10 @@
     "config/db-mcp.starter.toml",
     "README.md",
     "LICENSE-MIT",
-    "LICENSE-APACHE"
+    "LICENSE-APACHE",
+    "scripts/feature-smoke.js",
+    "scripts/mcp-call.js",
+    "scripts/make-isolated-config.js"
   ],
   "engines": {
     "node": ">=18.0.0"

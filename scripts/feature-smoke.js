@@ -9,23 +9,49 @@
  *   - sensitive-column redaction and restricted tables
  *   - Streamable HTTP transport (bearer auth, /health, /metrics, /admin/approve)
  *   - audit trail persistence
+ *   - governed ontology flow (agent proposes, admin certifies and publishes via CLI, agent asks)
  *
- * Usage: node scripts/feature-smoke.js [--config config/db-mcp.example.toml] [--json]
+ * Usage: node scripts/feature-smoke.js [--json] [--keep] [--config <file>]
+ *        npx @vinoth_n_3000/db-mcp selftest [--json] [--keep]      (same checks, shipped in the npm package)
+ * By default every check runs against an isolated temporary copy of config/db-mcp.example.toml, so no
+ * user database, audit log or ontology store is touched; --keep prints and keeps that directory.
+ * --config runs against another config instead (developer use; it writes to the stores that config names,
+ * and the governed ontology flow is skipped).
  * Exit code 0 when every check passes, 1 otherwise. Prints a feature matrix.
  */
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const net = require("node:net");
+const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const { createClient } = require(path.join(__dirname, "mcp-call.js"));
+const { makeIsolatedConfig } = require(path.join(__dirname, "make-isolated-config.js"));
 const { spawnDbMcpServer } = require(path.join(__dirname, "..", "npm", "bin", "db-mcp.js"));
 
 const REPO_ROOT = path.resolve(__dirname, "..");
 const LAUNCHER = path.join(REPO_ROOT, "npm", "bin", "db-mcp.js");
 const argv = process.argv.slice(2);
-const CONFIG = argv.includes("--config") ? argv[argv.indexOf("--config") + 1] : "config/db-mcp.example.toml";
+const KEEP = argv.includes("--keep");
+const ISO = argv.includes("--config") ? null : makeIsolatedConfig();
+const CONFIG = ISO ? ISO.configPath : path.resolve(argv[argv.indexOf("--config") + 1]);
+const WORK_DIR = ISO ? ISO.dir : os.tmpdir();
 const JSON_OUT = argv.includes("--json");
+const CERTIFY = [
+  "metric:main.orders.count",
+  "attribute:main.users.role",
+  "attribute:main.order_items.sku",
+  "relationship:main.orders(user_id)->main.users",
+  "relationship:main.order_items(order_id)->main.orders",
+];
+
+function configuredPath(key) {
+  const m = fs.readFileSync(CONFIG, "utf8").match(new RegExp(`^\\s*${key}\\s*=\\s*"([^"]+)"`, "m"));
+  return m ? path.resolve(REPO_ROOT, m[1]) : null;
+}
+function ontologyCli(args) {
+  return spawnSync(process.execPath, [LAUNCHER, "ontology", ...args, "--config", CONFIG], { cwd: REPO_ROOT, encoding: "utf8" });
+}
 
 const results = [];
 function record(feature, check, ok, detail) {
@@ -281,6 +307,46 @@ async function stdioSuite() {
       const p = envelopeOk(await call("plan_semantic_query", { connection: "local-sqlite", question: "how many late arrivals per service" }), "plan");
       assert.equal(p.data.status, "not_answerable");
     });
+    if (ISO) {
+      // Full governed flow. Only on the isolated copy: it writes certifications and a published revision.
+      let draft = null;
+      await step("ontology", "propose_semantic_definition stores an agent draft", async () => {
+        const r = envelopeOk(await call("propose_semantic_definition", {
+          connection: "local-sqlite",
+          definition: { name: "order value", synonyms: ["order total", "sales"], body: { type: "metric", base_table: "orders", aggregation: "sum", column: "total_cents", unit: "cents", grain: "order" } },
+        }), "propose");
+        draft = r.data.definition;
+        assert.match(draft.def_id, /^metric:/);
+      });
+      await step("ontology", "proposer cannot certify its own draft (CLI review)", async () => {
+        assert.ok(draft, "no draft");
+        const r = ontologyCli(["review", "--connection", "local-sqlite", "--def-id", draft.def_id, "--version", String(draft.version), "--action", "approve", "--reviewer", "smoke-agent", "--reason", "self"]);
+        assert.notEqual(r.status, 0, "self review succeeded");
+        assert.match(r.stderr + r.stdout, /SELF_APPROVAL_FORBIDDEN|self/i);
+      });
+      await step("ontology", "admin certifies and publishes a revision via CLI", async () => {
+        assert.ok(draft, "no draft");
+        for (const [id, v] of [...CERTIFY.map((id) => [id, 1]), [draft.def_id, draft.version]]) {
+          const r = ontologyCli(["review", "--connection", "local-sqlite", "--def-id", id, "--version", String(v), "--action", "approve", "--reviewer", "smoke-reviewer", "--reason", "selftest"]);
+          assert.equal(r.status, 0, `review ${id}: ${r.stderr.trim()}`);
+        }
+        const pub = ontologyCli(["publish", "--connection", "local-sqlite", "--reviewer", "smoke-reviewer"]);
+        assert.equal(pub.status, 0, pub.stderr.trim());
+        assert.ok(JSON.parse(pub.stdout).revision.def_refs.length >= CERTIFY.length + 1);
+      });
+      await step("ontology", "ask_semantic_question answers from certified definitions only", async () => {
+        const a = envelopeOk(await call("ask_semantic_question", { connection: "local-sqlite", question: "total order value by user role" }), "ask");
+        assert.equal(a.data.plan.status, "answerable", JSON.stringify(a.data.plan.missing));
+        assert.equal(a.data.answered, true);
+        assert.match(a.data.plan.sql, /^SELECT /i);
+        assert.ok(a.rows.length >= 1, "no rows");
+      });
+      await step("ontology", "multiplicative join (fan-out) is refused, not guessed", async () => {
+        const p = envelopeOk(await call("plan_semantic_query", { connection: "local-sqlite", question: "order total by sku" }), "fanout");
+        assert.equal(p.data.status, "not_answerable");
+        assert.match(p.data.missing.join(" "), /multiplicative/i);
+      });
+    }
   } finally {
     client.close();
   }
@@ -335,8 +401,8 @@ async function httpSuite() {
 
 async function auditSuite() {
   await step("audit", "JSONL audit trail records tool calls with redaction", async () => {
-    const p = path.join(REPO_ROOT, "research", "traces", "audit.jsonl");
-    assert.ok(fs.existsSync(p), "audit.jsonl missing");
+    const p = configuredPath("jsonl_path");
+    assert.ok(p && fs.existsSync(p), `audit JSONL missing (${p})`);
     const lines = fs.readFileSync(p, "utf8").trim().split("\n").filter(Boolean);
     assert.ok(lines.length >= 10, `only ${lines.length} audit lines`);
     const last = JSON.parse(lines[lines.length - 1]);
@@ -349,7 +415,7 @@ async function auditSuite() {
     assert.equal(JSON.parse(r.stdout).status, "ok");
   });
   await step("cli", "verify-config rejects invalid config", async () => {
-    const bad = path.join(REPO_ROOT, "research", "traces", "smoke-bad.toml");
+    const bad = path.join(WORK_DIR, `smoke-bad-${process.pid}.toml`);
     fs.writeFileSync(bad, 'server_name = "x"\n[[connections]]\nid = "c"\nengine = "Oracle"\ndsn = "x"\n');
     const r = spawnSync(process.execPath, [LAUNCHER, "verify-config", "--config", bad], { cwd: REPO_ROOT, encoding: "utf8" });
     fs.unlinkSync(bad);
@@ -371,6 +437,14 @@ async function auditSuite() {
     console.log("\nFeature matrix:");
     for (const [f, c] of Object.entries(byFeature)) console.log(`  ${c.fail ? "FAIL" : "PASS"}  ${f.padEnd(12)} ${c.pass} passed, ${c.fail} failed`);
     console.log(`\n${results.length - failed.length}/${results.length} checks passed in ${((Date.now() - started) / 1000).toFixed(1)}s`);
+  }
+  if (ISO && KEEP) {
+    if (!JSON_OUT) console.log(`kept isolated run directory: ${ISO.dir}`);
+  } else if (ISO) {
+    // Windows may hold SQLite handles briefly after the servers exit.
+    for (let i = 0; i < 20; i++) {
+      try { fs.rmSync(ISO.dir, { recursive: true, force: true }); break; } catch { await sleep(250); }
+    }
   }
   process.exit(failed.length ? 1 : 0);
 })().catch((e) => { console.error(e); process.exit(1); });
