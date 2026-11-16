@@ -1248,6 +1248,8 @@ impl PgInsightsEngine {
             );
             let drop_ddl = if engine == DatabaseEngine::Postgres {
                 format!("DROP INDEX CONCURRENTLY IF EXISTS {index_name};")
+            } else if engine == DatabaseEngine::SqlServer {
+                format!("DROP INDEX IF EXISTS {index_name} ON {ddl_table};")
             } else {
                 format!("DROP INDEX IF EXISTS {index_name};")
             };
@@ -1310,7 +1312,11 @@ impl PgInsightsEngine {
                 )]
             };
 
-            let validation_procedure = if engine == DatabaseEngine::Postgres {
+            let validation_procedure = if engine == DatabaseEngine::SqlServer {
+                format!(
+                    "In staging, compare the estimated plan (SET SHOWPLAN_XML ON) before and after creating '{index_name}', then watch sys.dm_db_index_usage_stats for seeks."
+                )
+            } else if engine == DatabaseEngine::Postgres {
                 format!(
                     "1. Verify virtual plan with HypoPG: SELECT * FROM hypopg_create_index('{suggested_ddl}'); EXPLAIN (FORMAT JSON) <query>; SELECT hypopg_reset(); \
                      2. After governed rollout, monitor pg_stat_user_indexes.idx_scan for '{index_name}' and confirm mean_exec_time reduction in pg_stat_statements."

@@ -508,6 +508,54 @@ fn verify_audit_stores(cfg: &ServerConfig) -> (bool, Vec<Value>) {
     (all_ok, results)
 }
 
+/// Base `check-connection` report: `{connection, engine, backend, server_version, can_connect,
+/// select_1, object_count, permissions[], can_write, warnings[]}`.
+fn base_check_report(conn: &db_mcp_mcp::ConnectionConfig, backend: &str) -> Value {
+    json!({
+        "connection": conn.id,
+        "engine": conn.engine.as_str(),
+        "backend": backend,
+        "server_version": Value::Null,
+        "can_connect": false,
+        "select_1": false,
+        "object_count": Value::Null,
+        "permissions": [],
+        "can_write": false,
+        "warnings": [],
+    })
+}
+
+async fn check_sqlserver_connection(conn: &db_mcp_mcp::ConnectionConfig, mut report: Value) -> (Value, bool) {
+    let secrets = db_mcp_secrets::CompositeSecretProvider::with_static_and_env(db_mcp_secrets::StaticSecretProvider::new());
+    let adapter = match conn
+        .resolve_dsn(&secrets)
+        .and_then(|dsn| db_mcp_sqlserver::SqlServerAdapter::new(db_mcp_sqlserver::SqlServerConfig::new(&conn.id, dsn)))
+    {
+        Ok(a) => a,
+        Err(e) => {
+            report["warnings"] = json!([db_mcp_secrets::redact_sensitive_text(&e.to_string())]);
+            report["error_code"] = json!(e.code());
+            return (report, false);
+        }
+    };
+    let c = adapter.check_connection().await;
+    report["target"] = json!(c.target);
+    report["server_version"] = json!(c.server_version);
+    report["database"] = json!(c.database);
+    report["login"] = json!(c.login);
+    report["can_connect"] = json!(c.can_connect);
+    report["select_1"] = json!(c.select_1);
+    report["object_count"] = json!(c.object_count);
+    report["permissions"] = json!(c.permissions);
+    report["can_write"] = json!(c.can_write);
+    report["warnings"] = json!(c.warnings);
+    if let Some(code) = &c.error_code {
+        report["error_code"] = json!(code);
+        report["next_action"] = json!("check host, port, instance, login and password (env:/file: DSN reference), then retry");
+    }
+    (report, c.can_connect && c.select_1)
+}
+
 async fn run_stdio_loop(handler: McpProtocolHandler, caller: CallerIdentity) -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
@@ -724,7 +772,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     }
 }
 
-/// Run the read-only connection smoke test. Live MySQL connections are checked by the adapter
+/// Run the read-only connection smoke test. Live MySQL and SQL Server connections are checked by the adapter
 /// itself (grants, version, read-only session); every other connection goes through the governed
 /// runtime as an admin caller (`SELECT 1` + catalog count). Never prints DSNs or passwords.
 async fn check_connections(cfg: &ServerConfig, only: Option<&str>) -> anyhow::Result<(bool, Vec<Value>)> {
@@ -741,7 +789,9 @@ async fn check_connections(cfg: &ServerConfig, only: Option<&str>) -> anyhow::Re
     let mut runtime: Option<db_mcp_mcp::DbMcpRuntime> = None;
     for conn in selected {
         let backend = conn.effective_backend()?;
-        let result = if conn.engine == db_mcp_core::DatabaseEngine::MySql && backend == db_mcp_mcp::config::BACKEND_LIVE {
+        let result = if conn.engine == db_mcp_core::DatabaseEngine::SqlServer {
+            check_sqlserver_connection(conn, base_check_report(conn, backend)).await.0
+        } else if conn.engine == db_mcp_core::DatabaseEngine::MySql && backend == db_mcp_mcp::config::BACKEND_LIVE {
             check_mysql_live(conn).await
         } else {
             if runtime.is_none() {

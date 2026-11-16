@@ -46,7 +46,7 @@ node scripts/ontology-demo.js --keep      # prints the kept ontology.db path
 # then, from an MCP client with REA: inspect_pe_imports / inspect_sqlite_database on those paths
 ```
 
-## 3. Egress note for live MySQL (v0.3.0, Track M)
+## 3. Egress note for live MySQL (v0.3.0)
 
 The binary now links a MySQL wire-protocol client: `mysql_async` 0.37 with
 `default-features = false, features = ["minimal-rust"]` (pure-Rust deflate, no TLS). `cargo tree -p
@@ -56,5 +56,20 @@ configured `engine = "MySql"` connection whose `backend` is `live` (pool of at m
 connection, opened lazily on the first tool call, never at startup); simulated connections never
 open a socket. `caching_sha2_password` full authentication uses the server's RSA public key over the
 same connection. There is still no HTTP client or model SDK, so ontology discovery and planning
-cannot send schema or data to an external service. (SQL Server's TDS client and its TLS stack are
-documented by the SQL Server track.)
+cannot send schema or data to an external service.
+
+## 4. Egress note for live SQL Server (v0.3.0)
+
+The binary now links a TDS (SQL Server) client, `tiberius` 0.12, with `rustls` 0.21 / `ring` for
+TLS (no OpenSSL, no SChannel). Consequences for the checks above:
+
+- `Cargo.lock` now contains `tiberius`, `rustls`, `tokio-rustls`, `rustls-native-certs` and
+  `ring`; the "no TLS stack" row no longer holds. The TLS client is only used inside the TDS
+  login/session to a SQL Server named in a configured `engine = "sqlserver"` DSN.
+- Connections go only to the configured DSN host and port, or, for a named instance without a
+  port, to the SQL Server Browser on that same host (UDP 1434). Nothing else is contacted.
+- Still no HTTP client crate (`reqwest`, `ureq`, `hyper` client, `isahc`, `surf`) and no model SDK
+  (`openai`, `anthropic`). The ontology still cannot send schema or data to a model service.
+- `rustls-native-certs` reads the OS certificate store only when `trustServerCertificate=false`.
+
+Re-run the REA import/lockfile inspection on the v0.3.0 release binary before publishing.

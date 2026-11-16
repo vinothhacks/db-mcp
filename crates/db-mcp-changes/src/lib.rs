@@ -1483,6 +1483,7 @@ mod tests {
                 DatabaseEngine::Postgres => DatabaseCapabilities::for_postgres(true, true),
                 DatabaseEngine::MySql => DatabaseCapabilities::for_mysql(),
                 DatabaseEngine::Sqlite => DatabaseCapabilities::for_sqlite(),
+                DatabaseEngine::SqlServer => DatabaseCapabilities::for_sqlserver(),
             }
         }
 

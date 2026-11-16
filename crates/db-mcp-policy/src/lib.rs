@@ -1547,6 +1547,44 @@ mod tests {
     }
 
     #[test]
+    fn test_sqlserver_tsql_rules() {
+        let e = DatabaseEngine::SqlServer;
+        for sql in [
+            "SELECT password_hash AS ph FROM dbo.users",
+            "SELECT TOP 1 UPPER(password_hash) FROM dbo.users",
+            "SELECT ph FROM (SELECT [password_hash] AS ph FROM [dbo].[users]) t",
+        ] {
+            assert_eq!(eval_dev(e, sql).denial_code(), Some(CODE_SENSITIVE_COLUMN_FORBIDDEN), "{sql}");
+        }
+        assert!(eval_dev(e, "SELECT TOP (5) password_hash FROM [dbo].[users]").is_allowed());
+        let ro = PolicyEngine::with_configs(
+            OperatingMode::ReadOnly,
+            vec![ConnectionPolicyConfig::read_only("ro").with_restricted_tables(vec!["internal_secrets".to_string()])],
+        );
+        let caller = CallerIdentity::local_agent("agent-1");
+        let eval = |sql: &str| ro.evaluate_raw_sql(&caller, "ro", e, sql).map(|(_, ev)| ev);
+        assert!(eval("SELECT TOP 5 id, email FROM dbo.users ORDER BY id").unwrap().is_allowed());
+        for sql in [
+            "EXEC sp_who",
+            "EXEC xp_cmdshell 'whoami'",
+            "SELECT 1 DELETE FROM dbo.users",
+            "SELECT id INTO dbo.copy FROM dbo.users",
+            "SELECT * FROM OPENROWSET('SQLNCLI', 'x', 'SELECT 1')",
+            "BEGIN TRAN",
+            "USE master",
+        ] {
+            match eval(sql) {
+                Ok(ev) => assert!(!ev.is_allowed(), "{sql} was allowed"),
+                Err(_) => {}
+            }
+        }
+        assert_eq!(
+            eval("SELECT * FROM [dbo].[internal_secrets]").unwrap().denial_code(),
+            Some(CODE_RESTRICTED_TABLE_FORBIDDEN)
+        );
+    }
+
+    #[test]
     fn test_sensitive_column_direct_select_and_filters_still_allowed() {
         for engine in [DatabaseEngine::Sqlite, DatabaseEngine::Postgres, DatabaseEngine::MySql] {
             for sql in [

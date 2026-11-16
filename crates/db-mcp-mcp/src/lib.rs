@@ -40,6 +40,7 @@ use db_mcp_postgres::{PostgresAdapter, PostgresConfig};
 use db_mcp_secrets::{CompositeSecretProvider, SecretProvider, StaticSecretProvider};
 use db_mcp_sql::{hash_sql, parse_and_analyze_sql};
 use db_mcp_sqlite::{SqliteAdapter, SqliteConfig};
+use db_mcp_sqlserver::{SqlServerAdapter, SqlServerConfig};
 use db_mcp_tools::NamedToolRegistry;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -161,6 +162,8 @@ fn scrub_restricted(value: &mut Value, cfg: &db_mcp_policy::ConnectionPolicyConf
 pub struct DbMcpRuntime {
     config: ServerConfig,
     adapters: BTreeMap<String, Arc<dyn DatabaseAdapter>>,
+    /// Live SQL Server adapters (also in `adapters`), for engine-specific diagnostics.
+    sqlserver: BTreeMap<String, Arc<SqlServerAdapter>>,
     summaries: BTreeMap<String, ConnectionSummary>,
     policy: Arc<PolicyEngine>,
     audit: Arc<dyn AuditSink>,
@@ -347,6 +350,7 @@ impl DbMcpRuntime {
         config.validate()?;
         let secrets = CompositeSecretProvider::with_static_and_env(StaticSecretProvider::new());
         let mut adapters: BTreeMap<String, Arc<dyn DatabaseAdapter>> = BTreeMap::new();
+        let mut sqlserver: BTreeMap<String, Arc<SqlServerAdapter>> = BTreeMap::new();
         let mut summaries = BTreeMap::new();
         let mut policy_configs = Vec::new();
         let mut mysql_live: BTreeMap<String, Arc<MySqlAdapter>> = BTreeMap::new();
@@ -407,6 +411,23 @@ impl DbMcpRuntime {
                     }
                     mysql
                 }
+                DatabaseEngine::SqlServer => {
+                    if conn.init_sql.as_deref().map(str::trim).filter(|s| !s.is_empty()).is_some() {
+                        return Err(DbMcpError::ConfigurationError(format!(
+                            "Connection '{}': init_sql is not supported for live SQL Server connections",
+                            conn.id
+                        )));
+                    }
+                    let read_only = conn.read_only
+                        || conn.effective_mode(config.default_mode) == db_mcp_core::OperatingMode::ReadOnly;
+                    let mut cfg = SqlServerConfig::new(&conn.id, resolved_dsn).with_read_only(read_only);
+                    if let Some(schema) = &conn.default_schema {
+                        cfg = cfg.with_default_schema(schema.clone());
+                    }
+                    let ss = Arc::new(SqlServerAdapter::new(cfg)?);
+                    sqlserver.insert(conn.id.clone(), ss.clone());
+                    ss
+                }
             };
 
             let mode = conn.effective_mode(config.default_mode);
@@ -454,6 +475,7 @@ impl DbMcpRuntime {
         Ok(Self {
             config,
             adapters,
+            sqlserver,
             summaries,
             policy,
             audit,
@@ -558,6 +580,73 @@ impl DbMcpRuntime {
             });
         }
         db_mcp_changes::validate_change_statement(&analysis)
+    }
+
+    /// SQL Server workload: Query Store, else the plan cache, else DB-MCP's recorded history.
+    /// Never synthesizes statistics for a live server.
+    async fn sqlserver_workload(
+        &self,
+        live: &SqlServerAdapter,
+        conn: &str,
+        top_n: usize,
+    ) -> DbMcpResult<db_mcp_core::WorkloadAnalysis> {
+        let (found, mut notes) = db_mcp_sqlserver::diagnostics::server_workload(live, top_n).await?;
+        if let Some((source, stats)) = found {
+            return Ok(db_mcp_sqlserver::diagnostics::workload_from_stats(conn, source, stats, top_n, notes));
+        }
+        let mut recorded = self.pg_insights.analyze_workload(conn, top_n).await?;
+        if recorded.source != "recorded_workload_history" {
+            recorded.top_queries.clear();
+            recorded.hot_tables.clear();
+            recorded.total_queries_analyzed = 0;
+            recorded.source = "unavailable".to_string();
+            recorded.notes.clear();
+            notes.push("No server workload statistics are readable and no queries were recorded through DB-MCP yet.".to_string());
+        } else {
+            notes.push("Showing statements recorded through DB-MCP in this session (server statistics unavailable).".to_string());
+        }
+        recorded.notes.extend(notes);
+        Ok(recorded)
+    }
+
+    /// SQL Server index advice: missing-index DMVs + showplan hints + the heuristic advisor,
+    /// T-SQL DDL, advisory only.
+    async fn sqlserver_index_advice(
+        &self,
+        live: &SqlServerAdapter,
+        conn: &str,
+        queries: Vec<String>,
+        max_recs: usize,
+    ) -> DbMcpResult<(Vec<db_mcp_core::IndexRecommendation>, Vec<String>)> {
+        use db_mcp_sqlserver::diagnostics as diag;
+        let info = live.server_info().await?;
+        let objects = live.catalog_objects().await?;
+        let mut notes = Vec::new();
+        let (dmv, dmv_notes) = diag::missing_index_dmv(live, &info).await;
+        notes.extend(dmv_notes);
+        let mut server: Vec<db_mcp_core::IndexRecommendation> = dmv
+            .into_iter()
+            .map(|(hint, evidence)| diag::hint_to_recommendation(&hint, evidence, Vec::new(), "Missing-index DMV"))
+            .collect();
+        if !queries.is_empty() {
+            if info.can_showplan() {
+                let (recs, plan_notes) = diag::showplan_hints(live, &queries).await;
+                server.extend(recs);
+                notes.extend(plan_notes);
+            } else {
+                notes.push(format!(
+                    "optimizer missing-index hints need GRANT SHOWPLAN TO [{}]",
+                    info.database_user
+                ));
+            }
+        }
+        let heuristic = self.pg_insights.recommend_indexes(conn, queries, max_recs).await?;
+        Ok((diag::merge_recommendations(&objects, server, heuristic, max_recs), notes))
+    }
+
+    /// Live SQL Server adapter for a connection id (check-connection and diagnostics).
+    pub fn sqlserver_adapter(&self, connection: &str) -> Option<Arc<SqlServerAdapter>> {
+        self.sqlserver.get(connection).cloned()
     }
 
     /// True when the connection's adapter serves results from an embedded simulation.
@@ -1104,6 +1193,10 @@ impl DbMcpRuntime {
                     .filter(|c| self.policy.authorize_connection(caller, &c.id).is_allowed())
                     .map(|c| {
                         let mut summary: ConnectionSummary = c.clone();
+                        if let Some(live) = self.sqlserver.get(&c.id) {
+                            // Live capabilities include the grants detected at first connect.
+                            summary.capabilities = live.capabilities();
+                        }
                         let simulated = self.is_simulated(&c.id);
                         if simulated {
                             // An embedded simulation cannot interrupt statements or run real ANALYZE plans.
@@ -1423,13 +1516,15 @@ impl DbMcpRuntime {
                         "supports_health_diagnostics",
                     ));
                 }
-                let report = match self.mysql_live.get(&conn).and_then(|m| m.live().cloned()) {
+                let mysql_live = self.mysql_live.get(&conn).and_then(|m| m.live().cloned());
+                let report = match (self.sqlserver.get(&conn).cloned(), mysql_live) {
+                    (Some(live), _) => db_mcp_sqlserver::diagnostics::database_health(&live).await?,
                     // Live MySQL: server counters + catalog checks over the policy-visible catalog.
-                    Some(live) => {
+                    (None, Some(live)) => {
                         let (visible, _) = self.discover_allowed(adapter.as_ref(), &conn, None).await?;
                         live.database_health(&visible).await?
                     }
-                    None => self.pg_insights.database_health(&conn).await?,
+                    (None, None) => self.pg_insights.database_health(&conn).await?,
                 };
                 let mut val = to_json(PgInsightsEngine::health_report_to_response(
                     req_id,
@@ -1447,8 +1542,10 @@ impl DbMcpRuntime {
                 let conn = req_str("connection")?;
                 let _adapter = self.get_authorized_adapter(caller, &conn)?;
                 let top_n = arg_positive_u64(args, "top_n")?.unwrap_or(10) as usize;
-                let workload = match self.mysql_live.get(&conn).and_then(|m| m.live().cloned()) {
-                    Some(live) => match live.analyze_workload(top_n).await? {
+                let mysql_live = self.mysql_live.get(&conn).and_then(|m| m.live().cloned());
+                let workload = match (self.sqlserver.get(&conn).cloned(), mysql_live) {
+                    (Some(live), _) => self.sqlserver_workload(&live, &conn, top_n).await?,
+                    (None, Some(live)) => match live.analyze_workload(top_n).await? {
                         Ok(w) => w,
                         // Missing optional grant: session history, plus a note naming the GRANT.
                         Err(note) => {
@@ -1457,7 +1554,7 @@ impl DbMcpRuntime {
                             w
                         }
                     },
-                    None => self.pg_insights.analyze_workload(&conn, top_n).await?,
+                    (None, None) => self.pg_insights.analyze_workload(&conn, top_n).await?,
                 };
                 let mut val = to_json(PgInsightsEngine::workload_to_response(
                     req_id,
@@ -1495,8 +1592,10 @@ impl DbMcpRuntime {
                         next_action: Some("Remove restricted tables from the workload".to_string()),
                     });
                 }
-                let recs = match self.mysql_live.get(&conn).and_then(|m| m.live().cloned()) {
-                    Some(live) => {
+                let mysql_live = self.mysql_live.get(&conn).and_then(|m| m.live().cloned());
+                let (recs, advice_notes) = match (self.sqlserver.get(&conn).cloned(), mysql_live) {
+                    (Some(live), _) => self.sqlserver_index_advice(&live, &conn, queries, max_recs).await?,
+                    (None, Some(live)) => {
                         // Without explicit queries, prefer the server's statement digests.
                         let mut queries = queries;
                         if queries.is_empty() {
@@ -1510,16 +1609,13 @@ impl DbMcpRuntime {
                             }
                         }
                         let recs = self.pg_insights.recommend_indexes(&conn, queries, max_recs).await?;
-                        live.finish_index_recommendations(recs).await
+                        (live.finish_index_recommendations(recs).await, Vec::new())
                     }
-                    None => self.pg_insights.recommend_indexes(&conn, queries, max_recs).await?,
+                    (None, None) => (self.pg_insights.recommend_indexes(&conn, queries, max_recs).await?, Vec::new()),
                 };
-                let mut val = to_json(PgInsightsEngine::recommendations_to_response(
-                    req_id,
-                    &conn,
-                    "snapshot_indexes",
-                    recs,
-                ))?;
+                let mut resp = PgInsightsEngine::recommendations_to_response(req_id, &conn, "snapshot_indexes", recs);
+                resp.warnings.extend(advice_notes);
+                let mut val = to_json(resp)?;
                 if scrub_restricted(&mut val, &cfg) > 0 {
                     if let Some(rows) = val.get("rows").and_then(|r| r.as_array()).map(|r| r.len()) {
                         val["returned_rows"] = json!(rows);
@@ -2259,6 +2355,31 @@ mod tests {
         assert_eq!(cfg.server_name, "db-mcp");
         assert_eq!(cfg.connections.len(), 3);
         assert_eq!(cfg.named_tools.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sqlserver_connection_is_live_and_fails_closed_when_unreachable() {
+        let toml = "server_name = \"t\"
+[[connections]]
+id = \"ms\"
+engine = \"sqlserver\"
+mode = \"read_only\"
+dsn = \"sqlserver://ro:Secr3tPw@127.0.0.1:1?connectTimeout=2\"
+";
+        let rt = DbMcpRuntime::from_config(ServerConfig::from_toml_str(toml).unwrap()).unwrap();
+        assert!(!rt.is_simulated("ms"));
+        assert!(rt.sqlserver_adapter("ms").is_some());
+        let caller = CallerIdentity::local_agent("t");
+        let list = rt.call_tool("list_connections", json!({}), &caller).await;
+        let entry = &list["data"][0];
+        assert_eq!(entry["backend"], "live");
+        assert_eq!(entry["engine"], "sqlserver");
+        let denied = rt.call_tool("search_objects", json!({"connection": "ms"}), &caller).await;
+        assert_eq!(denied["code"], "CONNECTION_UNAVAILABLE", "{denied}");
+        assert!(!denied.to_string().contains("Secr3tPw"));
+        let init = format!("{toml}init_sql = \"SELECT 1\"
+");
+        assert!(DbMcpRuntime::from_config(ServerConfig::from_toml_str(&init).unwrap()).is_err());
     }
 
     #[tokio::test]

@@ -10,13 +10,22 @@ It combines, in one binary:
 | Lineage and call graphs | `trace_table_dependencies` (FK graph, dependent views/triggers/procedures, shortest join path, Mermaid) and `get_procedure_call_graph` (callers/callees, cycles, table read/write touchpoints, Mermaid) |
 | Bounded SQL | `execute_query`, `explain_query` with timeouts, row and byte limits, parameter binding, multi-statement and mutating-CTE guards, sensitive-column redaction |
 | Declarative tools | `run_named_tool` for curated parameterized SQL defined in config (zero string interpolation) |
-| PostgreSQL intelligence | `database_health`, `analyze_workload`, `recommend_indexes` (heuristic candidates + HypoPG validation when available) |
+| Database intelligence | `database_health`, `analyze_workload`, `recommend_indexes` (heuristic candidates validated by HypoPG, MySQL `EXPLAIN` or SQL Server missing-index DMVs and estimated plans; advisory DDL only) |
 | Governed changes | `propose_change`, `get_change`, `apply_change` with SHA-256 approval binding, separation of duties, replay prevention and schema-drift checks |
 | Schema snapshots | `capture_schema`, `diff_schema` with deterministic `snapshot_<hash>` versions |
 | Governed ontology (v0.2) | `ontology_status`, `discover_ontology`, `search_terms`, `describe_term`, `trace_semantic_relationships`, `propose_semantic_definition`, `plan_semantic_query`, `ask_semantic_question`: certified business terms, metrics and relationships, and natural-language questions compiled into validated SQL only from human-certified definitions |
 | Audit | Structured JSONL + SQLite audit trail for every tool call, denial and admin action, with literal-free SQL fingerprints and secret redaction |
 
-Engines: **SQLite** (native). **PostgreSQL** and **MySQL/MariaDB** connections currently run on a deterministic embedded simulation (no wire-protocol client yet). Every response from those connections carries a warning saying so, so an agent never mistakes simulated output for production data. See `research/findings/capability-matrix.md`.
+Engines:
+- **SQLite**: native.
+- **MySQL 8**: live server over plain TCP (`mysql_async`). A read-only login (`GRANT SELECT, SHOW VIEW`) is enough; every session runs `READ ONLY`.
+- **Microsoft SQL Server** (2016+ for Query Store, any version detected at connect): live server over TDS with optional encryption (`tiberius` + rustls), named instances, SQL logins. A `db_datareader` login is enough; every statement runs inside `BEGIN TRAN ... ROLLBACK`.
+- **PostgreSQL**: deterministic embedded simulation (no wire-protocol client yet). MySQL can also be simulated with `backend = "simulated"`, which the bundled example config uses. Simulated responses always carry a warning, so an agent never mistakes them for production data.
+
+A live connection that cannot be reached fails with `CONNECTION_UNAVAILABLE`. It never falls back to the simulation.
+Check a connection before you point an agent at it: `npx @vinoth_n_3000/db-mcp check-connection --config db-mcp.toml --connection <id>`
+prints server version, permissions, `SELECT 1`, object count and a warning if the account can write. Setup, DSN format and
+grants per feature: [docs/CLIENT-SETUP.md](docs/CLIENT-SETUP.md) ("Connect to MySQL", "Connect to SQL Server").
 
 Transports: **stdio** (local agents) and **Streamable HTTP** JSON-RPC (`POST /mcp`, Bearer auth, `/health`, `/metrics`, `/admin/approve`, `/admin/ontology/review`, `/admin/ontology/publish`).
 
@@ -57,7 +66,7 @@ bundled example config. It never touches your own config, databases or audit log
 ### Option C: Docker (self-hosted HTTP)
 
 ```bash
-docker compose up --build            # db-mcp on :8080 plus disposable Postgres and MySQL
+docker compose up --build            # db-mcp on :8080 with the bundled example config
 curl -s http://127.0.0.1:8080/health
 ```
 

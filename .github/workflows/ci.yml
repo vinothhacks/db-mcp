@@ -69,3 +69,33 @@ jobs:
       - name: Remove the container
         if: always()
         run: bash scripts/live-db-up.sh mysql --down
+
+  live-sqlserver:
+    name: live SQL Server (read-only logins)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build release binary
+        run: cargo build --release -p db-mcp-server
+      - name: Start SQL Server 2022, seed fixture, create read-only logins
+        shell: bash
+        run: |
+          bash scripts/live-db-up.sh mssql > "$RUNNER_TEMP/mssql.env"
+          # Export the DSNs to later steps without echoing them.
+          sed -n "s/^export \([A-Z_]*\)='\(.*\)'$/\1=\2/p" "$RUNNER_TEMP/mssql.env" | while IFS= read -r line; do
+            echo "::add-mask::${line#*=}"
+            echo "$line" >> "$GITHUB_ENV"
+          done
+      - name: Gated Rust integration tests (DB_MCP_MSSQL_TEST_DSN)
+        run: cargo test --release -p db-mcp-sqlserver --test live
+      - name: Feature suite 18 (every tool on a live SQL Server)
+        run: node npm/test/features/18-sqlserver-live.test.js
+      - name: Remove container
+        if: always()
+        run: bash scripts/live-db-up.sh mssql --down

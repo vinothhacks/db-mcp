@@ -129,6 +129,30 @@ CREATE TABLE IF NOT EXISTS notes (
 # allowed_principals = ["*"]
 
 # ---------------------------------------------------------------------------
+# Microsoft SQL Server (live server, SQL login with db_datareader; optional grants
+# VIEW DEFINITION, SHOWPLAN, VIEW DATABASE STATE, VIEW SERVER STATE unlock more diagnostics).
+# DSN: sqlserver://user:pct-encoded-pass@host:port?instance=NAME[&database=DB]
+#      [&encrypt=optional|true|false][&trustServerCertificate=true|false]
+# With a port, DB-MCP connects directly; without one it asks SQL Browser (UDP 1434).
+# Keep the DSN in an environment variable, never in this file. Check it with
+#   db-mcp check-connection --config db-mcp.toml --connection mssql
+# ---------------------------------------------------------------------------
+# [[connections]]
+# id = "mssql"
+# engine = "sqlserver"                      # alias: mssql
+# dsn = "env:MSSQL_URL"
+# mode = "ReadOnly"
+# read_only = true
+# description = "Read-only SQL Server database"
+# timeout_ms = 15000
+# max_rows = 1000
+# max_bytes = 1048576
+# restricted_tables = []
+# sensitive_columns = ["password_hash", "api_key", "secret_token"]
+# allowed_roles = ["*"]
+# allowed_principals = ["*"]
+
+# ---------------------------------------------------------------------------
 # Declarative named tools: curated parameterized SQL the agent can call by name
 # ---------------------------------------------------------------------------
 [[named_tools]]

@@ -210,6 +210,80 @@ cargo test --release -p db-mcp-mysql         # live tests run when DB_MCP_MYSQL_
 bash scripts/live-db-up.sh mysql --down
 ```
 
+## Connect to SQL Server
+
+DB-MCP talks to Microsoft SQL Server directly over TDS (pure-Rust TLS, no ODBC driver needed). The
+server version is detected at connect; Query Store diagnostics need SQL Server 2016 or newer.
+There is no simulated SQL Server backend: an unreachable server or a failed login is reported as
+`CONNECTION_UNAVAILABLE` with `next_action` pointing to `db-mcp check-connection`.
+
+```toml
+[[connections]]
+id = "erp-sql"
+engine = "sqlserver"                 # alias: mssql
+dsn = "env:ERP_SQL_DSN"              # never put the password in the file
+mode = "read_only"
+read_only = true
+default_schema = "dbo"
+restricted_tables = ["internal_secrets"]
+sensitive_columns = ["password_hash"]
+```
+
+```bash
+# Named instance on an explicit port, SQL login, password percent-encoded (@ -> %40, ) -> %29, $ -> %24)
+export ERP_SQL_DSN='sqlserver://ro_user:P%40ss%29w%24rd@10.0.0.5:33333?instance=V2DEMO'
+db-mcp check-connection --config db-mcp.toml --connection erp-sql
+```
+
+DSN shape: `sqlserver://user:password@host[:port][/database][?parameters]`.
+
+| Parameter | Default | Meaning |
+|---|---|---|
+| `instance` | none | Named instance. With an explicit port the client connects to that port directly and the name is informational; without a port it is resolved through the SQL Server Browser (UDP 1434). `host%5CINSTANCE` is accepted too. |
+| `database` (or `/database` path) | the login's default database | Database whose catalog is explored and queried. |
+| `encrypt` | `optional` | `optional`: TLS for the login packet when the server offers it (ODBC `Encrypt=Optional`); `true`: encrypt the whole session and fail without TLS; `disable`: no TLS at all. `strict` (TDS 8.0) is not supported yet. |
+| `trustServerCertificate` | `true` | Accept the server certificate without validation (typical for private networks with self-signed certificates). Set `false` to validate against the OS trust store. |
+| `connectTimeout` | `15` | Seconds for TCP connect plus login. |
+| `applicationName` | `db-mcp` | Shown in `sys.dm_exec_sessions.program_name`. |
+
+`check-connection` prints `{connection, engine, backend, server_version, can_connect, select_1,
+object_count, permissions[], can_write, warnings[]}`. It only reads; it warns when the login can
+write and lists the optional grants that are missing. It never prints the password, and it exits
+non-zero when a live connection cannot be verified.
+
+### Minimum and optional grants
+
+| Feature | Needs |
+|---|---|
+| search/describe tables and views, execute_query, named tools, lineage over foreign keys, schema capture/diff, ontology | `db_datareader` (minimum) |
+| Procedures, functions, triggers and view definitions (call graphs, routine lineage) | `GRANT VIEW DEFINITION TO [user]` |
+| `explain_query` (estimated plans via SHOWPLAN_XML), optimizer missing-index hints | `GRANT SHOWPLAN TO [user]` |
+| `analyze_workload` from Query Store, table sizes | `GRANT VIEW DATABASE STATE TO [user]` |
+| Buffer/PLE counters, connections, blocking, plan-cache workload, missing-index DMVs | `GRANT VIEW SERVER STATE TO [login]` (in `master`) |
+
+Without an optional grant the tool still answers: `database_health` keeps the catalog checks
+(missing primary keys, heaps, duplicate/disabled indexes, unindexed foreign keys, untrusted
+constraints, database options) and adds an Info finding that names the grant; `explain_query`
+returns `UNSUPPORTED_CAPABILITY` with the `GRANT SHOWPLAN` statement; `analyze_workload` reports
+`source: unavailable` (or the statements recorded through DB-MCP) instead of inventing statistics;
+`list_connections` shows the missing grants under `capabilities.unavailable_reasons` after the
+first connect.
+
+### Read-only guarantees
+
+Read-only holds even if one layer fails: the policy engine (ReadOnly mode), the adapter's own read
+guard (re-classifies the T-SQL and refuses writes, `EXEC`, `sp_*`/`xp_*`, `OPENROWSET`/`OPENQUERY`,
+`BULK INSERT`, `DBCC`, `WAITFOR`, `USE`, `SELECT ... INTO` and semicolon-less batches such as
+`SELECT 1 DELETE FROM t`), every statement runs inside `BEGIN TRANSACTION ... ROLLBACK`, and the
+login's own permissions. Timeouts and cancellation close the TDS connection (a read-only login
+cannot `KILL`); the server rolls the open transaction back. `explain_query` never collects actual
+execution plans (`analyze=true` is refused) because they would run the statement. Index advice is
+advisory T-SQL (`CREATE NONCLUSTERED INDEX ... ON dbo.t (...)`); DB-MCP never runs it.
+
+To try it locally with a disposable container: `eval "$(bash scripts/live-db-up.sh mssql)"`
+(seeds `research/fixtures/sqlserver-live`, creates a `db_datareader` login and an extra-grants
+login), then `node npm/test/features/18-sqlserver-live.test.js`.
+
 ## Environment variables
 
 | Variable | Effect |

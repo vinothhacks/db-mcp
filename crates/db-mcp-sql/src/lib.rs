@@ -19,7 +19,7 @@ use sqlparser::ast::{
     BinaryOperator, Cte, Expr, Ident, JoinConstraint, JoinOperator, ObjectName, OrderByExpr, Query,
     Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Visit, Visitor,
 };
-use sqlparser::dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+use sqlparser::dialect::{Dialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 use sqlparser::tokenizer::{Token, Tokenizer};
 
@@ -68,6 +68,11 @@ pub const PRIVILEGED_FUNCTIONS: &[&str] = &[
     "edit",
     // PostgreSQL run-time configuration change (search_path hijack, statement_timeout, ...).
     "set_config",
+    // SQL Server: ad-hoc remote/file access and OS command execution.
+    "openrowset",
+    "opendatasource",
+    "openquery",
+    "xp_cmdshell",
 ];
 
 /// SQLite pragmas that take an argument but only read state (`PRAGMA table_info(users)`).
@@ -323,7 +328,77 @@ fn dialect_for_engine(engine: DatabaseEngine) -> Box<dyn Dialect> {
         DatabaseEngine::Postgres => Box::new(PostgreSqlDialect {}),
         DatabaseEngine::MySql => Box::new(MySqlDialect {}),
         DatabaseEngine::Sqlite => Box::new(SQLiteDialect {}),
+        DatabaseEngine::SqlServer => Box::new(MsSqlDialect {}),
     }
+}
+
+/// T-SQL keywords that change data, schema, session or server state. They are reserved words
+/// in T-SQL, so an unquoted occurrence can never be a column or table name in a genuine read.
+/// SQL Server also runs several statements in one batch without semicolons
+/// (`SELECT 1 DELETE FROM t`), so a token scan backs up the AST classification.
+fn tsql_keyword_class(word: &str, next: Option<&str>) -> Option<(SqlStatementClass, &'static str)> {
+    let class = match word {
+        "exec" | "execute" => (SqlStatementClass::PrivilegeOrAdmin, "TSQL_EXEC"),
+        "openrowset" | "openquery" | "opendatasource" => (SqlStatementClass::PrivilegeOrAdmin, "TSQL_REMOTE_ACCESS"),
+        "bulk" => (SqlStatementClass::PrivilegeOrAdmin, "TSQL_BULK"),
+        "dbcc" => (SqlStatementClass::PrivilegeOrAdmin, "TSQL_DBCC"),
+        "shutdown" | "reconfigure" | "kill" | "checkpoint" => (SqlStatementClass::PrivilegeOrAdmin, "TSQL_SERVER_ADMIN"),
+        "backup" | "restore" => (SqlStatementClass::PrivilegeOrAdmin, "TSQL_BACKUP_RESTORE"),
+        "grant" | "revoke" | "deny" | "setuser" | "revert" => (SqlStatementClass::PrivilegeOrAdmin, "TSQL_PERMISSIONS"),
+        "waitfor" => (SqlStatementClass::PrivilegeOrAdmin, "TSQL_WAITFOR"),
+        // `OPTION (USE HINT (...))` / `USE PLAN` are query hints inside a read.
+        "use" if !matches!(next, Some("hint") | Some("plan")) => (SqlStatementClass::PrivilegeOrAdmin, "TSQL_USE_DATABASE"),
+        "create" | "alter" | "drop" | "truncate" | "enable" | "disable" => (SqlStatementClass::Ddl, "TSQL_DDL"),
+        "insert" | "update" | "delete" | "merge" | "into" | "writetext" | "updatetext" | "send" | "receive" => {
+            (SqlStatementClass::Write, "TSQL_WRITE")
+        }
+        "begin" | "commit" | "rollback" | "save" | "set" | "declare" => (SqlStatementClass::Transaction, "TSQL_SESSION"),
+        _ => return None,
+    };
+    Some(class)
+}
+
+fn tsql_class_rank(class: SqlStatementClass) -> u8 {
+    match class {
+        SqlStatementClass::Read => 0,
+        SqlStatementClass::Transaction => 1,
+        SqlStatementClass::Write => 2,
+        SqlStatementClass::Ddl => 3,
+        SqlStatementClass::PrivilegeOrAdmin => 4,
+        SqlStatementClass::Unknown => 5,
+    }
+}
+
+/// Most severe class implied by unquoted T-SQL keywords in `raw_sql` (`None` for a plain read).
+pub fn tsql_hazard_class(raw_sql: &str) -> Option<(SqlStatementClass, &'static str)> {
+    let dialect = MsSqlDialect {};
+    let Ok(tokens) = Tokenizer::new(&dialect, raw_sql).tokenize() else {
+        return Some((SqlStatementClass::Unknown, "TSQL_UNTOKENIZABLE"));
+    };
+    let words: Vec<String> = tokens
+        .iter()
+        .filter_map(|t| match t {
+            Token::Word(w) if w.quote_style.is_none() => Some(w.value.to_ascii_lowercase()),
+            Token::Whitespace(_) => None,
+            _ => Some(String::new()),
+        })
+        .collect();
+    let mut worst: Option<(SqlStatementClass, &'static str)> = None;
+    for (i, w) in words.iter().enumerate() {
+        if w.is_empty() {
+            continue;
+        }
+        let next = words.get(i + 1).map(String::as_str);
+        // A procedure named first in a batch runs without EXEC (`sp_configure ...`).
+        let leading_procedure = (i == 0 && (w.starts_with("xp_") || w.starts_with("sp_")))
+            .then_some((SqlStatementClass::PrivilegeOrAdmin, "TSQL_SYSTEM_PROCEDURE"));
+        if let Some(found) = leading_procedure.or_else(|| tsql_keyword_class(w, next)) {
+            if worst.map(|(c, _)| tsql_class_rank(found.0) > tsql_class_rank(c)).unwrap_or(true) {
+                worst = Some(found);
+            }
+        }
+    }
+    worst
 }
 
 /// Split a raw SQL batch into individual top-level statement strings using the dialect tokenizer.
@@ -1032,6 +1107,15 @@ fn analyze_ast_statement(
 
     let mut classes = vec![base_class];
     classes.extend(inspector.nested_classes.iter().copied());
+    let mut kind = kind;
+    if engine == DatabaseEngine::SqlServer {
+        if let Some((hazard, hazard_kind)) = tsql_hazard_class(raw_sql) {
+            classes.push(hazard);
+            if base_class == SqlStatementClass::Read {
+                kind = hazard_kind;
+            }
+        }
+    }
     let final_class = combine_statement_classes(
         classes.into_iter(),
         inspector.has_cte_write,
@@ -1046,6 +1130,14 @@ fn analyze_ast_statement(
             ) && !raw_sql.to_ascii_uppercase().contains("CONCURRENTLY")
         }
         DatabaseEngine::MySql => final_class != SqlStatementClass::Ddl,
+        DatabaseEngine::SqlServer => {
+            let upper = raw_sql.to_ascii_uppercase();
+            matches!(
+                final_class,
+                SqlStatementClass::Read | SqlStatementClass::Write | SqlStatementClass::Ddl
+            ) && !upper.contains("DATABASE")
+                && !upper.contains("FULLTEXT")
+        }
     };
 
     let mut disclosure = analyze_statement_disclosure(engine, stmt);
@@ -1137,7 +1229,14 @@ fn analyze_fallback_statement(
         .next()
         .unwrap_or("");
 
-    let (class, kind) = if !priv_fns.is_empty()
+    let tsql_hazard = if engine == DatabaseEngine::SqlServer {
+        tsql_hazard_class(raw_sql)
+    } else {
+        None
+    };
+    let (class, kind) = if let Some((hazard, hazard_kind)) = tsql_hazard {
+        (hazard, hazard_kind)
+    } else if !priv_fns.is_empty()
         || matches!(first_word, "ATTACH" | "DETACH" | "VACUUM" | "COPY" | "GRANT" | "REVOKE")
     {
         (SqlStatementClass::PrivilegeOrAdmin, first_word)
@@ -1449,5 +1548,115 @@ mod tests {
         let unparsed =
             parse_and_analyze_sql(DatabaseEngine::Sqlite, "FOOBAR_VENDOR password_hash WITH MAGIC").unwrap();
         assert_eq!(unparsed.disclosure.opaque_sql.len(), 1);
+    }
+
+    fn tsql(sql: &str) -> SqlAnalysis {
+        parse_and_analyze_sql(DatabaseEngine::SqlServer, sql).unwrap()
+    }
+
+    #[test]
+    fn tsql_reads_parse_with_brackets_top_hints_and_named_params() {
+        for sql in [
+            "SELECT TOP (5) [id], [email] FROM [dbo].[users] WHERE [id] = @P1",
+            "SELECT TOP 10 o.id, u.email FROM dbo.orders o WITH (NOLOCK) JOIN dbo.users u ON u.id = o.user_id ORDER BY o.id",
+            "SELECT COUNT(*) AS n FROM dbo.orders OPTION (RECOMPILE)",
+            "WITH c AS (SELECT id FROM dbo.orders) SELECT id FROM c",
+        ] {
+            let a = tsql(sql);
+            assert_eq!(a.overall_class, SqlStatementClass::Read, "{sql}: {:?}", a.statements[0].statement_kind);
+            assert!(!a.is_multi_statement, "{sql}");
+        }
+        let a = tsql("SELECT [id] FROM [dbo].[users] WHERE [id] = @P1");
+        assert!(a.referenced_tables.iter().any(|t| t == "dbo.users"), "{:?}", a.referenced_tables);
+    }
+
+    #[test]
+    fn tsql_hazards_are_privileged_or_writes() {
+        let privileged = [
+            "EXEC sp_who",
+            "EXECUTE dbo.reserve_inventory 1",
+            "EXEC('DROP TABLE dbo.users')",
+            "EXEC xp_cmdshell 'dir'",
+            "sp_configure 'show advanced options', 1",
+            "SELECT * FROM OPENROWSET('SQLNCLI', 'Server=x;', 'SELECT 1')",
+            "SELECT * FROM OPENQUERY(linked, 'SELECT 1')",
+            "SELECT * FROM OPENDATASOURCE('SQLNCLI', 'Data Source=x').db.dbo.t",
+            "BULK INSERT dbo.users FROM 'c:/x.csv'",
+            "DBCC CHECKDB",
+            "WAITFOR DELAY '00:00:05'",
+            "SHUTDOWN",
+            "BACKUP DATABASE x TO DISK = 'c:/x.bak'",
+            "GRANT SELECT ON dbo.users TO public",
+            "KILL 55",
+        ];
+        for sql in privileged {
+            let a = tsql(sql);
+            assert_eq!(a.overall_class, SqlStatementClass::PrivilegeOrAdmin, "{sql}");
+        }
+        for (sql, class) in [
+            ("SELECT id INTO dbo.copy FROM dbo.users", SqlStatementClass::Write),
+            ("SELECT 1 DELETE FROM dbo.users", SqlStatementClass::Write),
+            ("SELECT 1 AS x UPDATE dbo.users SET email = 'x'", SqlStatementClass::Write),
+            ("INSERT INTO dbo.users (id) VALUES (1)", SqlStatementClass::Write),
+            ("MERGE dbo.inventory AS t USING dbo.x AS s ON t.sku = s.sku WHEN MATCHED THEN DELETE;", SqlStatementClass::Write),
+            ("TRUNCATE TABLE dbo.audit_logs", SqlStatementClass::Ddl),
+            ("SELECT 1 DROP TABLE dbo.users", SqlStatementClass::Ddl),
+            ("ALTER TABLE dbo.users ADD bio nvarchar(100)", SqlStatementClass::Ddl),
+            ("BEGIN TRAN", SqlStatementClass::Transaction),
+            ("SET SHOWPLAN_XML ON", SqlStatementClass::Transaction),
+        ] {
+            let a = tsql(sql);
+            assert!(
+                a.overall_class == class || a.overall_class == SqlStatementClass::Unknown,
+                "{sql}: {:?}",
+                a.overall_class
+            );
+            assert_ne!(a.overall_class, SqlStatementClass::Read, "{sql}");
+        }
+        // Statements sqlparser cannot represent still never classify as a read.
+        for sql in ["USE master", "SELECT o.id FROM dbo.orders o OPTION (USE HINT ('X'))"] {
+            assert_ne!(tsql(sql).overall_class, SqlStatementClass::Read, "{sql}");
+        }
+        // Bracket-quoted identifiers named like keywords are data, not statements.
+        assert_eq!(tsql("SELECT [update], [delete] FROM dbo.flags").overall_class, SqlStatementClass::Read);
+    }
+
+    #[test]
+    fn tsql_mode_fails_closed_on_unclassified_batches() {
+        for sql in ["dbo.reserve_inventory 1", "SELECT 1 GO SELECT 2 FROM"] {
+            let r = analyze_sql_for_mode(DatabaseEngine::SqlServer, sql, OperatingMode::ReadOnly);
+            assert!(r.is_err() || r.unwrap().overall_class != SqlStatementClass::Read, "{sql}");
+        }
+    }
+}
+#[cfg(test)]
+mod tsql_read_coverage {
+    use super::*;
+    #[test]
+    fn common_tsql_reads_classify_as_read() {
+        for sql in [
+            "SELECT u.id, x.n FROM dbo.users u CROSS APPLY (SELECT COUNT(*) AS n FROM dbo.orders o WHERE o.user_id = u.id) x",
+            "SELECT u.id FROM dbo.users u OUTER APPLY (SELECT TOP 1 o.id FROM dbo.orders o WHERE o.user_id = u.id) x",
+            "SELECT id, email FROM dbo.users FOR JSON PATH",
+            "SELECT id FROM dbo.orders ORDER BY id OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY",
+            "SELECT TRY_CAST(total_cents AS decimal(10,2)) FROM dbo.orders",
+            "SELECT IIF(total_cents > 2000, 'big', 'small') FROM dbo.orders",
+            "SELECT DATEADD(day, 1, created_at) FROM dbo.orders",
+            "SELECT STRING_AGG(email, ',') WITHIN GROUP (ORDER BY email) FROM dbo.users",
+            "SELECT id FROM dbo.orders WHERE created_at > GETDATE() - 30",
+            "SELECT CONVERT(varchar(10), created_at, 120) FROM dbo.orders",
+            "SELECT * FROM dbo.orders PIVOT (SUM(total_cents) FOR status IN ([completed], [pending])) p",
+            "SELECT N'unicode' AS s",
+            "SELECT id FROM dbo.orders WITH (NOLOCK) WHERE status = N'completed'",
+            "SELECT ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY created_at) FROM dbo.orders",
+            "SELECT #t.id FROM #t",
+            "SELECT id FROM dbmcp_fixture.dbo.orders",
+        ] {
+            let a = parse_and_analyze_sql(DatabaseEngine::SqlServer, sql).unwrap();
+            assert_eq!(a.overall_class, SqlStatementClass::Read, "{sql}");
+        }
+        // Known gap: sqlparser cannot represent some query hints; they fail closed, never read.
+        let hinted = "WITH r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT n FROM r OPTION (MAXRECURSION 10)";
+        assert_ne!(parse_and_analyze_sql(DatabaseEngine::SqlServer, hinted).unwrap().overall_class, SqlStatementClass::Read);
     }
 }

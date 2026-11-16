@@ -1,0 +1,24 @@
+[package]
+name = "db-mcp-sqlserver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+db-mcp-core.workspace = true
+db-mcp-sql.workspace = true
+db-mcp-catalog.workspace = true
+db-mcp-secrets.workspace = true
+tokio.workspace = true
+tokio-util = { workspace = true, features = ["compat"] }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+regex.workspace = true
+percent-encoding = "2.3"
+quick-xml = "0.37"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "rustls", "sql-browser-tokio", "chrono"] }

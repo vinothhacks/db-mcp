@@ -61,6 +61,7 @@ fn parse_engine_str(raw: &str) -> Result<DatabaseEngine, String> {
         "postgres" | "postgresql" | "pg" => Ok(DatabaseEngine::Postgres),
         "mysql" | "mariadb" => Ok(DatabaseEngine::MySql),
         "sqlite" | "sqlite3" => Ok(DatabaseEngine::Sqlite),
+        "sqlserver" | "mssql" | "sql_server" | "tsql" => Ok(DatabaseEngine::SqlServer),
         other => Err(format!("Unsupported database engine '{other}'")),
     }
 }
@@ -173,8 +174,8 @@ pub struct ConnectionConfig {
     #[serde(default)]
     pub init_sql: Option<String>,
     /// `"live"` (talk to the real server, fail closed when unreachable) or `"simulated"` (embedded
-    /// engine, never contacts a server). Default: live for MySQL, simulated for Postgres, and
-    /// SQLite is always a local database file.
+    /// engine, never contacts a server). Default: live for MySQL and SQL Server, simulated for
+    /// Postgres, and SQLite is always a local database file.
     #[serde(default)]
     pub backend: Option<String>,
 }
@@ -192,7 +193,7 @@ impl ConnectionConfig {
             Some(b) if b == BACKEND_SIMULATED => Some(BACKEND_SIMULATED),
             Some(other) => {
                 return Err(DbMcpError::ConfigurationError(format!(
-                    "Connection '{}': backend '{other}' is not supported (expected \"live\" or \"simulated\")",
+                    "Connection '{}': backend '{other}' is not supported (backend must be \"live\" or \"simulated\")",
                     self.id.trim()
                 )))
             }
@@ -206,6 +207,13 @@ impl ConnectionConfig {
                 ))),
                 _ => Ok(BACKEND_SIMULATED),
             },
+            DatabaseEngine::SqlServer => match explicit {
+                Some(BACKEND_SIMULATED) => Err(DbMcpError::ConfigurationError(format!(
+                    "Connection '{}': SQL Server has no simulated backend; remove backend = \"simulated\"",
+                    self.id.trim()
+                ))),
+                _ => Ok(BACKEND_LIVE),
+            },
             DatabaseEngine::Sqlite => match explicit {
                 Some(BACKEND_SIMULATED) => Err(DbMcpError::ConfigurationError(format!(
                     "Connection '{}': SQLite always opens its local database file; remove backend = \"simulated\"",
@@ -214,6 +222,11 @@ impl ConnectionConfig {
                 _ => Ok(BACKEND_LIVE),
             },
         }
+    }
+
+    /// True when the connection is served by the embedded simulation instead of a live server.
+    pub fn is_simulated_backend(&self) -> bool {
+        matches!(self.effective_backend(), Ok(BACKEND_SIMULATED))
     }
 
     pub fn effective_mode(&self, default_mode: OperatingMode) -> OperatingMode {
@@ -927,6 +940,27 @@ dsn = \"mysql://u:p@127.0.0.1:1/db\"
         let demo = ServerConfig::default_demo();
         let mysql = demo.connections.iter().find(|c| c.engine == DatabaseEngine::MySql).unwrap();
         assert_eq!(mysql.effective_backend().unwrap(), "simulated");
+    }
+
+    #[test]
+    fn backend_and_sqlserver_engine_validation() {
+        assert!(err("backend = \"emulated\"
+").contains("backend must be"));
+        let ss = "server_name = \"t\"
+[[connections]]
+id = \"ms\"
+engine = \"sqlserver\"
+dsn = \"sqlserver://ro:p%40ss@127.0.0.1:1?instance=X\"
+";
+        let cfg = ServerConfig::from_toml_str(ss).unwrap();
+        assert_eq!(cfg.connections[0].engine, DatabaseEngine::SqlServer);
+        let e = ServerConfig::from_toml_str(&format!("{ss}backend = \"simulated\"
+")).unwrap_err().to_string();
+        assert!(e.contains("no simulated backend"), "{e}");
+        let ms = ss.replace("sqlserver\"
+dsn", "mssql\"
+dsn");
+        assert_eq!(ServerConfig::from_toml_str(&ms).unwrap().connections[0].engine, DatabaseEngine::SqlServer);
     }
 
     #[test]
