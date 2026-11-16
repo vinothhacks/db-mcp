@@ -40,6 +40,7 @@ use db_mcp_postgres::{PostgresAdapter, PostgresConfig};
 use db_mcp_secrets::{CompositeSecretProvider, SecretProvider, StaticSecretProvider};
 use db_mcp_sql::{hash_sql, parse_and_analyze_sql};
 use db_mcp_sqlite::{SqliteAdapter, SqliteConfig};
+use db_mcp_sqlserver::{SqlServerAdapter, SqlServerConfig};
 use db_mcp_tools::NamedToolRegistry;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -161,6 +162,8 @@ fn scrub_restricted(value: &mut Value, cfg: &db_mcp_policy::ConnectionPolicyConf
 pub struct DbMcpRuntime {
     config: ServerConfig,
     adapters: BTreeMap<String, Arc<dyn DatabaseAdapter>>,
+    /// Live SQL Server adapters (also in `adapters`), for engine-specific diagnostics.
+    sqlserver: BTreeMap<String, Arc<SqlServerAdapter>>,
     summaries: BTreeMap<String, ConnectionSummary>,
     policy: Arc<PolicyEngine>,
     audit: Arc<dyn AuditSink>,
@@ -345,6 +348,7 @@ impl DbMcpRuntime {
         config.validate()?;
         let secrets = CompositeSecretProvider::with_static_and_env(StaticSecretProvider::new());
         let mut adapters: BTreeMap<String, Arc<dyn DatabaseAdapter>> = BTreeMap::new();
+        let mut sqlserver: BTreeMap<String, Arc<SqlServerAdapter>> = BTreeMap::new();
         let mut summaries = BTreeMap::new();
         let mut policy_configs = Vec::new();
 
@@ -393,10 +397,21 @@ impl DbMcpRuntime {
                     Arc::new(MySqlAdapter::new(cfg)?)
                 }
                 DatabaseEngine::SqlServer => {
-                    return Err(DbMcpError::ConfigurationError(format!(
-                        "Connection '{}': the SQL Server adapter is not available in this build",
-                        conn.id
-                    )));
+                    if conn.init_sql.as_deref().map(str::trim).filter(|s| !s.is_empty()).is_some() {
+                        return Err(DbMcpError::ConfigurationError(format!(
+                            "Connection '{}': init_sql is not supported for live SQL Server connections",
+                            conn.id
+                        )));
+                    }
+                    let read_only = conn.read_only
+                        || conn.effective_mode(config.default_mode) == db_mcp_core::OperatingMode::ReadOnly;
+                    let mut cfg = SqlServerConfig::new(&conn.id, resolved_dsn).with_read_only(read_only);
+                    if let Some(schema) = &conn.default_schema {
+                        cfg = cfg.with_default_schema(schema.clone());
+                    }
+                    let ss = Arc::new(SqlServerAdapter::new(cfg)?);
+                    sqlserver.insert(conn.id.clone(), ss.clone());
+                    ss
                 }
             };
 
@@ -445,6 +460,7 @@ impl DbMcpRuntime {
         Ok(Self {
             config,
             adapters,
+            sqlserver,
             summaries,
             policy,
             audit,
@@ -548,6 +564,11 @@ impl DbMcpRuntime {
             });
         }
         db_mcp_changes::validate_change_statement(&analysis)
+    }
+
+    /// Live SQL Server adapter for a connection id (check-connection and diagnostics).
+    pub fn sqlserver_adapter(&self, connection: &str) -> Option<Arc<SqlServerAdapter>> {
+        self.sqlserver.get(connection).cloned()
     }
 
     /// True when the connection's adapter serves results from an embedded simulation.
@@ -1057,6 +1078,10 @@ impl DbMcpRuntime {
                     .filter(|c| self.policy.authorize_connection(caller, &c.id).is_allowed())
                     .map(|c| {
                         let mut summary: ConnectionSummary = c.clone();
+                        if let Some(live) = self.sqlserver.get(&c.id) {
+                            // Live capabilities include the grants detected at first connect.
+                            summary.capabilities = live.capabilities();
+                        }
                         let simulated = self.is_simulated(&c.id);
                         if simulated {
                             // An embedded simulation cannot interrupt statements or run real ANALYZE plans.
@@ -1065,6 +1090,7 @@ impl DbMcpRuntime {
                         }
                         let mut entry = serde_json::to_value(&summary).unwrap_or_else(|_| json!({}));
                         entry["simulated"] = json!(simulated);
+                        entry["backend"] = json!(if simulated { "simulated" } else { "live" });
                         if simulated {
                             entry["warnings"] = json!([format!(
                                 "connection '{}' is served by the embedded simulated {} engine (no external server is queried; results are illustrative)",
@@ -2173,6 +2199,31 @@ mod tests {
         assert_eq!(cfg.server_name, "db-mcp");
         assert_eq!(cfg.connections.len(), 3);
         assert_eq!(cfg.named_tools.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sqlserver_connection_is_live_and_fails_closed_when_unreachable() {
+        let toml = "server_name = \"t\"
+[[connections]]
+id = \"ms\"
+engine = \"sqlserver\"
+mode = \"read_only\"
+dsn = \"sqlserver://ro:Secr3tPw@127.0.0.1:1?connectTimeout=2\"
+";
+        let rt = DbMcpRuntime::from_config(ServerConfig::from_toml_str(toml).unwrap()).unwrap();
+        assert!(!rt.is_simulated("ms"));
+        assert!(rt.sqlserver_adapter("ms").is_some());
+        let caller = CallerIdentity::local_agent("t");
+        let list = rt.call_tool("list_connections", json!({}), &caller).await;
+        let entry = &list["data"][0];
+        assert_eq!(entry["backend"], "live");
+        assert_eq!(entry["engine"], "sqlserver");
+        let denied = rt.call_tool("search_objects", json!({"connection": "ms"}), &caller).await;
+        assert_eq!(denied["code"], "CONNECTION_UNAVAILABLE", "{denied}");
+        assert!(!denied.to_string().contains("Secr3tPw"));
+        let init = format!("{toml}init_sql = \"SELECT 1\"
+");
+        assert!(DbMcpRuntime::from_config(ServerConfig::from_toml_str(&init).unwrap()).is_err());
     }
 
     #[tokio::test]

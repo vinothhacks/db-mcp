@@ -16,6 +16,7 @@ db-mcp-tools.workspace = true
 db-mcp-sqlite.workspace = true
 db-mcp-postgres.workspace = true
 db-mcp-mysql.workspace = true
+db-mcp-sqlserver.workspace = true
 db-mcp-pg-insights.workspace = true
 db-mcp-changes.workspace = true
 db-mcp-ontology.workspace = true

@@ -62,6 +62,15 @@ pub enum Commands {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Read-only connection smoke test: connect, server version, permissions, SELECT 1, catalog
+    /// object count, and a warning when the account can write. Never prints credentials.
+    CheckConnection {
+        #[arg(long)]
+        config: PathBuf,
+        /// Check only this connection id (default: every connection).
+        #[arg(long)]
+        connection: Option<String>,
+    },
     /// Verify the hash chains of the configured JSONL and SQLite audit trails (non-zero exit on tamper).
     VerifyAudit {
         #[arg(long)]
@@ -495,6 +504,67 @@ fn verify_audit_stores(cfg: &ServerConfig) -> (bool, Vec<Value>) {
     (all_ok, results)
 }
 
+/// One `check-connection` report: `{connection, engine, backend, server_version, can_connect,
+/// select_1, object_count, permissions[], can_write, warnings[]}`. The bool is false when a
+/// live connection could not be verified.
+async fn check_connection_report(conn: &db_mcp_mcp::ConnectionConfig) -> (Value, bool) {
+    let simulated = conn.is_simulated_backend()
+        || matches!(conn.engine, db_mcp_core::DatabaseEngine::Sqlite | db_mcp_core::DatabaseEngine::Postgres | db_mcp_core::DatabaseEngine::MySql)
+            && conn.backend.as_deref().map(|b| !b.eq_ignore_ascii_case("live")).unwrap_or(true);
+    let mut report = json!({
+        "connection": conn.id,
+        "engine": conn.engine.as_str(),
+        "backend": if simulated { "simulated" } else { "live" },
+        "server_version": Value::Null,
+        "can_connect": false,
+        "select_1": false,
+        "object_count": Value::Null,
+        "permissions": [],
+        "can_write": false,
+        "warnings": [],
+    });
+    if conn.engine == db_mcp_core::DatabaseEngine::SqlServer {
+        return check_sqlserver_connection(conn, report).await;
+    }
+    if simulated {
+        report["warnings"] = json!(["simulated backend: no external server to check"]);
+        return (report, true);
+    }
+    report["warnings"] = json!([format!("live check for engine '{}' is not available in this build", conn.engine.as_str())]);
+    (report, false)
+}
+
+async fn check_sqlserver_connection(conn: &db_mcp_mcp::ConnectionConfig, mut report: Value) -> (Value, bool) {
+    let secrets = db_mcp_secrets::CompositeSecretProvider::with_static_and_env(db_mcp_secrets::StaticSecretProvider::new());
+    let adapter = match conn
+        .resolve_dsn(&secrets)
+        .and_then(|dsn| db_mcp_sqlserver::SqlServerAdapter::new(db_mcp_sqlserver::SqlServerConfig::new(&conn.id, dsn)))
+    {
+        Ok(a) => a,
+        Err(e) => {
+            report["warnings"] = json!([e.to_string()]);
+            report["error_code"] = json!(e.code());
+            return (report, false);
+        }
+    };
+    let c = adapter.check_connection().await;
+    report["target"] = json!(c.target);
+    report["server_version"] = json!(c.server_version);
+    report["database"] = json!(c.database);
+    report["login"] = json!(c.login);
+    report["can_connect"] = json!(c.can_connect);
+    report["select_1"] = json!(c.select_1);
+    report["object_count"] = json!(c.object_count);
+    report["permissions"] = json!(c.permissions);
+    report["can_write"] = json!(c.can_write);
+    report["warnings"] = json!(c.warnings);
+    if let Some(code) = &c.error_code {
+        report["error_code"] = json!(code);
+        report["next_action"] = json!("check host, port, instance, login and password (env:/file: DSN reference), then retry");
+    }
+    (report, c.can_connect && c.select_1)
+}
+
 async fn run_stdio_loop(handler: McpProtocolHandler, caller: CallerIdentity) -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
@@ -583,6 +653,38 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 "active_profiles": parsed.active_profiles,
             });
             println!("{}", serde_json::to_string_pretty(&summary)?);
+            Ok(())
+        }
+        Commands::CheckConnection { config, connection } => {
+            let parsed = ServerConfig::from_file(&config)?;
+            let selected: Vec<_> = parsed
+                .connections
+                .iter()
+                .filter(|c| connection.as_deref().map(|id| c.id == id).unwrap_or(true))
+                .collect();
+            if selected.is_empty() {
+                anyhow::bail!(
+                    "connection '{}' is not defined in {}",
+                    connection.unwrap_or_default(),
+                    config.display()
+                );
+            }
+            let mut results = Vec::new();
+            let mut all_ok = true;
+            for conn in selected {
+                let (report, ok) = check_connection_report(conn).await;
+                all_ok &= ok;
+                results.push(report);
+            }
+            let out = if connection.is_some() && results.len() == 1 {
+                results.remove(0)
+            } else {
+                Value::Array(results)
+            };
+            println!("{}", serde_json::to_string_pretty(&out)?);
+            if !all_ok {
+                std::process::exit(3);
+            }
             Ok(())
         }
         Commands::VerifyAudit { config } => {

@@ -173,9 +173,20 @@ pub struct ConnectionConfig {
     pub allowed_principals: Vec<String>,
     #[serde(default)]
     pub init_sql: Option<String>,
+    /// `live` (default for MySQL and SQL Server) or `simulated` (embedded engine, no server).
+    #[serde(default)]
+    pub backend: Option<String>,
 }
 
 impl ConnectionConfig {
+    /// True when the connection is served by the embedded simulation instead of a live server.
+    pub fn is_simulated_backend(&self) -> bool {
+        self.backend
+            .as_deref()
+            .map(|b| b.trim().eq_ignore_ascii_case("simulated"))
+            .unwrap_or(false)
+    }
+
     pub fn effective_mode(&self, default_mode: OperatingMode) -> OperatingMode {
         self.mode.unwrap_or(default_mode)
     }
@@ -536,6 +547,7 @@ impl ServerConfig {
                     allowed_roles: default_wildcard_vec(),
                     allowed_principals: default_wildcard_vec(),
                     init_sql: Some(DEMO_SEED_SQL.to_string()),
+                    backend: None,
                 },
                 ConnectionConfig {
                     id: "prod-postgres".to_string(),
@@ -569,6 +581,7 @@ impl ServerConfig {
                     ],
                     allowed_principals: default_wildcard_vec(),
                     init_sql: Some(DEMO_SEED_SQL.to_string()),
+                    backend: None,
                 },
                 ConnectionConfig {
                     id: "analytics-mysql".to_string(),
@@ -597,6 +610,7 @@ impl ServerConfig {
                     allowed_roles: default_wildcard_vec(),
                     allowed_principals: default_wildcard_vec(),
                     init_sql: Some(DEMO_SEED_SQL.to_string()),
+                    backend: None,
                 },
             ],
             named_tools: vec![
@@ -743,6 +757,18 @@ impl ServerConfig {
                     "Connection '{trimmed}' has an empty dsn"
                 )));
             }
+            if let Some(b) = conn.backend.as_deref() {
+                if !matches!(b.trim().to_ascii_lowercase().as_str(), "live" | "simulated") {
+                    return Err(DbMcpError::ConfigurationError(format!(
+                        "Connection '{trimmed}' backend must be \"live\" or \"simulated\""
+                    )));
+                }
+            }
+            if conn.engine == DatabaseEngine::SqlServer && conn.is_simulated_backend() {
+                return Err(DbMcpError::ConfigurationError(format!(
+                    "Connection '{trimmed}': SQL Server has no simulated backend; remove backend = \"simulated\""
+                )));
+            }
             if conn.timeout_ms == 0 || conn.max_rows == 0 || conn.max_bytes == 0 {
                 return Err(DbMcpError::InvalidArgument(format!(
                     "Connection '{trimmed}' limits must be greater than zero"
@@ -853,6 +879,29 @@ mod tests {
         assert!(err("[http]\nbind = \"not-an-addr\"\n").contains("http.bind"));
         assert!(err("[http]\nbind = \"host:99999\"\n").contains("http.bind"));
         ServerConfig::from_toml_str(&format!("{BASE}[http]\nbind = \"localhost:9000\"\n")).unwrap();
+    }
+
+    #[test]
+    fn backend_and_sqlserver_engine_validation() {
+        assert!(err("backend = \"emulated\"
+").contains("backend must be"));
+        ServerConfig::from_toml_str(&format!("{BASE}backend = \"simulated\"
+")).unwrap();
+        let ss = "server_name = \"t\"
+[[connections]]
+id = \"ms\"
+engine = \"sqlserver\"
+dsn = \"sqlserver://ro:p%40ss@127.0.0.1:1?instance=X\"
+";
+        let cfg = ServerConfig::from_toml_str(ss).unwrap();
+        assert_eq!(cfg.connections[0].engine, DatabaseEngine::SqlServer);
+        let e = ServerConfig::from_toml_str(&format!("{ss}backend = \"simulated\"
+")).unwrap_err().to_string();
+        assert!(e.contains("no simulated backend"), "{e}");
+        let ms = ss.replace("sqlserver\"
+dsn", "mssql\"
+dsn");
+        assert_eq!(ServerConfig::from_toml_str(&ms).unwrap().connections[0].engine, DatabaseEngine::SqlServer);
     }
 
     #[test]
