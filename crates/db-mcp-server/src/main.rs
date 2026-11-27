@@ -65,6 +65,8 @@ pub enum Commands {
         #[arg(long)]
         live: bool,
     },
+    /// Test the bundled SQLite engine and query path using an in-memory fixture.
+    Selftest,
     /// Read-only smoke test of configured connections: connect, server version, permissions,
     /// `SELECT 1`, catalog object count, and a warning when the account can write.
     /// Prints JSON; exits non-zero when a connection cannot be reached.
@@ -639,6 +641,22 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             if !all_ok {
                 std::process::exit(3);
             }
+            Ok(())
+        }
+        Commands::Selftest => {
+            let mut config = ServerConfig::default_demo();
+            config.connections.retain(|connection| connection.id == "local-sqlite");
+            config.named_tools.clear();
+            let handler = McpProtocolHandler::from_config(config)?;
+            let result = handler
+                .call_tool(
+                    "execute_query",
+                    json!({ "connection": "local-sqlite", "sql": "SELECT 1 AS selftest_value" }),
+                    &CallerIdentity::local_agent("selftest"),
+                )
+                .await;
+            anyhow::ensure!(result["status"].as_str() == Some("ok"), "SQLite selftest failed: {result}");
+            println!("DB MCP selftest passed (in-memory SQLite query).");
             Ok(())
         }
         Commands::VerifyConfig { config, live } => {

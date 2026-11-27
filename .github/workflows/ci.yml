@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -29,17 +32,26 @@ jobs:
         shell: bash
         run: cargo fmt --all -- --check || echo "::warning::rustfmt differences found"
       - name: Build release binary
-        run: cargo build --release -p db-mcp-server
+        run: cargo build --locked --release -p db-mcp-server
+      - name: Check native release commands
+        shell: bash
+        run: |
+          target/release/db-mcp-server selftest
+          target/release/db-mcp-server verify-config --config config/db-mcp.example.toml
       - name: Rust unit, contract, security and integration tests
-        run: cargo test --workspace --release
+        run: cargo test --locked --workspace --release
       - name: Node end-to-end tests (stdio + HTTP + CLI approval)
         run: npm test
       - name: Feature matrix smoke test
         run: npm run verify:features
-      - name: Per-feature verification suites (known-bug checks allowed to fail)
-        continue-on-error: true
+      - name: Per-feature verification suites
         shell: bash
-        run: for f in npm/test/features/*.test.js; do echo "== $f"; node "$f" || true; done
+        run: |
+          set -euo pipefail
+          for file in npm/test/features/*.test.js; do
+            printf '== %s\n' "$file"
+            node "$file"
+          done
       - name: npm pack dry run
         run: npm pack --dry-run
 

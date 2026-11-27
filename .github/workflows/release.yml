@@ -10,11 +10,12 @@ on:
         required: true
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   BIN: db-mcp-server
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   build:
@@ -33,9 +34,13 @@ jobs:
           - { os: macos-latest,     target: aarch64-apple-darwin,      archive: tar.gz }
           - { os: windows-latest,   target: x86_64-pc-windows-msvc,    archive: zip }
     steps:
+      - name: Validate release tag
+        shell: bash
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9][A-Za-z0-9.-]*)?$ ]]
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: refs/tags/${{ env.RELEASE_TAG }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -47,8 +52,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          NAME="${BIN}-${TAG}-${{ matrix.target }}"
+          NAME="${BIN}-${RELEASE_TAG}-${{ matrix.target }}"
           mkdir -p "dist/${NAME}"
           cp "target/${{ matrix.target }}/release/${BIN}" "dist/${NAME}/"
           cp README.md LICENSE-MIT LICENSE-APACHE config/db-mcp.example.toml "dist/${NAME}/"
@@ -58,7 +62,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $Tag = "${{ github.event.inputs.tag || github.ref_name }}"
+          $Tag = $env:RELEASE_TAG
           $Name = "$env:BIN-$Tag-${{ matrix.target }}"
           New-Item -ItemType Directory -Force "dist/$Name" | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/$env:BIN.exe" "dist/$Name/"
@@ -78,6 +82,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -86,6 +92,6 @@ jobs:
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
           files: artifacts/*
           generate_release_notes: true
