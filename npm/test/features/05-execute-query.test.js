@@ -261,19 +261,11 @@ async function sectionParams(c) {
     assert.ok(m.result, JSON.stringify(m.error));
     assert.match(m.result.content[0].text, /"rows":\[\[9223372036854775807,"integer"\]\]/);
   });
-  // KNOWN-BUG: F05-B6 - u64 values above i64::MAX wrap to negative (sqlite adapter `u as i64`).
-  await check("1.12 integer parameter above i64::MAX is not silently wrapped to a negative number", async () => {
+  await check("1.12 integer parameter above i64::MAX is rejected", async () => {
     const m = await rawCall(c, 9102, '{"connection":"local-sqlite","sql":"SELECT ?1 AS p, typeof(?1) AS t","params":[18446744073709551615]}');
     assert.ok(m.result, JSON.stringify(m.error));
-    const text = m.result.content[0].text;
-    const sc = m.result.structuredContent;
-    if (sc.status === "ok") {
-      assert.ok(!/"rows":\[\[-1,/.test(text), `u64::MAX bound as -1: ${text.slice(0, 200)}`);
-      assert.ok(!/"rows":\[\[-9223372036854775808,/.test(text), "wrapped to i64::MIN");
-    } else {
-      denied(sc, ["INVALID_ARGUMENT", "ADAPTER_ERROR"]);
-    }
-  }, "F05-B6");
+    denied(m.result.structuredContent, ["INVALID_ARGUMENT"]);
+  });
   await check("1.13 out-of-range numeric literal (1e400) -> JSON-RPC -32700 and server stays alive", async () => {
     const m = await rawCall(c, 9103, '{"connection":"local-sqlite","sql":"SELECT ?1 AS p","params":[1e400]}');
     assert.ok(m.error, "expected a JSON-RPC error");
