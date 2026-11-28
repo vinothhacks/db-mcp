@@ -278,12 +278,11 @@ async function sectionParams(c) {
     okEnvelope(p);
     assert.deepEqual(p.rows, [[1, "alice@example.com"]]);
   });
-  // KNOWN-BUG: F05-B7 - embedded PG engine binds $n by order of appearance, not by number.
   await check("1.15 prod-postgres: $2 before $1 still binds by number", async () => {
     const { payload: p } = await eq(c, { connection: P, sql: "SELECT id FROM users WHERE id = $2 OR email = $1 ORDER BY id", params: ["bob@example.com", 1] });
     okEnvelope(p);
     assert.deepEqual(p.rows, [[1], [2]]);
-  }, "F05-B7");
+  });
   await check("1.16 prod-postgres: wrong $n count -> clear denial", async () => {
     const { payload: p } = await eq(c, { connection: P, sql: "SELECT id FROM users WHERE id = $1 AND role = $2", params: [1] });
     denied(p, ["ADAPTER_ERROR", "INVALID_ARGUMENT"]);
@@ -460,19 +459,16 @@ async function sectionCancellation(config) {
   const origWrite = c.child.stdin.write.bind(c.child.stdin);
   c.child.stdin.write = (s, ...rest) => { try { const m = JSON.parse(s); if (m.id !== undefined) lastId = m.id; } catch { /* ignore */ } return origWrite(s, ...rest); };
 
-  // KNOWN-BUG: F05-B3 - stdio loop is sequential and cancel handler keys on the internal req_<uuid> id.
   await check("4.01 notifications/cancelled (MCP requestId) aborts a running query -> EXECUTION_CANCELLED", async () => {
     const t0 = Date.now();
     const pending = c.rpc("tools/call", { name: "execute_query", arguments: { connection: L, sql: SLOW_1S } });
     const id = lastId;
     await new Promise((r) => setTimeout(r, 120));
     c.notify("notifications/cancelled", { requestId: id, reason: "test" });
-    c.notify("notifications/cancelled", { requestId: String(id), reason: "test" });
     const resp = await pending;
     const p = resp.result.structuredContent;
     denied(p, "EXECUTION_CANCELLED", `(query finished in ${Date.now() - t0}ms with status ${p.status})`);
-  }, "F05-B3");
-  // KNOWN-BUG: F05-B3
+  });
   await check("4.02 explicit `cancel` request while a query runs reports cancelled=true", async () => {
     const pending = c.rpc("tools/call", { name: "execute_query", arguments: { connection: L, sql: SLOW_1S } });
     const id = lastId;
@@ -481,7 +477,7 @@ async function sectionCancellation(config) {
     await pending;
     const r = (await cancelResp).result;
     assert.equal(r && r.cancelled, true, `cancel returned ${JSON.stringify(r)}`);
-  }, "F05-B3");
+  });
   await check("4.03 client stays usable after cancellation attempts", async () => {
     const { payload: p } = await eq(c, { connection: L, sql: "SELECT 1 AS ok" });
     okEnvelope(p);
@@ -621,13 +617,12 @@ async function sectionModes(c) {
     const sel = await eq(c, { connection: L, sql: "SELECT email FROM users WHERE id = 3" });
     assert.deepEqual(sel.payload.rows, [["carol@example.com"]]);
   });
-  // KNOWN-BUG: F05-B5 - QueryResult.rows_affected is dropped by McpSuccessResponse::from_query_result.
   await check("6.02 Development: UPDATE reports the number of affected rows in the envelope", async () => {
     const { payload: p } = await eq(c, { connection: L, sql: "UPDATE users SET role = 'customer' WHERE id IN (2, 3)" });
     okEnvelope(p);
     const affected = p.rows_affected ?? p.affected_rows ?? (p.data && (p.data.rows_affected ?? p.data.affected_rows));
     assert.equal(affected, 2, `no affected-row count in envelope keys [${Object.keys(p)}]`);
-  }, "F05-B5");
+  });
   await check("6.03 Development: DELETE executes and persists", async () => {
     okEnvelope((await eq(c, { connection: L, sql: "DELETE FROM users WHERE id = 3" })).payload);
     const sel = await eq(c, { connection: L, sql: "SELECT count(*) AS n FROM users WHERE id = 3" });

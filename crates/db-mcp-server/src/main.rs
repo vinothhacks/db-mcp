@@ -1,5 +1,7 @@
 //! DB-MCP server binary entrypoint supporting stdio, Streamable HTTP, and out-of-band admin approvals.
 
+use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -559,35 +561,97 @@ async fn check_sqlserver_connection(conn: &db_mcp_mcp::ConnectionConfig, mut rep
 }
 
 async fn run_stdio_loop(handler: McpProtocolHandler, caller: CallerIdentity) -> anyhow::Result<()> {
-    let stdin = tokio::io::stdin();
+    let mut reader = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
-    let mut reader = BufReader::new(stdin);
-    let mut buf: Vec<u8> = Vec::new();
+    let mut incoming = Vec::new();
+    let mut pending: VecDeque<Vec<u8>> = VecDeque::new();
+    let mut eof = false;
 
     loop {
-        buf.clear();
-        // Read raw bytes so an invalid UTF-8 line cannot abort the loop; stop only on EOF.
-        if reader.read_until(b'\n', &mut buf).await? == 0 {
-            break;
-        }
-        let response_json = match std::str::from_utf8(&buf) {
-            Ok(line) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
+        let line = match pending.pop_front() {
+            Some(line) => line,
+            None => {
+                if !eof {
+                    eof = reader.read_until(b'\n', &mut incoming).await? == 0;
                 }
-                match handler.handle_jsonrpc_line(trimmed, &caller).await {
-                    Some(r) => r,
-                    None => continue,
+                if incoming.is_empty() {
+                    break;
+                }
+                std::mem::take(&mut incoming)
+            }
+        };
+        let line = match std::str::from_utf8(&line) {
+            Ok(line) if line.trim().is_empty() => continue,
+            Ok(line) => line.trim(),
+            Err(e) => {
+                let response = json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": { "code": -32700, "message": format!("Parse error: invalid UTF-8: {e}") }
+                });
+                write_stdio_response(&mut stdout, Some(response.to_string())).await?;
+                continue;
+            }
+        };
+        let request_id = format!("req_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
+        let response =
+            handler.handle_jsonrpc_line_with_tool_id(line, &caller, Some(request_id.clone()));
+        tokio::pin!(response);
+
+        // Execute ordinary requests in input order, but process cancellations while a tool is
+        // running. Bound the number of queued messages so the sender sees backpressure.
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut response => {
+                    write_stdio_response(&mut stdout, result).await?;
+                    break;
+                }
+                read = reader.read_until(b'\n', &mut incoming), if !eof && pending.len() < 64 => {
+                    eof = read? == 0;
+                    if incoming.is_empty() {
+                        continue;
+                    }
+                    if let Some(cancel) = stdio_cancellation(&incoming, line, &request_id) {
+                        let result = handler.handle_jsonrpc_line(&cancel.to_string(), &caller).await;
+                        write_stdio_response(&mut stdout, result).await?;
+                        incoming.clear();
+                    } else {
+                        pending.push_back(std::mem::take(&mut incoming));
+                    }
                 }
             }
-            Err(e) => serde_json::to_string(&json!({
-                "jsonrpc": "2.0",
-                "id": null,
-                "error": { "code": -32700, "message": format!("Parse error: invalid UTF-8: {e}") }
-            }))?,
-        };
-        stdout.write_all(response_json.as_bytes()).await?;
+        }
+    }
+    Ok(())
+}
+
+fn stdio_cancellation(incoming: &[u8], active_line: &str, active_request_id: &str) -> Option<Value> {
+    let mut request: Value = serde_json::from_slice(incoming).ok()?;
+    if !matches!(request.get("method")?.as_str()?, "cancel" | "notifications/cancelled") {
+        return None;
+    }
+    let active: Value = serde_json::from_str(active_line).ok()?;
+    if active.get("method").and_then(Value::as_str) != Some("tools/call") {
+        return None;
+    }
+    let params = request.get_mut("params")?.as_object_mut()?;
+    let target = params.get("requestId").or_else(|| params.get("request_id"))?;
+    let id = active.get("id").filter(|id| id.is_number() || id.is_string())?;
+    // The explicit cancel method historically accepted a string ID.
+    if target != id && !(id.is_number() && target.as_str() == Some(id.to_string().as_str())) {
+        return None;
+    }
+    params.insert("requestId".to_string(), json!(active_request_id));
+    Some(request)
+}
+
+async fn write_stdio_response(
+    stdout: &mut tokio::io::Stdout,
+    response: Option<String>,
+) -> anyhow::Result<()> {
+    if let Some(response) = response {
+        stdout.write_all(response.as_bytes()).await?;
         stdout.write_all(b"\n").await?;
         stdout.flush().await?;
     }
@@ -770,7 +834,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 "http" => {
                     let expected_auth_token = resolve_optional_token(auth_token_ref.as_deref())?;
                     let expected_admin_token = resolve_optional_token(admin_token_ref.as_deref())?;
+                    let addresses: Vec<SocketAddr> = tokio::net::lookup_host(&bind_addr).await?.collect();
                     if expected_auth_token.is_none() {
+                        anyhow::ensure!(
+                            addresses.iter().all(|addr| addr.ip().is_loopback()),
+                            "http.auth_token is required for a non-loopback bind address"
+                        );
                         eprintln!("[db-mcp] WARNING: no http.auth_token configured; POST /mcp is unauthenticated");
                     }
                     let state = HttpAppState {
@@ -780,7 +849,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         expected_admin_token,
                     };
                     let app = build_http_router(state);
-                    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+                    let listener = tokio::net::TcpListener::bind(addresses.as_slice()).await?;
                     axum::serve(listener, app).await?;
                     Ok(())
                 }

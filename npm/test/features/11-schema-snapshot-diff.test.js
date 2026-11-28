@@ -267,10 +267,10 @@ async function main() {
 
   // Contract CONTRACT-SCHEMA-CAPTURE-AND-DIFF (research/contracts/tool-contracts.json) expects a one-row summary.
   await check("capture_schema: contract summary row columns [schema_version, table_count, index_count, captured_at] with returned_rows=1", () => {
-    assert.deepEqual(a0.columns, ["schema_version", "table_count", "index_count", "captured_at"]);
+    assert.deepEqual(a0.columns.map((column) => column.name), ["schema_version", "table_count", "index_count", "captured_at"]);
     assert.equal(a0.returned_rows, 1);
     assert.equal(a0.rows.length, 1);
-  }, "F11-07"); // KNOWN-BUG: F11-07 with_data() always emits columns=[] rows=[] returned_rows=0 (core lib.rs with_data)
+  });
 
   await check("snapshot content: object inventory of the fixture (5 visible tables, restricted internal_secrets excluded, 1 view, 3 procedures, 1 function) all grouped under schema 'main' in canonical order", () => {
     const objs = a0.data.objects;
@@ -365,7 +365,7 @@ async function main() {
     assert.equal(r.data.objects.length, 0);
     assert.match(r.schema_version, SNAPSHOT_RE);
     assert.ok(r.warnings.length > 0, "expected a warning explaining that schema_pattern matched no objects");
-  }, "F11-08"); // KNOWN-BUG: F11-08 no warning; an empty snapshot silently diffs as 'everything dropped'
+  });
 
   // ------------------------------------------------------------------ 3. diff combinations (no mutation yet)
   const b0 = await cap("sqlite-b");
@@ -428,7 +428,7 @@ async function main() {
     const r0 = await diff({});
     assertDenied(r0, "INVALID_ARGUMENT", "no args");
     assert.equal(typeof r0.next_action, "string", `next_action missing: ${JSON.stringify(r0)}`);
-  }, "F11-11"); // KNOWN-BUG: F11-11 DbMcpError::InvalidArgument maps to next_action=None (core lib.rs to_denied_response)
+  });
 
   await check("diff_schema: malformed snapshots ({}, string, number, unknown engine) -> clean INVALID_ARGUMENT denial, server stays alive", async () => {
     const bad = [

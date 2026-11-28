@@ -663,6 +663,8 @@ pub struct McpSuccessResponse<T = serde_json::Value> {
     pub warnings: Vec<String>,
     pub schema_version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows_affected: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub execution_time_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<T>,
@@ -691,6 +693,7 @@ impl<T> McpSuccessResponse<T> {
             truncated: result.truncated,
             warnings: result.warnings,
             schema_version,
+            rows_affected: result.rows_affected,
             execution_time_ms: Some(result.execution_time_ms),
             data: None,
             _meta: untrusted_meta_json(&conn, "query_rows"),
@@ -715,6 +718,7 @@ impl<T> McpSuccessResponse<T> {
             truncated: false,
             warnings: Vec::new(),
             schema_version: schema_version.into(),
+            rows_affected: None,
             execution_time_ms: None,
             data: Some(data),
             _meta: untrusted_meta_json(&conn, source_kind),

@@ -33,8 +33,9 @@ use db_mcp_core::{
 use db_mcp_secrets::{redact_dsn, redact_sensitive_text, SecretString};
 use db_mcp_sql::{parse_and_analyze_sql, split_sql_statements, PredicateOperator};
 use regex::Regex;
+use rusqlite::fallible_iterator::FallibleIterator;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
-use rusqlite::{params_from_iter, Connection};
+use rusqlite::{Batch, Connection};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -954,7 +955,7 @@ fn find_routine_ddl_end(sql: &str, after_open_paren: usize) -> usize {
     len
 }
 
-/// Rewrite PostgreSQL-specific schema qualifications (e.g. `public.table`), `$1` parameter placeholders,
+/// Rewrite PostgreSQL-specific schema qualifications (e.g. `public.table`)
 /// and `CREATE [OR REPLACE] PROCEDURE/FUNCTION` DDL so they execute identically on the embedded SQLite engine.
 fn rewrite_pg_sql_for_embedded(sql: &str, default_schema: &str) -> String {
     let header_re = Regex::new(
@@ -1466,6 +1467,13 @@ impl DatabaseAdapter for PostgresAdapter {
             }
         }
 
+        if analysis.is_multi_statement && !request.params.is_empty() {
+            return Err(DbMcpError::InvalidArgument(
+                "Bound parameters are not supported in a multi-statement batch; send one statement per call"
+                    .to_string(),
+            ));
+        }
+
         let pid = self
             .active_pids
             .entry(exec_id.clone())
@@ -1476,7 +1484,6 @@ impl DatabaseAdapter for PostgresAdapter {
 
         let conn_arc = Arc::clone(&self.engine_conn);
         let default_schema = self.config.default_schema.clone();
-        let active_pids = Arc::clone(&self.active_pids);
         let cancelled_map = Arc::clone(&self.cancelled_executions);
 
         let res = tokio::task::spawn_blocking(move || {
@@ -1486,7 +1493,6 @@ impl DatabaseAdapter for PostgresAdapter {
             })?;
 
             if cancelled_map.contains_key(&request.execution_id) {
-                active_pids.remove(&request.execution_id);
                 return Err(DbMcpError::ExecutionCancelled(format!(
                     "PostgreSQL execution '{}' cancelled",
                     request.execution_id
@@ -1502,25 +1508,75 @@ impl DatabaseAdapter for PostgresAdapter {
             };
             let max_bytes = request.max_bytes;
 
-            let mut stmt = guard.prepare(&rewritten_sql).map_err(|e| {
-                DbMcpError::AdapterError(redact_sensitive_text(&e.to_string()))
-            })?;
-            let col_count = stmt.column_count();
-
-            let outcome = if col_count > 0 {
-                let mut columns: Vec<ColumnMetadata> = stmt
+            let mut batch = Batch::new(&guard, &rewritten_sql);
+            let mut single = if analysis.is_multi_statement {
+                None
+            } else {
+                Some(guard.prepare(&rewritten_sql).map_err(|e| {
+                    DbMcpError::AdapterError(redact_sensitive_text(&e.to_string()))
+                })?)
+            };
+            let mut executed = 0;
+            let mut rows_affected = None;
+            let mut columns: Vec<ColumnMetadata> = Vec::new();
+            let mut rows_out = Vec::new();
+            let mut bytes_used = 0;
+            let mut truncated = false;
+            let mut warnings = Vec::new();
+            loop {
+                let next = if analysis.is_multi_statement {
+                    batch.next().map_err(|e| {
+                        DbMcpError::AdapterError(redact_sensitive_text(&e.to_string()))
+                    })?
+                } else {
+                    single.take()
+                };
+                let Some(mut stmt) = next else { break };
+                executed += 1;
+                // SQLite assigns '$n' slots in appearance order. PostgreSQL addresses the
+                // caller's parameter array by the number, including repeated references.
+                let mut required_params = 0;
+                for slot in 1..=stmt.parameter_count() {
+                    let position = stmt
+                        .parameter_name(slot)
+                        .and_then(|name| name.strip_prefix('$'))
+                        .and_then(|number| number.parse::<usize>().ok())
+                        .unwrap_or(slot);
+                    let value = position
+                        .checked_sub(1)
+                        .and_then(|index| params.get(index))
+                        .ok_or_else(|| {
+                            DbMcpError::InvalidArgument(format!("Missing parameter at position {position}"))
+                        })?;
+                    stmt.raw_bind_parameter(slot, value)
+                        .map_err(|e| DbMcpError::AdapterError(redact_sensitive_text(&e.to_string())))?;
+                    required_params = required_params.max(position);
+                }
+                if params.len() != required_params {
+                    return Err(DbMcpError::InvalidArgument(format!(
+                        "Expected {required_params} parameters, got {}",
+                        params.len()
+                    )));
+                }
+                let col_count = stmt.column_count();
+                if col_count == 0 {
+                    let changed = stmt.raw_execute().map_err(|e| {
+                        DbMcpError::AdapterError(redact_sensitive_text(&e.to_string()))
+                    })?;
+                    *rows_affected.get_or_insert(0) += changed as u64;
+                    continue;
+                }
+                columns = stmt
                     .column_names()
                     .into_iter()
                     .map(|n| ColumnMetadata::new(n, "text"))
                     .collect();
-                let mut rows_out = Vec::new();
-                let mut bytes_used = 0usize;
-                let mut truncated = false;
-                let mut warnings = Vec::new();
+                rows_out.clear();
+                bytes_used = 0;
+                truncated = false;
+                warnings.clear();
 
-                let mut rows = stmt
-                    .query(params_from_iter(params.iter()))
-                    .map_err(|e| DbMcpError::AdapterError(redact_sensitive_text(&e.to_string())))?;
+                let mut rows = stmt.raw_query();
 
                 while let Some(row) = rows
                     .next()
@@ -1553,57 +1609,29 @@ impl DatabaseAdapter for PostgresAdapter {
                     bytes_used += row_bytes;
                     rows_out.push(vals);
                 }
-                drop(rows);
-                drop(stmt);
-
-                let schema_version = introspect_embedded_pg_catalog(&guard, &default_schema)
-                    .ok()
-                    .map(|objs| compute_schema_version(&objs));
-
-                let returned_rows = rows_out.len();
-                Ok(QueryResult {
-                    execution_id: request.execution_id.clone(),
-                    columns,
-                    rows: rows_out,
-                    returned_rows,
-                    rows_affected: None,
-                    truncated,
-                    bytes_used,
-                    execution_time_ms: started.elapsed().as_millis() as u64,
-                    warnings,
-                    schema_version,
-                })
-            } else {
-                drop(stmt);
-                let changed = guard
-                    .execute(&rewritten_sql, params_from_iter(params.iter()))
-                    .map_err(|e| DbMcpError::AdapterError(redact_sensitive_text(&e.to_string())))?;
-
-                let schema_version = introspect_embedded_pg_catalog(&guard, &default_schema)
-                    .ok()
-                    .map(|objs| compute_schema_version(&objs));
-
-                Ok(QueryResult {
-                    execution_id: request.execution_id.clone(),
-                    columns: Vec::new(),
-                    rows: Vec::new(),
-                    returned_rows: 0,
-                    rows_affected: Some(changed as u64),
-                    truncated: false,
-                    bytes_used: 0,
-                    execution_time_ms: started.elapsed().as_millis() as u64,
-                    warnings: Vec::new(),
-                    schema_version,
-                })
-            };
-
-            active_pids.remove(&request.execution_id);
-            outcome
+            }
+            if executed > 1 {
+                warnings.push(format!("Executed {executed} statements as one batch."));
+            }
+            let schema_version = introspect_embedded_pg_catalog(&guard, &default_schema)
+                .ok()
+                .map(|objects| compute_schema_version(&objects));
+            Ok(QueryResult {
+                execution_id: request.execution_id,
+                columns,
+                returned_rows: rows_out.len(),
+                rows: rows_out,
+                rows_affected,
+                truncated,
+                bytes_used,
+                execution_time_ms: started.elapsed().as_millis() as u64,
+                warnings,
+                schema_version,
+            })
         })
-        .await
-        .map_err(|e| DbMcpError::InternalError(format!("Postgres execute join error: {e}")))?;
-
-        res
+        .await;
+        self.active_pids.remove(&exec_id);
+        res.map_err(|e| DbMcpError::InternalError(format!("Postgres execute join error: {e}")))?
     }
 
     async fn explain(&self, request: ExplainRequest) -> DbMcpResult<ExplainPlan> {

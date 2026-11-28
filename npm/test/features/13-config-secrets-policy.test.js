@@ -736,6 +736,12 @@ async function main() {
   // -------------------------------------------------------------------------------------------
   // 3b. HTTP identity & trust model
   // -------------------------------------------------------------------------------------------
+  await check("http: a non-loopback bind without an agent token is refused", () => {
+    const config = writeCfg("http-unauthenticated.toml", MIN());
+    const r = runBin(["serve", "--transport", "http", "--bind", "0.0.0.0:0", "--config", config], { timeout: 5000 });
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /http\.auth_token is required for a non-loopback bind address/);
+  });
   await check("http: with tokens set, /mcp requires bearer; header role cannot approve, /admin/approve needs the separate admin token", async () => {
     const port = 19000 + Math.floor(Math.random() * 500);
     const { configPath, dir } = makeIsolatedConfig({ dir: path.join(TMP, "http-tok"), transform: (t) => t.replace('bind = "127.0.0.1:8080"', `bind = "127.0.0.1:${port}"`) });
