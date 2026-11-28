@@ -4,7 +4,9 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use db_mcp_core::{CatalogObject, CatalogObjectType, ColumnSpec, DbMcpResult, ForeignKeySpec, IndexSpec};
+use db_mcp_core::{
+    CatalogObject, CatalogObjectType, ColumnSpec, DbMcpResult, ForeignKeySpec, IndexSpec,
+};
 
 use serde_json::Value as J;
 
@@ -140,19 +142,28 @@ pub struct CatalogRows {
 /// Turn `information_schema` rows into catalog objects. `default_schema` decides whether a
 /// foreign-key target is written bare (same schema) or qualified.
 pub fn build_catalog_objects(rows: &CatalogRows) -> Vec<CatalogObject> {
-    let key = |schema: &str, name: &str| format!("{}.{}", schema.to_ascii_lowercase(), name.to_ascii_lowercase());
+    let key = |schema: &str, name: &str| {
+        format!(
+            "{}.{}",
+            schema.to_ascii_lowercase(),
+            name.to_ascii_lowercase()
+        )
+    };
 
     let mut columns: BTreeMap<String, Vec<ColumnSpec>> = BTreeMap::new();
     for r in &rows.columns {
-        columns.entry(key(&s(r.first()), &s(r.get(1)))).or_default().push(ColumnSpec {
-            name: s(r.get(2)),
-            data_type: s(r.get(3)).to_ascii_lowercase(),
-            nullable: truthy(r.get(4)),
-            default_value: opt_s(r.get(5)),
-            is_primary_key: truthy(r.get(6)),
-            comment: opt_s(r.get(7)).filter(|c| !c.is_empty()),
-            ordinal_position: num(r.get(8)).unwrap_or(0) as usize,
-        });
+        columns
+            .entry(key(&s(r.first()), &s(r.get(1))))
+            .or_default()
+            .push(ColumnSpec {
+                name: s(r.get(2)),
+                data_type: s(r.get(3)).to_ascii_lowercase(),
+                nullable: truthy(r.get(4)),
+                default_value: opt_s(r.get(5)),
+                is_primary_key: truthy(r.get(6)),
+                comment: opt_s(r.get(7)).filter(|c| !c.is_empty()),
+                ordinal_position: num(r.get(8)).unwrap_or(0) as usize,
+            });
     }
 
     // (table key) -> ordered index specs
@@ -161,7 +172,9 @@ pub fn build_catalog_objects(rows: &CatalogRows) -> Vec<CatalogObject> {
         let schema = s(r.first());
         let table = s(r.get(1));
         let index_name = s(r.get(2));
-        let column = opt_s(r.get(3)).or_else(|| opt_s(r.get(7)).map(|e| format!("({e})"))).unwrap_or_default();
+        let column = opt_s(r.get(3))
+            .or_else(|| opt_s(r.get(7)).map(|e| format!("({e})")))
+            .unwrap_or_default();
         let list = indexes.entry(key(&schema, &table)).or_default();
         if let Some(existing) = list.iter_mut().find(|i| i.name == index_name) {
             existing.columns.push(column);
@@ -197,7 +210,11 @@ pub fn build_catalog_objects(rows: &CatalogRows) -> Vec<CatalogObject> {
                 bq(&idx.name),
                 bq(&schema_name),
                 bq(&idx.table_name),
-                idx.columns.iter().map(|c| if c.starts_with('(') { c.clone() } else { bq(c) }).collect::<Vec<_>>().join(", ")
+                idx.columns
+                    .iter()
+                    .map(|c| if c.starts_with('(') { c.clone() } else { bq(c) })
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
     }
@@ -209,13 +226,16 @@ pub fn build_catalog_objects(rows: &CatalogRows) -> Vec<CatalogObject> {
         let constraint = s(r.get(2));
         let ref_schema = s(r.get(4));
         let ref_table = s(r.get(5));
-        let referenced_table = if ref_schema.eq_ignore_ascii_case(&schema) || ref_schema.is_empty() {
+        let referenced_table = if ref_schema.eq_ignore_ascii_case(&schema) || ref_schema.is_empty()
+        {
             ref_table
         } else {
             format!("{ref_schema}.{ref_table}")
         };
         let list = fks.entry(key(&schema, &table)).or_default();
-        let pos = list.iter().position(|f| f.name.as_deref() == Some(constraint.as_str()));
+        let pos = list
+            .iter()
+            .position(|f| f.name.as_deref() == Some(constraint.as_str()));
         let fk = match pos {
             Some(p) => &mut list[p],
             None => {
@@ -237,7 +257,12 @@ pub fn build_catalog_objects(rows: &CatalogRows) -> Vec<CatalogObject> {
     let views: BTreeMap<String, Option<String>> = rows
         .views
         .iter()
-        .map(|r| (key(&s(r.first()), &s(r.get(1))), opt_s(r.get(2)).filter(|d| !d.trim().is_empty())))
+        .map(|r| {
+            (
+                key(&s(r.first()), &s(r.get(1))),
+                opt_s(r.get(2)).filter(|d| !d.trim().is_empty()),
+            )
+        })
         .collect();
 
     let mut objects = Vec::new();
@@ -246,7 +271,11 @@ pub fn build_catalog_objects(rows: &CatalogRows) -> Vec<CatalogObject> {
         let name = s(t.get(1));
         let is_view = s(t.get(2)).eq_ignore_ascii_case("view");
         let k = key(&schema, &name);
-        let table_indexes = if is_view { Vec::new() } else { indexes.get(&k).cloned().unwrap_or_default() };
+        let table_indexes = if is_view {
+            Vec::new()
+        } else {
+            indexes.get(&k).cloned().unwrap_or_default()
+        };
         for idx in table_indexes.iter().filter(|i| !i.primary) {
             objects.push(CatalogObject {
                 schema: schema.clone(),
@@ -286,13 +315,21 @@ pub fn build_catalog_objects(rows: &CatalogRows) -> Vec<CatalogObject> {
         objects.push(CatalogObject {
             schema: schema.clone(),
             name: name.clone(),
-            object_type: if is_view { CatalogObjectType::View } else { CatalogObjectType::Table },
+            object_type: if is_view {
+                CatalogObjectType::View
+            } else {
+                CatalogObjectType::Table
+            },
             comment: opt_s(t.get(3)).filter(|c| !c.is_empty()),
             estimated_rows: if is_view { None } else { num(t.get(4)) },
             size_bytes: if is_view { None } else { num(t.get(5)) },
             columns: columns.get(&k).cloned().unwrap_or_default(),
             indexes: table_indexes,
-            foreign_keys: if is_view { Vec::new() } else { fks.get(&k).cloned().unwrap_or_default() },
+            foreign_keys: if is_view {
+                Vec::new()
+            } else {
+                fks.get(&k).cloned().unwrap_or_default()
+            },
             definition,
         });
     }
@@ -334,7 +371,10 @@ pub fn build_catalog_objects(rows: &CatalogRows) -> Vec<CatalogObject> {
             continue;
         }
         let is_function = s(r.get(6)).eq_ignore_ascii_case("FUNCTION");
-        let mode = opt_s(r.get(3)).filter(|_| !is_function).map(|m| format!("{m} ")).unwrap_or_default();
+        let mode = opt_s(r.get(3))
+            .filter(|_| !is_function)
+            .map(|m| format!("{m} "))
+            .unwrap_or_default();
         entry.0.push(format!("{mode}{} {dtd}", s(r.get(4))));
     }
     for r in &rows.routines {
@@ -343,7 +383,10 @@ pub fn build_catalog_objects(rows: &CatalogRows) -> Vec<CatalogObject> {
         let kind = s(r.get(2));
         let is_function = kind.eq_ignore_ascii_case("function");
         let body = opt_s(r.get(3));
-        let (plist, returns) = params.get(&key(&schema, &name)).cloned().unwrap_or_default();
+        let (plist, returns) = params
+            .get(&key(&schema, &name))
+            .cloned()
+            .unwrap_or_default();
         let definition = body.map(|b| {
             format!(
                 "CREATE {} {}.{}({}){}\n{b}",
@@ -351,13 +394,20 @@ pub fn build_catalog_objects(rows: &CatalogRows) -> Vec<CatalogObject> {
                 bq(&schema),
                 bq(&name),
                 plist.join(", "),
-                returns.filter(|_| is_function).map(|r| format!(" RETURNS {r}")).unwrap_or_default()
+                returns
+                    .filter(|_| is_function)
+                    .map(|r| format!(" RETURNS {r}"))
+                    .unwrap_or_default()
             )
         });
         objects.push(CatalogObject {
             schema,
             name,
-            object_type: if is_function { CatalogObjectType::Function } else { CatalogObjectType::Procedure },
+            object_type: if is_function {
+                CatalogObjectType::Function
+            } else {
+                CatalogObjectType::Procedure
+            },
             comment: opt_s(r.get(4)).filter(|c| !c.is_empty()),
             estimated_rows: None,
             size_bytes: None,
@@ -392,14 +442,70 @@ impl LiveMySql {
         let timeout_ms = 30_000;
         let mut conn = self.session(true, timeout_ms).await?;
         let mut rows = CatalogRows::default();
-        rows.tables = self.query_json(&mut conn, &crate::build_information_schema_tables_query(None), timeout_ms).await?.1;
-        rows.columns = self.query_json(&mut conn, &build_information_schema_all_columns_query(), timeout_ms).await?.1;
-        rows.statistics = self.query_json(&mut conn, &build_information_schema_all_statistics_query(), timeout_ms).await?.1;
-        rows.foreign_keys = self.query_json(&mut conn, &build_information_schema_foreign_keys_query(), timeout_ms).await?.1;
-        rows.views = self.query_json(&mut conn, &build_information_schema_views_query(), timeout_ms).await?.1;
-        rows.triggers = self.query_json(&mut conn, &build_information_schema_triggers_query(), timeout_ms).await?.1;
-        rows.routines = self.query_json(&mut conn, &crate::build_information_schema_routines_query(None), timeout_ms).await?.1;
-        rows.parameters = self.query_json(&mut conn, &build_information_schema_parameters_query(), timeout_ms).await?.1;
+        rows.tables = self
+            .query_json(
+                &mut conn,
+                &crate::build_information_schema_tables_query(None),
+                timeout_ms,
+            )
+            .await?
+            .1;
+        rows.columns = self
+            .query_json(
+                &mut conn,
+                &build_information_schema_all_columns_query(),
+                timeout_ms,
+            )
+            .await?
+            .1;
+        rows.statistics = self
+            .query_json(
+                &mut conn,
+                &build_information_schema_all_statistics_query(),
+                timeout_ms,
+            )
+            .await?
+            .1;
+        rows.foreign_keys = self
+            .query_json(
+                &mut conn,
+                &build_information_schema_foreign_keys_query(),
+                timeout_ms,
+            )
+            .await?
+            .1;
+        rows.views = self
+            .query_json(
+                &mut conn,
+                &build_information_schema_views_query(),
+                timeout_ms,
+            )
+            .await?
+            .1;
+        rows.triggers = self
+            .query_json(
+                &mut conn,
+                &build_information_schema_triggers_query(),
+                timeout_ms,
+            )
+            .await?
+            .1;
+        rows.routines = self
+            .query_json(
+                &mut conn,
+                &crate::build_information_schema_routines_query(None),
+                timeout_ms,
+            )
+            .await?
+            .1;
+        rows.parameters = self
+            .query_json(
+                &mut conn,
+                &build_information_schema_parameters_query(),
+                timeout_ms,
+            )
+            .await?
+            .1;
         let grants = self.grants(&mut conn).await.unwrap_or_default();
         drop(conn);
 
@@ -410,7 +516,11 @@ impl LiveMySql {
                 "routine definitions are hidden from '{}': procedures/functions are not listed and the call graph is incomplete (optional: GRANT SHOW_ROUTINE ON *.* TO the login)",
                 self.dsn.user
             ));
-        } else if rows.routines.iter().any(|r| matches!(r.get(3), Some(J::Null) | None)) {
+        } else if rows
+            .routines
+            .iter()
+            .any(|r| matches!(r.get(3), Some(J::Null) | None))
+        {
             warnings.push("some routine definitions are NULL (definition hidden); the call graph omits their bodies".to_string());
         }
         if rows.triggers.is_empty() && !privileges.has_trigger {
@@ -418,8 +528,15 @@ impl LiveMySql {
                 "triggers are not listed: information_schema.TRIGGERS needs the TRIGGER privilege, which also allows creating triggers (not granted to a read-only login by design)".to_string(),
             );
         }
-        if rows.views.iter().any(|r| matches!(r.get(2), Some(J::Null) | None) || s(r.get(2)).is_empty()) {
-            warnings.push("some view definitions are empty: GRANT SHOW VIEW on the schema to read them".to_string());
+        if rows
+            .views
+            .iter()
+            .any(|r| matches!(r.get(2), Some(J::Null) | None) || s(r.get(2)).is_empty())
+        {
+            warnings.push(
+                "some view definitions are empty: GRANT SHOW VIEW on the schema to read them"
+                    .to_string(),
+            );
         }
         let objects = build_catalog_objects(&rows);
         let schema_version = db_mcp_catalog::compute_schema_version(&objects);
@@ -441,11 +558,17 @@ impl LiveMySql {
 impl LiveMySql {
     /// Real `EXPLAIN FORMAT=JSON` (plus `FORMAT=TREE` for text, `EXPLAIN ANALYZE` when requested
     /// on 8.0.18+). The statement must be a single read; policy decides whether ANALYZE is allowed.
-    pub async fn explain(&self, request: &db_mcp_core::ExplainRequest) -> DbMcpResult<db_mcp_core::ExplainPlan> {
-        let stmts = db_mcp_sql::split_sql_statements(db_mcp_core::DatabaseEngine::MySql, &request.sql);
+    pub async fn explain(
+        &self,
+        request: &db_mcp_core::ExplainRequest,
+    ) -> DbMcpResult<db_mcp_core::ExplainPlan> {
+        let stmts =
+            db_mcp_sql::split_sql_statements(db_mcp_core::DatabaseEngine::MySql, &request.sql);
         let stmts: Vec<&String> = stmts.iter().filter(|s| !s.trim().is_empty()).collect();
         if stmts.len() != 1 {
-            return Err(db_mcp_core::DbMcpError::InvalidArgument("explain_query requires a single SQL statement".to_string()));
+            return Err(db_mcp_core::DbMcpError::InvalidArgument(
+                "explain_query requires a single SQL statement".to_string(),
+            ));
         }
         let trimmed = stmts[0].trim().trim_end_matches(';').trim().to_string();
         if trimmed.to_ascii_uppercase().starts_with("EXPLAIN") {
@@ -453,34 +576,70 @@ impl LiveMySql {
                 "SQL passed to explain_query must not already start with EXPLAIN".to_string(),
             ));
         }
-        let analysis = db_mcp_sql::parse_and_analyze_sql(db_mcp_core::DatabaseEngine::MySql, &trimmed)?;
-        if analysis.overall_class.is_mutating() || analysis.has_privileged_functions || analysis.has_cte_write {
+        let analysis =
+            db_mcp_sql::parse_and_analyze_sql(db_mcp_core::DatabaseEngine::MySql, &trimmed)?;
+        if analysis.overall_class.is_mutating()
+            || analysis.has_privileged_functions
+            || analysis.has_cte_write
+        {
             return Err(db_mcp_core::DbMcpError::PolicyDenied {
                 code: "READONLY_VIOLATION".to_string(),
                 message: "explain_query only permits read-only SQL statements".to_string(),
                 next_action: None,
             });
         }
-        let timeout_ms = if request.timeout_ms == 0 { 10_000 } else { request.timeout_ms };
+        let timeout_ms = if request.timeout_ms == 0 {
+            10_000
+        } else {
+            request.timeout_ms
+        };
         let (sql, params) = crate::live::bind_mysql_placeholders(&trimmed, &request.params)?;
-        let params: Vec<mysql_async::Value> = params.iter().map(crate::live::json_to_mysql_param).collect();
+        let params: Vec<mysql_async::Value> = params
+            .iter()
+            .map(crate::live::json_to_mysql_param)
+            .collect();
         let mut conn = self.session(true, timeout_ms).await?;
-        let raw_json = self.explain_text(&mut conn, &format!("EXPLAIN FORMAT=JSON {sql}"), &params, timeout_ms).await?;
+        let raw_json = self
+            .explain_text(
+                &mut conn,
+                &format!("EXPLAIN FORMAT=JSON {sql}"),
+                &params,
+                timeout_ms,
+            )
+            .await?;
         let parsed = crate::parse_mysql_explain_json(&raw_json)?;
         let mut warnings = parsed.warnings.clone();
         let raw_plan = if request.analyze {
-            if self.server_version_tuple().map(|v| v < (8, 0, 18)).unwrap_or(false) {
+            if self
+                .server_version_tuple()
+                .map(|v| v < (8, 0, 18))
+                .unwrap_or(false)
+            {
                 return Err(db_mcp_core::DbMcpError::UnsupportedCapability(format!(
                     "EXPLAIN ANALYZE needs MySQL 8.0.18 or later (server {})",
                     self.server_version().unwrap_or_default()
                 )));
             }
             warnings.push("EXPLAIN ANALYZE executed the statement (read-only session) to measure actual rows and timings".to_string());
-            self.explain_text(&mut conn, &format!("EXPLAIN ANALYZE {sql}"), &params, timeout_ms).await?
+            self.explain_text(
+                &mut conn,
+                &format!("EXPLAIN ANALYZE {sql}"),
+                &params,
+                timeout_ms,
+            )
+            .await?
         } else {
             match request.format {
                 db_mcp_core::ExplainFormat::Json => raw_json.clone(),
-                db_mcp_core::ExplainFormat::Text => self.explain_text(&mut conn, &format!("EXPLAIN FORMAT=TREE {sql}"), &params, timeout_ms).await?,
+                db_mcp_core::ExplainFormat::Text => {
+                    self.explain_text(
+                        &mut conn,
+                        &format!("EXPLAIN FORMAT=TREE {sql}"),
+                        &params,
+                        timeout_ms,
+                    )
+                    .await?
+                }
             }
         };
         drop(conn);
@@ -499,18 +658,32 @@ impl LiveMySql {
         })
     }
 
-    async fn explain_text(&self, conn: &mut mysql_async::Conn, sql: &str, params: &[mysql_async::Value], timeout_ms: u64) -> DbMcpResult<String> {
+    async fn explain_text(
+        &self,
+        conn: &mut mysql_async::Conn,
+        sql: &str,
+        params: &[mysql_async::Value],
+        timeout_ms: u64,
+    ) -> DbMcpResult<String> {
         use mysql_async::prelude::Queryable;
-        let map = |e: mysql_async::Error| crate::live::map_exec_error(&self.connection_id, &self.dsn, timeout_ms, &e);
+        let map = |e: mysql_async::Error| {
+            crate::live::map_exec_error(&self.connection_id, &self.dsn, timeout_ms, &e)
+        };
         let row: Option<mysql_async::Row> = if params.is_empty() {
             conn.query_first(sql).await.map_err(map)?
         } else {
-            conn.exec_first(sql, mysql_async::Params::Positional(params.to_vec())).await.map_err(map)?
+            conn.exec_first(sql, mysql_async::Params::Positional(params.to_vec()))
+                .await
+                .map_err(map)?
         };
-        let value = row.and_then(|r| r.unwrap().into_iter().next()).unwrap_or(mysql_async::Value::NULL);
+        let value = row
+            .and_then(|r| r.unwrap().into_iter().next())
+            .unwrap_or(mysql_async::Value::NULL);
         match value {
             mysql_async::Value::Bytes(b) => Ok(String::from_utf8_lossy(&b).into_owned()),
-            mysql_async::Value::NULL => Err(db_mcp_core::DbMcpError::AdapterError("MySQL returned an empty plan".to_string())),
+            mysql_async::Value::NULL => Err(db_mcp_core::DbMcpError::AdapterError(
+                "MySQL returned an empty plan".to_string(),
+            )),
             other => Ok(format!("{other:?}")),
         }
     }
@@ -525,49 +698,190 @@ mod tests {
     fn catalog_rows_map_to_objects() {
         let rows = CatalogRows {
             tables: vec![
-                vec![json!("appdb"), json!("orders"), json!("table"), json!("Customer orders"), json!(2), json!(32768)],
-                vec![json!("appdb"), json!("users"), json!("table"), json!(""), json!(2), json!(16384)],
-                vec![json!("appdb"), json!("active_user_orders"), json!("view"), json!(""), J::Null, J::Null],
+                vec![
+                    json!("appdb"),
+                    json!("orders"),
+                    json!("table"),
+                    json!("Customer orders"),
+                    json!(2),
+                    json!(32768),
+                ],
+                vec![
+                    json!("appdb"),
+                    json!("users"),
+                    json!("table"),
+                    json!(""),
+                    json!(2),
+                    json!(16384),
+                ],
+                vec![
+                    json!("appdb"),
+                    json!("active_user_orders"),
+                    json!("view"),
+                    json!(""),
+                    J::Null,
+                    J::Null,
+                ],
             ],
             columns: vec![
-                vec![json!("appdb"), json!("orders"), json!("id"), json!("bigint"), json!(0), J::Null, json!(1), json!(""), json!(1)],
-                vec![json!("appdb"), json!("orders"), json!("user_id"), json!("bigint"), json!(0), J::Null, json!(0), json!(""), json!(2)],
-                vec![json!("appdb"), json!("users"), json!("id"), json!("bigint"), json!(0), J::Null, json!(1), json!(""), json!(1)],
+                vec![
+                    json!("appdb"),
+                    json!("orders"),
+                    json!("id"),
+                    json!("bigint"),
+                    json!(0),
+                    J::Null,
+                    json!(1),
+                    json!(""),
+                    json!(1),
+                ],
+                vec![
+                    json!("appdb"),
+                    json!("orders"),
+                    json!("user_id"),
+                    json!("bigint"),
+                    json!(0),
+                    J::Null,
+                    json!(0),
+                    json!(""),
+                    json!(2),
+                ],
+                vec![
+                    json!("appdb"),
+                    json!("users"),
+                    json!("id"),
+                    json!("bigint"),
+                    json!(0),
+                    J::Null,
+                    json!(1),
+                    json!(""),
+                    json!(1),
+                ],
             ],
             statistics: vec![
-                vec![json!("appdb"), json!("orders"), json!("PRIMARY"), json!("id"), json!(1), json!("BTREE"), json!(1), J::Null],
-                vec![json!("appdb"), json!("orders"), json!("fk_orders_user"), json!("user_id"), json!(0), json!("BTREE"), json!(1), J::Null],
+                vec![
+                    json!("appdb"),
+                    json!("orders"),
+                    json!("PRIMARY"),
+                    json!("id"),
+                    json!(1),
+                    json!("BTREE"),
+                    json!(1),
+                    J::Null,
+                ],
+                vec![
+                    json!("appdb"),
+                    json!("orders"),
+                    json!("fk_orders_user"),
+                    json!("user_id"),
+                    json!(0),
+                    json!("BTREE"),
+                    json!(1),
+                    J::Null,
+                ],
             ],
             foreign_keys: vec![vec![
-                json!("appdb"), json!("orders"), json!("fk_orders_user"), json!("user_id"),
-                json!("appdb"), json!("users"), json!("id"), json!("NO ACTION"), json!("CASCADE"),
+                json!("appdb"),
+                json!("orders"),
+                json!("fk_orders_user"),
+                json!("user_id"),
+                json!("appdb"),
+                json!("users"),
+                json!("id"),
+                json!("NO ACTION"),
+                json!("CASCADE"),
             ]],
-            views: vec![vec![json!("appdb"), json!("active_user_orders"), json!("select `o`.`id` AS `order_id` from `appdb`.`orders` `o`")]],
-            triggers: vec![vec![json!("appdb"), json!("trg"), json!("AFTER"), json!("UPDATE"), json!("orders"), json!("BEGIN END")]],
+            views: vec![vec![
+                json!("appdb"),
+                json!("active_user_orders"),
+                json!("select `o`.`id` AS `order_id` from `appdb`.`orders` `o`"),
+            ]],
+            triggers: vec![vec![
+                json!("appdb"),
+                json!("trg"),
+                json!("AFTER"),
+                json!("UPDATE"),
+                json!("orders"),
+                json!("BEGIN END"),
+            ]],
             routines: vec![
-                vec![json!("appdb"), json!("calc"), json!("function"), json!("BEGIN RETURN 1; END"), json!("")],
-                vec![json!("appdb"), json!("hidden"), json!("procedure"), J::Null, json!("")],
+                vec![
+                    json!("appdb"),
+                    json!("calc"),
+                    json!("function"),
+                    json!("BEGIN RETURN 1; END"),
+                    json!(""),
+                ],
+                vec![
+                    json!("appdb"),
+                    json!("hidden"),
+                    json!("procedure"),
+                    J::Null,
+                    json!(""),
+                ],
             ],
             parameters: vec![
-                vec![json!("appdb"), json!("calc"), json!(0), J::Null, J::Null, json!("decimal(12,2)"), json!("FUNCTION")],
-                vec![json!("appdb"), json!("calc"), json!(1), json!("IN"), json!("p_id"), json!("bigint"), json!("FUNCTION")],
+                vec![
+                    json!("appdb"),
+                    json!("calc"),
+                    json!(0),
+                    J::Null,
+                    J::Null,
+                    json!("decimal(12,2)"),
+                    json!("FUNCTION"),
+                ],
+                vec![
+                    json!("appdb"),
+                    json!("calc"),
+                    json!(1),
+                    json!("IN"),
+                    json!("p_id"),
+                    json!("bigint"),
+                    json!("FUNCTION"),
+                ],
             ],
         };
         let objs = build_catalog_objects(&rows);
         let orders = objs.iter().find(|o| o.name == "orders").unwrap();
         assert_eq!(orders.columns.len(), 2);
-        assert!(orders.indexes.iter().any(|i| i.primary && i.columns == vec!["id"]));
+        assert!(orders
+            .indexes
+            .iter()
+            .any(|i| i.primary && i.columns == vec!["id"]));
         assert_eq!(orders.foreign_keys[0].referenced_table, "users");
         assert_eq!(orders.foreign_keys[0].on_delete.as_deref(), Some("CASCADE"));
         assert_eq!(orders.comment.as_deref(), Some("Customer orders"));
-        let idx = objs.iter().find(|o| o.object_type == CatalogObjectType::Index).unwrap();
-        assert_eq!(idx.definition.as_deref(), Some("CREATE INDEX `fk_orders_user` ON `appdb`.`orders` (`user_id`);"));
-        let view = objs.iter().find(|o| o.object_type == CatalogObjectType::View).unwrap();
-        assert!(view.definition.as_deref().unwrap().starts_with("CREATE VIEW `appdb`.`active_user_orders` AS select"));
+        let idx = objs
+            .iter()
+            .find(|o| o.object_type == CatalogObjectType::Index)
+            .unwrap();
+        assert_eq!(
+            idx.definition.as_deref(),
+            Some("CREATE INDEX `fk_orders_user` ON `appdb`.`orders` (`user_id`);")
+        );
+        let view = objs
+            .iter()
+            .find(|o| o.object_type == CatalogObjectType::View)
+            .unwrap();
+        assert!(view
+            .definition
+            .as_deref()
+            .unwrap()
+            .starts_with("CREATE VIEW `appdb`.`active_user_orders` AS select"));
         let f = objs.iter().find(|o| o.name == "calc").unwrap();
         assert_eq!(f.object_type, CatalogObjectType::Function);
         assert_eq!(f.definition.as_deref().unwrap(), "CREATE FUNCTION `appdb`.`calc`(p_id bigint) RETURNS decimal(12,2)\nBEGIN RETURN 1; END");
-        assert!(objs.iter().find(|o| o.name == "hidden").unwrap().definition.is_none());
-        assert_eq!(objs.iter().filter(|o| o.object_type == CatalogObjectType::Trigger).count(), 1);
+        assert!(objs
+            .iter()
+            .find(|o| o.name == "hidden")
+            .unwrap()
+            .definition
+            .is_none());
+        assert_eq!(
+            objs.iter()
+                .filter(|o| o.object_type == CatalogObjectType::Trigger)
+                .count(),
+            1
+        );
     }
 }

@@ -88,18 +88,25 @@ fn weighted_tokens(def: &Definition) -> BTreeMap<String, f64> {
         add(s, 2.5);
     }
     match &def.body {
-        DefinitionBody::Attribute { table, column, .. } | DefinitionBody::Filter { table, column, .. } => {
+        DefinitionBody::Attribute { table, column, .. }
+        | DefinitionBody::Filter { table, column, .. } => {
             add(column, 1.5);
             add(table, 0.75);
         }
-        DefinitionBody::Metric { base_table, column, .. } => {
+        DefinitionBody::Metric {
+            base_table, column, ..
+        } => {
             if let Some(c) = column {
                 add(c, 1.5);
             }
             add(base_table, 0.75);
         }
         DefinitionBody::Entity { table } => add(table, 1.5),
-        DefinitionBody::Relationship { from_table, to_table, .. } => {
+        DefinitionBody::Relationship {
+            from_table,
+            to_table,
+            ..
+        } => {
             add(from_table, 1.0);
             add(to_table, 1.0);
         }
@@ -171,9 +178,7 @@ pub fn rank(query: &str, candidates: &[Definition]) -> Vec<ScoredDefinition> {
 
 /// Space-joined stemmed tokens, used for phrase containment checks.
 pub fn normalized_phrase(text: &str) -> String {
-    format!(" {} ", tokenize(text).join(" "))
-        .trim()
-        .to_string()
+    format!(" {} ", tokenize(text).join(" ")).trim().to_string()
 }
 
 #[cfg(test)]
@@ -182,7 +187,10 @@ mod tests {
 
     #[test]
     fn tokenizer_splits_and_stems() {
-        assert_eq!(tokenize("OrderItems by user_role"), vec!["order", "item", "user", "role"]);
+        assert_eq!(
+            tokenize("OrderItems by user_role"),
+            vec!["order", "item", "user", "role"]
+        );
         assert_eq!(tokenize("categories"), vec!["category"]);
         assert_eq!(tokenize("Completed orders"), vec!["complet", "order"]);
         assert_eq!(stem("status"), "status");

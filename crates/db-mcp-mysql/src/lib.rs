@@ -26,8 +26,8 @@ use db_mcp_catalog::{
 use db_mcp_core::{
     AuthorizedQuery, CatalogDetailLevel, CatalogObject, CatalogObjectType, CatalogRequest,
     CatalogResponse, ColumnMetadata, ColumnSpec, DatabaseAdapter, DatabaseCapabilities,
-    DatabaseEngine, DbMcpError, DbMcpResult, ExplainFormat, ExplainPlan, ExplainRequest,
-    ExecutionId, ForeignKeySpec, IndexSpec, QueryResult, SchemaDiff, SchemaDiffProvider,
+    DatabaseEngine, DbMcpError, DbMcpResult, ExecutionId, ExplainFormat, ExplainPlan,
+    ExplainRequest, ForeignKeySpec, IndexSpec, QueryResult, SchemaDiff, SchemaDiffProvider,
     SchemaSnapshot, SqlStatementClass, TransactionalDdlProvider,
 };
 use db_mcp_secrets::{redact_dsn, redact_sensitive_text, SecretString};
@@ -335,7 +335,10 @@ fn walk_mysql_plan_node(
                     .unwrap_or("ALL");
                 let rows = tbl_obj
                     .get("rows_examined_per_scan")
-                    .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                    .and_then(|v| {
+                        v.as_f64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })
                     .unwrap_or(1.0);
                 *rows_examined += rows;
                 if access_type.eq_ignore_ascii_case("ALL") {
@@ -348,13 +351,21 @@ fn walk_mysql_plan_node(
                     }
                 }
             }
-            if map.get("using_filesort").and_then(serde_json::Value::as_bool) == Some(true) {
+            if map
+                .get("using_filesort")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
                 let n = "Plan sorts rows with a filesort (no index provides the ORDER BY / GROUP BY order)".to_string();
                 if !notes.contains(&n) {
                     notes.push(n);
                 }
             }
-            if map.get("using_temporary_table").and_then(serde_json::Value::as_bool) == Some(true) {
+            if map
+                .get("using_temporary_table")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
                 let n = "Plan materializes an internal temporary table".to_string();
                 if !notes.contains(&n) {
                     notes.push(n);
@@ -433,7 +444,12 @@ impl MySqlAdapter {
     /// Create a new `MySqlAdapter` from `MySqlConfig`.
     pub fn new(config: MySqlConfig) -> DbMcpResult<Self> {
         let live = if config.backend_mode == MySqlBackendMode::LiveOnly {
-            if config.init_sql.as_deref().map(str::trim).is_some_and(|s| !s.is_empty()) {
+            if config
+                .init_sql
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty())
+            {
                 return Err(DbMcpError::ConfigurationError(format!(
                     "Connection '{}': init_sql is only allowed with backend = \"simulated\"; it is never run on a live server",
                     config.connection_id
@@ -447,8 +463,8 @@ impl MySqlAdapter {
         } else {
             None
         };
-        let conn = Connection::open_in_memory()
-            .map_err(|e| DbMcpError::AdapterError(e.to_string()))?;
+        let conn =
+            Connection::open_in_memory().map_err(|e| DbMcpError::AdapterError(e.to_string()))?;
 
         bootstrap_mysql_system_tables(&conn)?;
 
@@ -592,7 +608,11 @@ impl MySqlAdapter {
     }
 
     /// Live catalog (cached for `catalog::CATALOG_CACHE_TTL`) merged with registered objects.
-    async fn live_catalog_objects(&self, live: &live::LiveMySql, force: bool) -> DbMcpResult<Vec<CatalogObject>> {
+    async fn live_catalog_objects(
+        &self,
+        live: &live::LiveMySql,
+        force: bool,
+    ) -> DbMcpResult<Vec<CatalogObject>> {
         let cached = live.catalog(force).await?;
         let mut objects: Vec<CatalogObject> = cached.objects.as_ref().clone();
         for entry in self.custom_catalog.iter() {
@@ -955,7 +975,10 @@ fn rewrite_mysql_sql_for_embedded(sql: &str, default_schema: &str) -> String {
             .filter(|p| !p.is_empty())
             .collect();
         let (schema, routine_name) = if parts.len() >= 2 {
-            (parts[parts.len() - 2].clone(), parts[parts.len() - 1].clone())
+            (
+                parts[parts.len() - 2].clone(),
+                parts[parts.len() - 1].clone(),
+            )
         } else if parts.len() == 1 {
             (default_schema.to_string(), parts[0].clone())
         } else {
@@ -1046,7 +1069,10 @@ fn introspect_embedded_mysql_catalog(
                 };
                 let estimated_rows = if is_table {
                     conn.query_row(
-                        &format!("SELECT COUNT(*) FROM \"{}\"", item.name.replace('"', "\"\"")),
+                        &format!(
+                            "SELECT COUNT(*) FROM \"{}\"",
+                            item.name.replace('"', "\"\"")
+                        ),
                         [],
                         |r| r.get::<_, i64>(0),
                     )
@@ -1389,7 +1415,9 @@ impl DatabaseAdapter for MySqlAdapter {
             }
             let mutating = !read_only
                 && parse_and_analyze_sql(DatabaseEngine::MySql, &request.sql)
-                    .map(|a| a.overall_class != SqlStatementClass::Read || a.has_ddl || a.has_cte_write)
+                    .map(|a| {
+                        a.overall_class != SqlStatementClass::Read || a.has_ddl || a.has_cte_write
+                    })
                     .unwrap_or(true);
             let outcome = live.execute(&request, read_only, timeout_ms).await;
             if mutating {
@@ -1398,7 +1426,9 @@ impl DatabaseAdapter for MySqlAdapter {
             }
             let mut result = outcome?;
             if is_ddl_statement(&request.sql) {
-                result.warnings.push(MYSQL_NON_TRANSACTIONAL_DDL_WARNING.to_string());
+                result
+                    .warnings
+                    .push(MYSQL_NON_TRANSACTIONAL_DDL_WARNING.to_string());
             }
             result.schema_version = live.cached_schema_version();
             return Ok(result);
@@ -1478,7 +1508,8 @@ impl DatabaseAdapter for MySqlAdapter {
             }
 
             let rewritten_sql = rewrite_mysql_sql_for_embedded(&request.sql, &default_schema);
-            let params: Vec<SqliteValue> = request.params.iter().map(json_to_sqlite_param).collect();
+            let params: Vec<SqliteValue> =
+                request.params.iter().map(json_to_sqlite_param).collect();
             let max_rows = if request.max_rows == 0 {
                 usize::MAX
             } else {
@@ -1492,13 +1523,14 @@ impl DatabaseAdapter for MySqlAdapter {
             }
 
             let mut batch = Batch::new(&guard, &rewritten_sql);
-            let mut single = if analysis.is_multi_statement {
-                None
-            } else {
-                Some(guard.prepare(&rewritten_sql).map_err(|e| {
-                    DbMcpError::AdapterError(redact_sensitive_text(&e.to_string()))
-                })?)
-            };
+            let mut single =
+                if analysis.is_multi_statement {
+                    None
+                } else {
+                    Some(guard.prepare(&rewritten_sql).map_err(|e| {
+                        DbMcpError::AdapterError(redact_sensitive_text(&e.to_string()))
+                    })?)
+                };
             let mut executed = 0;
             let mut rows_affected = None;
             let mut columns: Vec<ColumnMetadata> = Vec::new();
@@ -1560,8 +1592,7 @@ impl DatabaseAdapter for MySqlAdapter {
                         row_bytes += b;
                         vals.push(jval);
                     }
-                    if max_bytes > 0 && bytes_used + row_bytes > max_bytes && !rows_out.is_empty()
-                    {
+                    if max_bytes > 0 && bytes_used + row_bytes > max_bytes && !rows_out.is_empty() {
                         truncated = true;
                         result_warnings.push(format!("Result truncated at max_bytes={max_bytes}"));
                         break;
@@ -1639,8 +1670,7 @@ impl DatabaseAdapter for MySqlAdapter {
             .predicates
             .iter()
             .filter(|p| {
-                p.operator != PredicateOperator::OrderBy
-                    && p.operator != PredicateOperator::GroupBy
+                p.operator != PredicateOperator::OrderBy && p.operator != PredicateOperator::GroupBy
             })
             .map(|p| p.column.to_ascii_lowercase())
             .collect();
@@ -1722,7 +1752,11 @@ impl DatabaseAdapter for MySqlAdapter {
                     format!(
                         "id=1 select_type=SIMPLE table={} type=ref key={} rows={:.0}",
                         base_tbl,
-                        parsed.index_scans.first().map(String::as_str).unwrap_or("PRIMARY"),
+                        parsed
+                            .index_scans
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("PRIMARY"),
                         parsed.rows_examined.unwrap_or(1.0)
                     )
                 }
@@ -1816,7 +1850,10 @@ impl TransactionalDdlProvider for MySqlAdapter {
         false
     }
 
-    async fn execute_transactional_ddl(&self, _request: AuthorizedQuery) -> DbMcpResult<QueryResult> {
+    async fn execute_transactional_ddl(
+        &self,
+        _request: AuthorizedQuery,
+    ) -> DbMcpResult<QueryResult> {
         Err(DbMcpError::UnsupportedCapability(
             MYSQL_NON_TRANSACTIONAL_DDL_WARNING.to_string(),
         ))
@@ -1975,7 +2012,10 @@ mod tests {
             .any(|w| w.contains("supports_transactional_ddl=false")));
 
         let snap_after = adapter.capture_schema("mysql-app", None).await.unwrap();
-        let diff = adapter.diff_schema(&snap_before, &snap_after).await.unwrap();
+        let diff = adapter
+            .diff_schema(&snap_before, &snap_after)
+            .await
+            .unwrap();
         assert!(!diff.is_identical);
         assert!(!diff.all_transactional);
         assert!(diff.items.iter().any(|i| {
@@ -2004,7 +2044,10 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(none.objects.is_empty(), "no phantom routines without init_sql DDL");
+        assert!(
+            none.objects.is_empty(),
+            "no phantom routines without init_sql DDL"
+        );
         adapter
             .execute_batch(
                 r#"
@@ -2063,7 +2106,11 @@ mod tests {
             .find(|o| o.name == "calculate_order_discount")
             .unwrap();
         assert_eq!(discount_fn.object_type, CatalogObjectType::Function);
-        assert!(discount_fn.definition.as_deref().unwrap().contains("JOIN users"));
+        assert!(discount_fn
+            .definition
+            .as_deref()
+            .unwrap()
+            .contains("JOIN users"));
 
         let checkout_proc = routines
             .objects
@@ -2098,7 +2145,9 @@ INSERT INTO t VALUES (1);
     fn live_adapter(var: &str) -> Option<MySqlAdapter> {
         let dsn = std::env::var(var).ok().filter(|v| !v.trim().is_empty());
         let Some(dsn) = dsn else {
-            eprintln!("skipped: {var} not set (run `eval \"$(bash scripts/live-db-up.sh mysql)\"`)");
+            eprintln!(
+                "skipped: {var} not set (run `eval \"$(bash scripts/live-db-up.sh mysql)\"`)"
+            );
             return None;
         };
         Some(MySqlAdapter::new(MySqlConfig::new("live", dsn).with_read_only(true)).unwrap())
@@ -2118,26 +2167,67 @@ INSERT INTO t VALUES (1);
 
     #[tokio::test]
     async fn live_catalog_discovery_and_explain() {
-        let Some(adapter) = live_adapter("DB_MCP_MYSQL_TEST_DSN") else { return };
+        let Some(adapter) = live_adapter("DB_MCP_MYSQL_TEST_DSN") else {
+            return;
+        };
         assert!(!adapter.is_simulated());
         assert!(adapter.capabilities().supports_health_diagnostics);
-        let resp = adapter.discover(catalog_req(vec![CatalogObjectType::Table, CatalogObjectType::View])).await.unwrap();
+        let resp = adapter
+            .discover(catalog_req(vec![
+                CatalogObjectType::Table,
+                CatalogObjectType::View,
+            ]))
+            .await
+            .unwrap();
         let names: Vec<&str> = resp.objects.iter().map(|o| o.name.as_str()).collect();
-        for t in ["users", "orders", "order_items", "inventory", "audit_logs", "internal_secrets", "active_user_orders"] {
+        for t in [
+            "users",
+            "orders",
+            "order_items",
+            "inventory",
+            "audit_logs",
+            "internal_secrets",
+            "active_user_orders",
+        ] {
             assert!(names.contains(&t), "{t} missing from {names:?}");
         }
-        assert!(resp.schema_version.as_deref().unwrap().starts_with("snapshot_"));
+        assert!(resp
+            .schema_version
+            .as_deref()
+            .unwrap()
+            .starts_with("snapshot_"));
         let orders = resp.objects.iter().find(|o| o.name == "orders").unwrap();
         assert_eq!(orders.schema, "appdb");
-        assert!(orders.foreign_keys.iter().any(|f| f.referenced_table == "users" && f.columns == vec!["user_id"]));
-        assert!(orders.indexes.iter().any(|i| i.name == "idx_orders_status_created" && i.columns == vec!["status", "created_at"]));
-        let view = resp.objects.iter().find(|o| o.name == "active_user_orders").unwrap();
-        assert!(view.definition.as_deref().unwrap().contains("`appdb`.`orders`"));
+        assert!(orders
+            .foreign_keys
+            .iter()
+            .any(|f| f.referenced_table == "users" && f.columns == vec!["user_id"]));
+        assert!(orders
+            .indexes
+            .iter()
+            .any(|i| i.name == "idx_orders_status_created"
+                && i.columns == vec!["status", "created_at"]));
+        let view = resp
+            .objects
+            .iter()
+            .find(|o| o.name == "active_user_orders")
+            .unwrap();
+        assert!(view
+            .definition
+            .as_deref()
+            .unwrap()
+            .contains("`appdb`.`orders`"));
         // The minimal login cannot see routines; the catalog says so instead of failing.
         let warnings = adapter.live().unwrap().catalog_warnings();
-        assert!(warnings.iter().any(|w| w.contains("SHOW_ROUTINE")), "{warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("SHOW_ROUTINE")),
+            "{warnings:?}"
+        );
 
-        let described = adapter.describe_object(Some("appdb"), "users", CatalogDetailLevel::Full).await.unwrap();
+        let described = adapter
+            .describe_object(Some("appdb"), "users", CatalogDetailLevel::Full)
+            .await
+            .unwrap();
         assert!(described.columns.iter().any(|c| c.name == "password_hash"));
 
         let plan = adapter
@@ -2158,7 +2248,9 @@ INSERT INTO t VALUES (1);
             .explain(ExplainRequest {
                 request_id: "e2".to_string(),
                 connection: "live".to_string(),
-                sql: "SELECT o.id FROM orders o JOIN users u ON u.id = o.user_id WHERE o.user_id = 1".to_string(),
+                sql:
+                    "SELECT o.id FROM orders o JOIN users u ON u.id = o.user_id WHERE o.user_id = 1"
+                        .to_string(),
                 params: vec![],
                 analyze: true,
                 format: ExplainFormat::Text,
@@ -2205,42 +2297,90 @@ INSERT INTO t VALUES (1);
             &ExecutionLimits::default(),
         );
         let res = adapter.execute(q).await.unwrap();
-        assert_eq!(res.schema_version.as_deref(), Some(snap.schema_version.as_str()));
+        assert_eq!(
+            res.schema_version.as_deref(),
+            Some(snap.schema_version.as_str())
+        );
     }
 
     #[tokio::test]
     async fn live_catalog_with_show_routine_lists_routines() {
-        let Some(adapter) = live_adapter("DB_MCP_MYSQL_TEST_DSN_DIAG") else { return };
+        let Some(adapter) = live_adapter("DB_MCP_MYSQL_TEST_DSN_DIAG") else {
+            return;
+        };
         let resp = adapter
-            .discover(catalog_req(vec![CatalogObjectType::Procedure, CatalogObjectType::Function]))
+            .discover(catalog_req(vec![
+                CatalogObjectType::Procedure,
+                CatalogObjectType::Function,
+            ]))
             .await
             .unwrap();
-        let checkout = resp.objects.iter().find(|o| o.name == "checkout_order").expect("checkout_order");
+        let checkout = resp
+            .objects
+            .iter()
+            .find(|o| o.name == "checkout_order")
+            .expect("checkout_order");
         let def = checkout.definition.as_deref().unwrap();
-        assert!(def.starts_with("CREATE PROCEDURE `appdb`.`checkout_order`(IN p_order_id bigint)"), "{def}");
+        assert!(
+            def.starts_with("CREATE PROCEDURE `appdb`.`checkout_order`(IN p_order_id bigint)"),
+            "{def}"
+        );
         assert!(def.contains("CALL reserve_inventory"));
-        let f = resp.objects.iter().find(|o| o.name == "calculate_order_discount").unwrap();
+        let f = resp
+            .objects
+            .iter()
+            .find(|o| o.name == "calculate_order_discount")
+            .unwrap();
         assert_eq!(f.object_type, CatalogObjectType::Function);
-        assert!(f.definition.as_deref().unwrap().contains("RETURNS decimal(12,2)"));
-        assert!(!adapter.live().unwrap().catalog_warnings().iter().any(|w| w.contains("SHOW_ROUTINE")));
+        assert!(f
+            .definition
+            .as_deref()
+            .unwrap()
+            .contains("RETURNS decimal(12,2)"));
+        assert!(!adapter
+            .live()
+            .unwrap()
+            .catalog_warnings()
+            .iter()
+            .any(|w| w.contains("SHOW_ROUTINE")));
     }
 
     #[tokio::test]
     async fn live_diagnostics_degrade_without_grants_and_use_them_when_granted() {
-        let Some(ro) = live_adapter("DB_MCP_MYSQL_TEST_DSN") else { return };
+        let Some(ro) = live_adapter("DB_MCP_MYSQL_TEST_DSN") else {
+            return;
+        };
         let live = ro.live().unwrap().clone();
         let objects = ro.collect_all_catalog_objects().await.unwrap();
         let report = live.database_health(&objects).await.unwrap();
-        let ids: Vec<&str> = report.findings.iter().map(|f| f.check_id.as_str()).collect();
-        assert!(ids.contains(&"tables_without_primary_key") && ids.contains(&"redundant_indexes"), "{ids:?}");
-        assert!(ids.contains(&"process_visibility") && ids.contains(&"workload_visibility"), "{ids:?}");
+        let ids: Vec<&str> = report
+            .findings
+            .iter()
+            .map(|f| f.check_id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"tables_without_primary_key") && ids.contains(&"redundant_indexes"),
+            "{ids:?}"
+        );
+        assert!(
+            ids.contains(&"process_visibility") && ids.contains(&"workload_visibility"),
+            "{ids:?}"
+        );
         assert!(report.active_connections.is_some() && report.max_connections.is_some());
-        let no_pk = report.findings.iter().find(|f| f.check_id == "tables_without_primary_key").unwrap();
+        let no_pk = report
+            .findings
+            .iter()
+            .find(|f| f.check_id == "tables_without_primary_key")
+            .unwrap();
         assert!(no_pk.evidence.to_string().contains("event_log_nopk"));
         let w = live.analyze_workload(10).await.unwrap();
-        assert!(w.unwrap_err().contains("GRANT SELECT ON performance_schema"));
+        assert!(w
+            .unwrap_err()
+            .contains("GRANT SELECT ON performance_schema"));
 
-        let Some(diag) = live_adapter("DB_MCP_MYSQL_TEST_DSN_DIAG") else { return };
+        let Some(diag) = live_adapter("DB_MCP_MYSQL_TEST_DSN_DIAG") else {
+            return;
+        };
         let q = AuthorizedQuery::new_read(
             "r",
             "live",
@@ -2251,13 +2391,33 @@ INSERT INTO t VALUES (1);
         );
         diag.execute(q).await.unwrap();
         let live = diag.live().unwrap().clone();
-        let w = live.analyze_workload(20).await.unwrap().expect("digests readable with the grant");
-        assert_eq!(w.source, "performance_schema.events_statements_summary_by_digest");
-        assert!(w.top_queries.iter().any(|q| q.normalized_query.to_ascii_lowercase().contains("total_cents")), "{:?}", w.top_queries);
-        assert!(!w.top_queries.iter().any(|q| q.normalized_query.to_ascii_lowercase().contains("information_schema")));
+        let w = live
+            .analyze_workload(20)
+            .await
+            .unwrap()
+            .expect("digests readable with the grant");
+        assert_eq!(
+            w.source,
+            "performance_schema.events_statements_summary_by_digest"
+        );
+        assert!(
+            w.top_queries.iter().any(|q| q
+                .normalized_query
+                .to_ascii_lowercase()
+                .contains("total_cents")),
+            "{:?}",
+            w.top_queries
+        );
+        assert!(!w.top_queries.iter().any(|q| q
+            .normalized_query
+            .to_ascii_lowercase()
+            .contains("information_schema")));
         let objects = diag.collect_all_catalog_objects().await.unwrap();
         let report = live.database_health(&objects).await.unwrap();
-        assert!(!report.findings.iter().any(|f| f.check_id == "process_visibility" || f.check_id == "workload_visibility"));
+        assert!(!report
+            .findings
+            .iter()
+            .any(|f| f.check_id == "process_visibility" || f.check_id == "workload_visibility"));
     }
 
     #[test]

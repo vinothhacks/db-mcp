@@ -105,7 +105,10 @@ impl DbMcpError {
 
     /// Indicates whether the caller can safely retry the same operation without modification.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::ExecutionTimeout { .. } | Self::ExecutionCancelled(_))
+        matches!(
+            self,
+            Self::ExecutionTimeout { .. } | Self::ExecutionCancelled(_)
+        )
     }
 
     /// Suggested next MCP tool or remediation action when a request is denied.
@@ -113,7 +116,9 @@ impl DbMcpError {
         match self {
             Self::PolicyDenied { next_action, .. } => next_action.as_deref(),
             Self::ApprovalRequired(_) => Some("propose_change"),
-            Self::SelfApprovalForbidden(_) => Some("db-mcp approve --change-id <id> --approver <admin>"),
+            Self::SelfApprovalForbidden(_) => {
+                Some("db-mcp approve --change-id <id> --approver <admin>")
+            }
             Self::ApprovalAlreadyConsumed(_) | Self::ApprovalExpired(_) => Some("propose_change"),
             Self::ApprovalHashMismatch(_) | Self::SchemaDriftDetected(_) => Some("capture_schema"),
             Self::ConnectionNotFound(_) | Self::Unauthorized(_) => Some("list_connections"),
@@ -362,10 +367,7 @@ impl CallerIdentity {
     /// Check if this caller is an automated coding agent.
     pub fn is_agent(&self) -> bool {
         self.role.eq_ignore_ascii_case("agent")
-            || self
-                .roles
-                .iter()
-                .any(|r| r.eq_ignore_ascii_case("agent"))
+            || self.roles.iter().any(|r| r.eq_ignore_ascii_case("agent"))
     }
 
     /// Check if this caller is authorized to access the given connection ID.
@@ -1766,7 +1768,8 @@ pub trait SchemaDiffProvider: Send + Sync {
 #[async_trait]
 pub trait TransactionalDdlProvider: Send + Sync {
     fn supports_transactional_ddl(&self) -> bool;
-    async fn execute_transactional_ddl(&self, request: AuthorizedQuery) -> DbMcpResult<QueryResult>;
+    async fn execute_transactional_ddl(&self, request: AuthorizedQuery)
+        -> DbMcpResult<QueryResult>;
 }
 
 #[cfg(test)]

@@ -24,8 +24,8 @@ use db_mcp_core::DatabaseEngine;
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::{
     AlterTableOperation, AssignmentTarget, Distinct, Expr, FunctionArg, FunctionArgExpr,
-    FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator, Query, Select,
-    SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Visit, Visitor,
+    FunctionArguments, GroupByExpr, Ident, JoinConstraint, JoinOperator, Query, Select, SelectItem,
+    SetExpr, Statement, TableFactor, TableWithJoins, Visit, Visitor,
 };
 
 /// A column reference whose value reaches query output (or stored data) under a name other than
@@ -81,7 +81,10 @@ impl DisclosureAnalysis {
 }
 
 /// Analyse how the column references of one parsed statement reach its output.
-pub fn analyze_statement_disclosure(engine: DatabaseEngine, stmt: &Statement) -> DisclosureAnalysis {
+pub fn analyze_statement_disclosure(
+    engine: DatabaseEngine,
+    stmt: &Statement,
+) -> DisclosureAnalysis {
     let mut scope = RelationScope::default();
     let _ = stmt.visit(&mut scope);
     let whole_row_names = if engine == DatabaseEngine::Postgres {
@@ -201,7 +204,9 @@ fn key_for_expr(expr: &Expr, whole_row_names: &BTreeSet<String>) -> Option<RefKe
         Expr::CompoundIdentifier(parts) if parts.len() == 1 => {
             key_for_expr(&Expr::Identifier(parts[0].clone()), whole_row_names)
         }
-        Expr::QualifiedWildcard(name) => Some(RefKey::WholeRow(name.to_string().to_ascii_lowercase())),
+        Expr::QualifiedWildcard(name) => {
+            Some(RefKey::WholeRow(name.to_string().to_ascii_lowercase()))
+        }
         _ => None,
     }
 }
@@ -230,7 +235,10 @@ impl<'a> RefCounter<'a> {
         match body {
             SetExpr::Select(select) => {
                 for item in &select.projection {
-                    if matches!(item, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)) {
+                    if matches!(
+                        item,
+                        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+                    ) {
                         self.add(RefKey::Wildcard);
                     }
                 }
@@ -287,10 +295,16 @@ struct RelationScope {
 }
 
 impl RelationScope {
-    fn resolve(&self, qualifier: Option<&str>, column: &str, output_name: Option<String>) -> Vec<ColumnExposure> {
+    fn resolve(
+        &self,
+        qualifier: Option<&str>,
+        column: &str,
+        output_name: Option<String>,
+    ) -> Vec<ColumnExposure> {
         let tables: Vec<Option<String>> = match qualifier {
             Some(q) => {
-                let mut candidates: BTreeSet<String> = self.alias_tables.get(q).cloned().unwrap_or_default();
+                let mut candidates: BTreeSet<String> =
+                    self.alias_tables.get(q).cloned().unwrap_or_default();
                 candidates.insert(q.to_string());
                 candidates.into_iter().map(Some).collect()
             }
@@ -312,7 +326,10 @@ impl RelationScope {
             let name = clean(&alias.name);
             self.relation_names.insert(name.clone());
             if let Some(t) = table {
-                self.alias_tables.entry(name).or_default().insert(t.to_string());
+                self.alias_tables
+                    .entry(name)
+                    .or_default()
+                    .insert(t.to_string());
             }
         }
     }
@@ -338,7 +355,10 @@ impl Visitor for RelationScope {
                 let full = name.to_string().to_ascii_lowercase();
                 let base = name.0.last().map(clean).unwrap_or_else(|| full.clone());
                 self.relation_names.insert(base.clone());
-                self.alias_tables.entry(base.clone()).or_default().insert(full.clone());
+                self.alias_tables
+                    .entry(base.clone())
+                    .or_default()
+                    .insert(full.clone());
                 if !self.cte_names.contains(&base) {
                     self.base_tables.insert(full.clone());
                 }
@@ -387,7 +407,9 @@ fn leftmost_output_names(body: &SetExpr) -> Option<Vec<Option<String>>> {
             let mut names = Vec::new();
             for item in &select.projection {
                 match item {
-                    SelectItem::UnnamedExpr(Expr::Identifier(ident)) => names.push(Some(clean(ident))),
+                    SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
+                        names.push(Some(clean(ident)))
+                    }
                     SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
                         names.push(parts.last().map(clean))
                     }
@@ -533,7 +555,9 @@ impl DisclosureWalker<'_> {
                 self.walk_query(query, &ctx);
             }
             Statement::CreateIndex(index) => self.mark_safe(index),
-            Statement::AlterTable { name, operations, .. } => {
+            Statement::AlterTable {
+                name, operations, ..
+            } => {
                 let table = name.to_string().to_ascii_lowercase();
                 for op in operations {
                     let renamed = match op {
@@ -629,7 +653,9 @@ impl DisclosureWalker<'_> {
         // `SELECT ... INTO new_table` creates a table with the projection's own column names;
         // `SELECT ... INTO @var` stores values in targets the projection does not name.
         let ctx = match &select.into {
-            Some(into) if into.name.to_string().starts_with('@') => ProjectionContext::Positional(None),
+            Some(into) if into.name.to_string().starts_with('@') => {
+                ProjectionContext::Positional(None)
+            }
             _ => ctx.clone(),
         };
         self.walk_projection(&select.projection, &ctx, true);
@@ -660,25 +686,35 @@ impl DisclosureWalker<'_> {
         }
     }
 
-    fn walk_projection(&mut self, items: &[SelectItem], ctx: &ProjectionContext, counted_wildcards: bool) {
+    fn walk_projection(
+        &mut self,
+        items: &[SelectItem],
+        ctx: &ProjectionContext,
+        counted_wildcards: bool,
+    ) {
         for (i, item) in items.iter().enumerate() {
             match ctx {
                 ProjectionContext::Named => match item {
                     SelectItem::UnnamedExpr(expr) => {
                         // A bare column keeps its own name in the output, where redaction sees it.
-                        if let Some(key @ RefKey::Column { .. }) = key_for_expr(expr, self.whole_row_names) {
+                        if let Some(key @ RefKey::Column { .. }) =
+                            key_for_expr(expr, self.whole_row_names)
+                        {
                             *self.safe.entry(key).or_insert(0) += 1;
                         }
                         // Any other expression is named after its own text: left unaccounted.
                     }
-                    SelectItem::ExprWithAlias { expr, alias } => self.mark_renamed(expr, Some(clean(alias))),
+                    SelectItem::ExprWithAlias { expr, alias } => {
+                        self.mark_renamed(expr, Some(clean(alias)))
+                    }
                     SelectItem::Wildcard(opts) | SelectItem::QualifiedWildcard(_, opts) => {
                         let renames = opts.opt_rename.is_some() || opts.opt_replace.is_some();
                         if counted_wildcards && !renames {
                             *self.safe.entry(RefKey::Wildcard).or_insert(0) += 1;
                         } else if renames {
-                            self.untracked
-                                .push("wildcard projection with RENAME/REPLACE options".to_string());
+                            self.untracked.push(
+                                "wildcard projection with RENAME/REPLACE options".to_string(),
+                            );
                         }
                     }
                 },
@@ -723,7 +759,9 @@ impl DisclosureWalker<'_> {
 
     fn walk_table_factor(&mut self, factor: &TableFactor) {
         match factor {
-            TableFactor::Table { name, alias, args, .. } => {
+            TableFactor::Table {
+                name, alias, args, ..
+            } => {
                 // `users AS u(a, b, ...)` renames a relation's columns positionally without naming
                 // them. Table-valued function outputs are tracked through their arguments instead.
                 if args.is_none() && alias.as_ref().is_some_and(|a| !a.columns.is_empty()) {
@@ -732,9 +770,13 @@ impl DisclosureWalker<'_> {
                     ));
                 }
             }
-            TableFactor::Derived { subquery, alias, .. } => {
+            TableFactor::Derived {
+                subquery, alias, ..
+            } => {
                 let ctx = match alias {
-                    Some(a) if !a.columns.is_empty() => ProjectionContext::Positional(ident_names(&a.columns)),
+                    Some(a) if !a.columns.is_empty() => {
+                        ProjectionContext::Positional(ident_names(&a.columns))
+                    }
                     _ => ProjectionContext::Named,
                 };
                 self.walk_query(subquery, &ctx);

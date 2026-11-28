@@ -200,7 +200,11 @@ fn scan_dependent_objects(
             continue;
         }
 
-        let Some(def_sql) = obj.definition.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        let Some(def_sql) = obj
+            .definition
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
         else {
             continue;
         };
@@ -224,7 +228,13 @@ fn scan_dependent_objects(
 
         if let Ok(parsed) = parse_and_analyze_sql(engine, def_sql) {
             for stmt in &parsed.statements {
-                inspect_statement_for_table(stmt, target_table, obj.object_type, &mut is_read, &mut is_write);
+                inspect_statement_for_table(
+                    stmt,
+                    target_table,
+                    obj.object_type,
+                    &mut is_read,
+                    &mut is_write,
+                );
             }
         }
 
@@ -236,8 +246,18 @@ fn scan_dependent_objects(
             }
         }
 
-        if !is_read && !is_write && matches!(obj.object_type, CatalogObjectType::View | CatalogObjectType::MaterializedView) {
-            if word_re.as_ref().map(|r| r.is_match(def_sql)).unwrap_or(false) {
+        if !is_read
+            && !is_write
+            && matches!(
+                obj.object_type,
+                CatalogObjectType::View | CatalogObjectType::MaterializedView
+            )
+        {
+            if word_re
+                .as_ref()
+                .map(|r| r.is_match(def_sql))
+                .unwrap_or(false)
+            {
                 is_read = true;
             }
         }
@@ -594,9 +614,9 @@ pub fn trace_table_dependencies(
     let dependent_objects =
         scan_dependent_objects(objects, engine, root_obj, &known_routines, &known_tables);
 
-    let join_path = resolved_target
-        .as_deref()
-        .and_then(|target_qname| find_shortest_join_path(&root_qname, target_qname, &all_edges, depth_limit));
+    let join_path = resolved_target.as_deref().and_then(|target_qname| {
+        find_shortest_join_path(&root_qname, target_qname, &all_edges, depth_limit)
+    });
 
     let mermaid_diagram = render_table_dependency_mermaid(
         &root_qname,
@@ -692,12 +712,13 @@ pub fn build_procedure_call_graph(
 
     let resolved_root = match root_procedure.map(str::trim).filter(|s| !s.is_empty()) {
         Some(root_raw) => {
-            let root_obj = resolve_routine_object(&routine_objs, root_raw, None).ok_or_else(|| {
-                DbMcpError::InvalidArgument(format!(
-                    "Procedure or function '{}' was not found in connection '{}'",
-                    root_raw, connection
-                ))
-            })?;
+            let root_obj =
+                resolve_routine_object(&routine_objs, root_raw, None).ok_or_else(|| {
+                    DbMcpError::InvalidArgument(format!(
+                        "Procedure or function '{}' was not found in connection '{}'",
+                        root_raw, connection
+                    ))
+                })?;
             Some(root_obj.qualified_name())
         }
         None => None,
@@ -751,24 +772,22 @@ pub fn build_procedure_call_graph(
             );
 
             // Ensure external/unregistered callee still has a stub node if referenced
-            nodes_map
-                .entry(callee_qname.clone())
-                .or_insert_with(|| {
-                    let (schema, name) = callee_qname
-                        .rsplit_once('.')
-                        .unwrap_or(("", callee_qname.as_str()));
-                    ProcedureNode {
-                        schema: schema.to_owned(),
-                        name: name.to_owned(),
-                        qualified_name: callee_qname,
-                        routine_kind: CatalogObjectType::Procedure,
-                        definition: None,
-                        direct_callees: Vec::new(),
-                        direct_callers: Vec::new(),
-                        tables_read: Vec::new(),
-                        tables_written: Vec::new(),
-                    }
-                });
+            nodes_map.entry(callee_qname.clone()).or_insert_with(|| {
+                let (schema, name) = callee_qname
+                    .rsplit_once('.')
+                    .unwrap_or(("", callee_qname.as_str()));
+                ProcedureNode {
+                    schema: schema.to_owned(),
+                    name: name.to_owned(),
+                    qualified_name: callee_qname,
+                    routine_kind: CatalogObjectType::Procedure,
+                    definition: None,
+                    direct_callees: Vec::new(),
+                    direct_callers: Vec::new(),
+                    tables_read: Vec::new(),
+                    tables_written: Vec::new(),
+                }
+            });
         }
 
         if let Some(node) = nodes_map.get_mut(&caller_qname) {
@@ -879,7 +898,11 @@ pub fn build_procedure_call_graph(
                 depth: 1,
             })
             .collect();
-        edge_list.sort_by(|a, b| a.caller.cmp(&b.caller).then_with(|| a.callee.cmp(&b.callee)));
+        edge_list.sort_by(|a, b| {
+            a.caller
+                .cmp(&b.caller)
+                .then_with(|| a.callee.cmp(&b.callee))
+        });
         (included, edge_list)
     };
 
@@ -1489,11 +1512,13 @@ mod tests {
             .iter()
             .any(|e| e.caller == "public.reserve_inventory"
                 && e.callee == "public.record_order_audit"));
-        assert!(upstream
-            .edges
-            .iter()
-            .any(|e| e.caller == "public.checkout_order"
-                && e.callee == "public.reserve_inventory"));
+        assert!(
+            upstream
+                .edges
+                .iter()
+                .any(|e| e.caller == "public.checkout_order"
+                    && e.callee == "public.reserve_inventory")
+        );
     }
 
     #[test]

@@ -170,10 +170,15 @@ struct QuestionParts {
 }
 
 fn split_question(question: &str) -> QuestionParts {
-    let re = Regex::new(r"(?i)\b(?:grouped by|broken down by|split by|for each|for every|by|per)\b").expect("static regex");
+    let re =
+        Regex::new(r"(?i)\b(?:grouped by|broken down by|split by|for each|for every|by|per)\b")
+            .expect("static regex");
     let lower = question.trim().trim_end_matches('?').trim().to_string();
     let Some(m) = re.find(&lower) else {
-        return QuestionParts { metric: lower, ..QuestionParts::default() };
+        return QuestionParts {
+            metric: lower,
+            ..QuestionParts::default()
+        };
     };
     let metric = lower[..m.start()].trim().to_string();
     let tail = &lower[m.end()..];
@@ -208,19 +213,72 @@ fn split_question(question: &str) -> QuestionParts {
             clauses[0] = format!("{last} only");
         }
     }
-    QuestionParts { metric, dimensions, clauses }
+    QuestionParts {
+        metric,
+        dimensions,
+        clauses,
+    }
 }
 
 /// Words that never restrict or redefine an answer: question scaffolding, measure verbs,
 /// filter-clause keywords (their content is still checked) and aggregation words for the
 /// aggregation the metric already has. Compared after stemming.
 const NEUTRAL: &[&str] = &[
-    "total", "sum", "number", "count", "amount", "overall", "altogether", "combined", "grand",
-    "show", "list", "give", "tell", "get", "find", "return", "display", "calculate", "compute",
-    "report", "can", "could", "would", "will", "you", "i", "we", "our", "us", "my", "want", "need",
-    "know", "see", "sold", "placed", "made", "bought", "purchased", "spent", "earned", "generated",
-    "recorded", "have", "has", "had", "been", "being", "exist", "where", "whose", "having", "only",
-    "when", "breakdown",
+    "total",
+    "sum",
+    "number",
+    "count",
+    "amount",
+    "overall",
+    "altogether",
+    "combined",
+    "grand",
+    "show",
+    "list",
+    "give",
+    "tell",
+    "get",
+    "find",
+    "return",
+    "display",
+    "calculate",
+    "compute",
+    "report",
+    "can",
+    "could",
+    "would",
+    "will",
+    "you",
+    "i",
+    "we",
+    "our",
+    "us",
+    "my",
+    "want",
+    "need",
+    "know",
+    "see",
+    "sold",
+    "placed",
+    "made",
+    "bought",
+    "purchased",
+    "spent",
+    "earned",
+    "generated",
+    "recorded",
+    "have",
+    "has",
+    "had",
+    "been",
+    "being",
+    "exist",
+    "where",
+    "whose",
+    "having",
+    "only",
+    "when",
+    "breakdown",
 ];
 
 /// Generic measure words that do not identify WHAT a metric measures.
@@ -287,14 +345,21 @@ fn is_neutral(token: &str) -> bool {
 /// Every word a certified definition stands for: name, synonyms, table, column and (for
 /// filters) the literal value. Free-text descriptions are not semantics and do not count.
 fn definition_terms(def: &Definition) -> BTreeSet<String> {
-    let mut texts: Vec<String> = std::iter::once(def.name.clone()).chain(def.synonyms.iter().cloned()).collect();
+    let mut texts: Vec<String> = std::iter::once(def.name.clone())
+        .chain(def.synonyms.iter().cloned())
+        .collect();
     match &def.body {
         DefinitionBody::Entity { table } => texts.push(base_table_name(table)),
         DefinitionBody::Attribute { table, column, .. } => {
             texts.push(base_table_name(table));
             texts.push(column.clone());
         }
-        DefinitionBody::Filter { table, column, value, .. } => {
+        DefinitionBody::Filter {
+            table,
+            column,
+            value,
+            ..
+        } => {
             texts.push(base_table_name(table));
             texts.push(column.clone());
             let values = match value {
@@ -310,13 +375,19 @@ fn definition_terms(def: &Definition) -> BTreeSet<String> {
                 }
             }
         }
-        DefinitionBody::Metric { base_table, column, .. } => {
+        DefinitionBody::Metric {
+            base_table, column, ..
+        } => {
             texts.push(base_table_name(base_table));
             if let Some(c) = column {
                 texts.push(c.clone());
             }
         }
-        DefinitionBody::Relationship { from_table, to_table, .. } => {
+        DefinitionBody::Relationship {
+            from_table,
+            to_table,
+            ..
+        } => {
             texts.push(base_table_name(from_table));
             texts.push(base_table_name(to_table));
         }
@@ -327,11 +398,22 @@ fn definition_terms(def: &Definition) -> BTreeSet<String> {
 /// Words that identify what a definition is about beyond its table and generic measure words
 /// (`role` for "user role", `quantity` for "order item quantity").
 fn identifying_terms(def: &Definition) -> BTreeSet<String> {
-    let table_tokens: BTreeSet<String> = def.body.tables().iter().flat_map(|t| tokenize(&base_table_name(t))).collect();
-    let mut texts: Vec<String> = std::iter::once(def.name.clone()).chain(def.synonyms.iter().cloned()).collect();
+    let table_tokens: BTreeSet<String> = def
+        .body
+        .tables()
+        .iter()
+        .flat_map(|t| tokenize(&base_table_name(t)))
+        .collect();
+    let mut texts: Vec<String> = std::iter::once(def.name.clone())
+        .chain(def.synonyms.iter().cloned())
+        .collect();
     match &def.body {
-        DefinitionBody::Attribute { column, .. } | DefinitionBody::Filter { column, .. } => texts.push(column.clone()),
-        DefinitionBody::Metric { column: Some(c), .. } => texts.push(c.clone()),
+        DefinitionBody::Attribute { column, .. } | DefinitionBody::Filter { column, .. } => {
+            texts.push(column.clone())
+        }
+        DefinitionBody::Metric {
+            column: Some(c), ..
+        } => texts.push(c.clone()),
         _ => {}
     }
     texts
@@ -344,7 +426,10 @@ fn identifying_terms(def: &Definition) -> BTreeSet<String> {
 /// The text names the definition: a name/synonym phrase appears verbatim, or one of its
 /// identifying words does.
 fn names_definition(def: &Definition, text_norm: &str, text_tokens: &BTreeSet<String>) -> bool {
-    exact_phrase(def, text_norm) || identifying_terms(def).iter().any(|t| text_tokens.contains(t))
+    exact_phrase(def, text_norm)
+        || identifying_terms(def)
+            .iter()
+            .any(|t| text_tokens.contains(t))
 }
 
 /// Original words of `text` whose stems are in `stems`, in order, deduplicated.
@@ -360,15 +445,24 @@ fn original_words(text: &str, stems: &BTreeSet<String>) -> Vec<String> {
 }
 
 fn quoted(words: &[String]) -> String {
-    words.iter().map(|w| format!("'{w}'")).collect::<Vec<_>>().join(", ")
+    words
+        .iter()
+        .map(|w| format!("'{w}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A certified filter matches when all distinctive words of its name (beyond the table name)
 /// appear, or one of its synonyms appears verbatim.
 fn filter_matches(f: &Definition, text_norm: &str, text_tokens: &BTreeSet<String>) -> bool {
-    let DefinitionBody::Filter { table, .. } = &f.body else { return false };
+    let DefinitionBody::Filter { table, .. } = &f.body else {
+        return false;
+    };
     let entity_tokens: BTreeSet<String> = tokenize(&base_table_name(table)).into_iter().collect();
-    let distinctive: BTreeSet<String> = tokenize(&f.name).into_iter().filter(|t| !entity_tokens.contains(t)).collect();
+    let distinctive: BTreeSet<String> = tokenize(&f.name)
+        .into_iter()
+        .filter(|t| !entity_tokens.contains(t))
+        .collect();
     let by_name = !distinctive.is_empty() && distinctive.iter().all(|t| text_tokens.contains(t));
     let by_synonym = f.synonyms.iter().any(|s| {
         let p = normalized_phrase(s);
@@ -427,7 +521,14 @@ fn table_key(t: &str) -> String {
 fn build_graph(rels: &[&Definition]) -> BTreeMap<String, Vec<Edge>> {
     let mut graph: BTreeMap<String, Vec<Edge>> = BTreeMap::new();
     for (i, def) in rels.iter().enumerate() {
-        if let DefinitionBody::Relationship { from_table, to_table, column_pairs, cardinality, .. } = &def.body {
+        if let DefinitionBody::Relationship {
+            from_table,
+            to_table,
+            column_pairs,
+            cardinality,
+            ..
+        } = &def.body
+        {
             graph.entry(table_key(from_table)).or_default().push(Edge {
                 to: table_key(to_table),
                 pairs: column_pairs.clone(),
@@ -436,7 +537,10 @@ fn build_graph(rels: &[&Definition]) -> BTreeMap<String, Vec<Edge>> {
             });
             graph.entry(table_key(to_table)).or_default().push(Edge {
                 to: table_key(from_table),
-                pairs: column_pairs.iter().map(|(a, b)| (b.clone(), a.clone())).collect(),
+                pairs: column_pairs
+                    .iter()
+                    .map(|(a, b)| (b.clone(), a.clone()))
+                    .collect(),
                 cardinality: cardinality.reversed(),
                 def_index: i,
             });
@@ -449,7 +553,11 @@ fn build_graph(rels: &[&Definition]) -> BTreeMap<String, Vec<Edge>> {
 }
 
 /// Shortest path (fewest hops) from `from` to `to`: list of (from_node, edge).
-fn shortest_path(graph: &BTreeMap<String, Vec<Edge>>, from: &str, to: &str) -> Option<Vec<(String, Edge)>> {
+fn shortest_path(
+    graph: &BTreeMap<String, Vec<Edge>>,
+    from: &str,
+    to: &str,
+) -> Option<Vec<(String, Edge)>> {
     if from == to {
         return Some(Vec::new());
     }
@@ -485,8 +593,13 @@ fn exact_phrase(def: &Definition, question_norm: &str) -> bool {
 }
 
 /// Validate a compiled statement: one read-only SELECT over allowlisted tables only.
-pub fn validate_generated_sql(engine: DatabaseEngine, sql: &str, allowed_tables: &[String]) -> Result<(), String> {
-    let analysis = db_mcp_sql::parse_and_analyze_sql(engine, sql).map_err(|e| format!("parse failed: {e}"))?;
+pub fn validate_generated_sql(
+    engine: DatabaseEngine,
+    sql: &str,
+    allowed_tables: &[String],
+) -> Result<(), String> {
+    let analysis =
+        db_mcp_sql::parse_and_analyze_sql(engine, sql).map_err(|e| format!("parse failed: {e}"))?;
     if analysis.statement_count != 1 || analysis.is_multi_statement {
         return Err("compiled SQL must be exactly one statement".to_string());
     }
@@ -497,11 +610,19 @@ pub fn validate_generated_sql(engine: DatabaseEngine, sql: &str, allowed_tables:
     {
         return Err("compiled SQL must be read-only".to_string());
     }
-    if analysis.statements.first().map(|s| s.statement_kind.as_str()) != Some("SELECT") {
+    if analysis
+        .statements
+        .first()
+        .map(|s| s.statement_kind.as_str())
+        != Some("SELECT")
+    {
         return Err("compiled SQL must be a SELECT".to_string());
     }
     if analysis.has_privileged_functions {
-        return Err(format!("privileged functions are not allowed: {:?}", analysis.privileged_functions));
+        return Err(format!(
+            "privileged functions are not allowed: {:?}",
+            analysis.privileged_functions
+        ));
     }
     if !analysis.parse_warnings.is_empty() {
         return Err(format!("analyzer warnings: {:?}", analysis.parse_warnings));
@@ -531,7 +652,10 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
         ));
     }
     // Comparison operators carry semantics (`!=`, `<`) that name-based filter matching cannot honour.
-    if let Some(op) = ["!=", "<>", "≠", "<=", ">=", "≤", "≥", "<", ">"].iter().find(|op| req.question.contains(**op)) {
+    if let Some(op) = ["!=", "<>", "≠", "<=", ">=", "≤", "≥", "<", ">"]
+        .iter()
+        .find(|op| req.question.contains(**op))
+    {
         return plan.refuse(
             PlanStatus::NotAnswerable,
             format!(
@@ -542,7 +666,11 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
     let parts = split_question(req.question);
     let metric_part = parts.metric.clone();
     let dim_parts = parts.dimensions;
-    let metric_query = if tokenize(&metric_part).is_empty() { req.question.to_string() } else { metric_part.clone() };
+    let metric_query = if tokenize(&metric_part).is_empty() {
+        req.question.to_string()
+    } else {
+        metric_part.clone()
+    };
     let question_norm = normalized_phrase(&metric_query);
     // Everything that can restrict the answer: the metric phrase plus trailing filter clauses.
     // Certified filters are matched against all of it; dimension phrases are resolved on their own.
@@ -570,7 +698,10 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
             format!("no certified metric matches '{metric_query}'"),
         );
     };
-    if stale_metrics.iter().any(|s| s.def_id == top.definition.def_id && s.version == top.definition.version) {
+    if stale_metrics
+        .iter()
+        .any(|s| s.def_id == top.definition.def_id && s.version == top.definition.version)
+    {
         return plan.refuse(
             PlanStatus::Stale,
             format!(
@@ -581,8 +712,14 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
     }
     // A match on generic words alone ("number of ...", "total ...") says nothing about WHAT is
     // measured; refusing beats answering a different question.
-    const GENERIC: &[&str] = &["number", "count", "total", "sum", "average", "avg", "amount", "much", "value", "all"];
-    if top.matched_terms.iter().all(|t| GENERIC.contains(&t.as_str())) {
+    const GENERIC: &[&str] = &[
+        "number", "count", "total", "sum", "average", "avg", "amount", "much", "value", "all",
+    ];
+    if top
+        .matched_terms
+        .iter()
+        .all(|t| GENERIC.contains(&t.as_str()))
+    {
         return plan.refuse(
             PlanStatus::NotAnswerable,
             format!(
@@ -608,7 +745,10 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
             .collect();
         return plan.refuse(
             PlanStatus::Ambiguous,
-            format!("'{metric_query}' matches several certified metrics: {}; name one explicitly", names.join(", ")),
+            format!(
+                "'{metric_query}' matches several certified metrics: {}; name one explicitly",
+                names.join(", ")
+            ),
         );
     }
     if let Some(second) = ranked.get(1) {
@@ -618,16 +758,29 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
         ));
     }
     let metric = top.definition.clone();
-    let DefinitionBody::Metric { base_table, aggregation, column, default_filters, unit, grain } = &metric.body else {
-        return plan.refuse(PlanStatus::NotAnswerable, "selected definition is not a metric");
+    let DefinitionBody::Metric {
+        base_table,
+        aggregation,
+        column,
+        default_filters,
+        unit,
+        grain,
+    } = &metric.body
+    else {
+        return plan.refuse(
+            PlanStatus::NotAnswerable,
+            "selected definition is not a metric",
+        );
     };
     let base = table_key(base_table);
 
     // ---- the metric must compute what was asked ----
     // An explicit aggregation word ("average", "max", "distinct", ...) must match the certified
     // aggregation, unless the word is part of the metric's own certified name or synonyms.
-    let metric_words: BTreeSet<String> =
-        std::iter::once(&metric.name).chain(metric.synonyms.iter()).flat_map(|t| tokenize_raw(t)).collect();
+    let metric_words: BTreeSet<String> = std::iter::once(&metric.name)
+        .chain(metric.synonyms.iter())
+        .flat_map(|t| tokenize_raw(t))
+        .collect();
     for word in tokenize_raw(&restrict_text) {
         if metric_words.contains(&word) {
             continue;
@@ -648,8 +801,10 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
     }
     // A column measure must be named: "how many order items" or "total orders" says nothing about
     // summing quantity or order totals.
-    if matches!(aggregation, Aggregation::Sum | Aggregation::Avg | Aggregation::Min | Aggregation::Max)
-        && !names_definition(&metric, &restrict_norm, &q_tokens)
+    if matches!(
+        aggregation,
+        Aggregation::Sum | Aggregation::Avg | Aggregation::Min | Aggregation::Max
+    ) && !names_definition(&metric, &restrict_norm, &q_tokens)
     {
         return plan.refuse(
             PlanStatus::NotAnswerable,
@@ -663,8 +818,16 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
     }
 
     // ---- relationship graph (live only) ----
-    let live_rels: Vec<&Definition> = req.published.iter().filter(|d| d.kind == DefinitionKind::Relationship).collect();
-    let stale_rels: Vec<&Definition> = req.stale.iter().filter(|d| d.kind == DefinitionKind::Relationship).collect();
+    let live_rels: Vec<&Definition> = req
+        .published
+        .iter()
+        .filter(|d| d.kind == DefinitionKind::Relationship)
+        .collect();
+    let stale_rels: Vec<&Definition> = req
+        .stale
+        .iter()
+        .filter(|d| d.kind == DefinitionKind::Relationship)
+        .collect();
     let graph = build_graph(&live_rels);
 
     // Resolves a path from base and refuses fan-out.
@@ -673,11 +836,16 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
         let path = match shortest_path(&graph, &base, target) {
             Some(p) => p,
             None => {
-                let stale_hit = stale_rels.iter().any(|d| d.body.tables().iter().any(|t| table_key(t) == target));
+                let stale_hit = stale_rels
+                    .iter()
+                    .any(|d| d.body.tables().iter().any(|t| table_key(t) == target));
                 return Err(if stale_hit {
                     (PlanStatus::Stale, format!("the certified relationship reaching {target} is stale after a schema change"))
                 } else {
-                    (PlanStatus::NotAnswerable, format!("no certified relationship connects {base} to {target}"))
+                    (
+                        PlanStatus::NotAnswerable,
+                        format!("no certified relationship connects {base} to {target}"),
+                    )
                 });
             }
         };
@@ -698,15 +866,29 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
     // ---- filters ----
     let mut filters: Vec<Definition> = Vec::new();
     for f_id in default_filters {
-        match req.published.iter().find(|d| &d.def_id == f_id && d.kind == DefinitionKind::Filter) {
+        match req
+            .published
+            .iter()
+            .find(|d| &d.def_id == f_id && d.kind == DefinitionKind::Filter)
+        {
             Some(f) => filters.push(f.clone()),
             None => {
-                return plan.refuse(PlanStatus::Stale, format!("default filter {f_id} of metric '{}' is not published", metric.name));
+                return plan.refuse(
+                    PlanStatus::Stale,
+                    format!(
+                        "default filter {f_id} of metric '{}' is not published",
+                        metric.name
+                    ),
+                );
             }
         }
     }
     let mut asked_filters = 0usize;
-    for f in req.published.iter().filter(|d| d.kind == DefinitionKind::Filter) {
+    for f in req
+        .published
+        .iter()
+        .filter(|d| d.kind == DefinitionKind::Filter)
+    {
         if filters.iter().any(|x| x.def_id == f.def_id) {
             continue;
         }
@@ -722,7 +904,10 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
     }) {
         return plan.refuse(
             PlanStatus::Stale,
-            format!("filter '{}' ({} v{}) is stale after a schema change and needs re-certification", s.name, s.def_id, s.version),
+            format!(
+                "filter '{}' ({} v{}) is stale after a schema change and needs re-certification",
+                s.name, s.def_id, s.version
+            ),
         );
     }
     // Certified filters are always ANDed: "completed or pending" must not become "completed and pending".
@@ -743,14 +928,32 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
     for (i, a) in filters.iter().enumerate() {
         for b in &filters[i + 1..] {
             let (
-                DefinitionBody::Filter { table: ta, column: ca, operator: oa, .. },
-                DefinitionBody::Filter { table: tb, column: cb, operator: ob, .. },
+                DefinitionBody::Filter {
+                    table: ta,
+                    column: ca,
+                    operator: oa,
+                    ..
+                },
+                DefinitionBody::Filter {
+                    table: tb,
+                    column: cb,
+                    operator: ob,
+                    ..
+                },
             ) = (&a.body, &b.body)
             else {
                 continue;
             };
-            let exclusive = |op: &FilterOp| matches!(op, FilterOp::Eq | FilterOp::In | FilterOp::IsNull | FilterOp::IsNotNull);
-            if table_key(ta) == table_key(tb) && ca.eq_ignore_ascii_case(cb) && (exclusive(oa) || exclusive(ob)) {
+            let exclusive = |op: &FilterOp| {
+                matches!(
+                    op,
+                    FilterOp::Eq | FilterOp::In | FilterOp::IsNull | FilterOp::IsNotNull
+                )
+            };
+            if table_key(ta) == table_key(tb)
+                && ca.eq_ignore_ascii_case(cb)
+                && (exclusive(oa) || exclusive(ob))
+            {
                 return plan.refuse(
                     PlanStatus::NotAnswerable,
                     format!(
@@ -781,29 +984,51 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
         pool.extend(stale_attrs.iter().cloned());
         let ranked = rank(phrase, &pool);
         let Some(best) = ranked.first() else {
-            if req.published.iter().any(|d| d.kind == DefinitionKind::Attribute && d.flags.sensitive && !rank(phrase, std::slice::from_ref(d)).is_empty()) {
+            if req.published.iter().any(|d| {
+                d.kind == DefinitionKind::Attribute
+                    && d.flags.sensitive
+                    && !rank(phrase, std::slice::from_ref(d)).is_empty()
+            }) {
                 return plan.refuse(PlanStatus::NotAnswerable, format!("'{phrase}' maps to a sensitive column, which cannot be used as a grouping dimension"));
             }
-            return plan.refuse(PlanStatus::NotAnswerable, format!("no certified attribute matches dimension '{phrase}'"));
+            return plan.refuse(
+                PlanStatus::NotAnswerable,
+                format!("no certified attribute matches dimension '{phrase}'"),
+            );
         };
         let phrase_norm = normalized_phrase(phrase);
         let phrase_tokens: BTreeSet<String> = tokenize(phrase).into_iter().collect();
         let uncovered = |d: &Definition| -> BTreeSet<String> {
             let terms = definition_terms(d);
-            phrase_tokens.iter().filter(|t| !terms.contains(*t) && !is_neutral(t)).cloned().collect()
+            phrase_tokens
+                .iter()
+                .filter(|t| !terms.contains(*t) && !is_neutral(t))
+                .cloned()
+                .collect()
         };
         // Prefer an attribute the phrase names with no words left over.
         // Among near-ties prefer the attribute reachable with the fewest joins.
-        let close: Vec<&ScoredDefinition> = ranked.iter().filter(|r| r.score >= best.score * 0.9).collect();
+        let close: Vec<&ScoredDefinition> = ranked
+            .iter()
+            .filter(|r| r.score >= best.score * 0.9)
+            .collect();
         let chosen = close
             .iter()
             .min_by_key(|r| {
                 let named = names_definition(&r.definition, &phrase_norm, &phrase_tokens);
-                let t = r.definition.body.tables().first().map(|t| table_key(t)).unwrap_or_default();
+                let t = r
+                    .definition
+                    .body
+                    .tables()
+                    .first()
+                    .map(|t| table_key(t))
+                    .unwrap_or_default();
                 (
                     !named,
                     uncovered(&r.definition).len(),
-                    shortest_path(&graph, &base, &t).map(|p| p.len()).unwrap_or(usize::MAX),
+                    shortest_path(&graph, &base, &t)
+                        .map(|p| p.len())
+                        .unwrap_or(usize::MAX),
                 )
             })
             .copied()
@@ -829,11 +1054,23 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
                 ),
             );
         }
-        if stale_attrs.iter().any(|s| s.def_id == chosen.definition.def_id && s.version == chosen.definition.version) {
-            return plan.refuse(PlanStatus::Stale, format!("dimension '{}' is stale after a schema change", chosen.definition.name));
+        if stale_attrs
+            .iter()
+            .any(|s| s.def_id == chosen.definition.def_id && s.version == chosen.definition.version)
+        {
+            return plan.refuse(
+                PlanStatus::Stale,
+                format!(
+                    "dimension '{}' is stale after a schema change",
+                    chosen.definition.name
+                ),
+            );
         }
         if let DefinitionBody::Attribute { table, .. } = &chosen.definition.body {
-            needed.push((table_key(table), format!("dimension {}", chosen.definition.name)));
+            needed.push((
+                table_key(table),
+                format!("dimension {}", chosen.definition.name),
+            ));
         }
         dims.push(chosen.definition.clone());
     }
@@ -845,7 +1082,11 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
     for d in filters.iter().chain(dims.iter()) {
         covered.extend(definition_terms(d));
     }
-    let leftover: BTreeSet<String> = q_tokens.iter().filter(|t| !covered.contains(*t) && !is_neutral(t)).cloned().collect();
+    let leftover: BTreeSet<String> = q_tokens
+        .iter()
+        .filter(|t| !covered.contains(*t) && !is_neutral(t))
+        .cloned()
+        .collect();
     if !leftover.is_empty() {
         return plan.refuse(
             PlanStatus::NotAnswerable,
@@ -858,7 +1099,8 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
 
     // ---- join paths ----
     let mut alias_of: BTreeMap<String, String> = BTreeMap::from([(base.clone(), "t0".to_string())]);
-    let mut table_names: BTreeMap<String, String> = BTreeMap::from([(base.clone(), base_table.clone())]);
+    let mut table_names: BTreeMap<String, String> =
+        BTreeMap::from([(base.clone(), base_table.clone())]);
     let mut joins: Vec<String> = Vec::new();
     let mut used_rels: BTreeSet<usize> = BTreeSet::new();
     for (target, _purpose) in &needed {
@@ -871,7 +1113,10 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
                 continue;
             }
             let alias = format!("t{}", alias_of.len());
-            let from_alias = alias_of.get(&from).cloned().unwrap_or_else(|| "t0".to_string());
+            let from_alias = alias_of
+                .get(&from)
+                .cloned()
+                .unwrap_or_else(|| "t0".to_string());
             let rel_def = live_rels[edge.def_index];
             let to_display = rel_def
                 .body
@@ -882,10 +1127,19 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
             let on = edge
                 .pairs
                 .iter()
-                .map(|(fc, tc)| format!("{alias}.{} = {from_alias}.{}", quote_ident(tc, req.engine), quote_ident(fc, req.engine)))
+                .map(|(fc, tc)| {
+                    format!(
+                        "{alias}.{} = {from_alias}.{}",
+                        quote_ident(tc, req.engine),
+                        quote_ident(fc, req.engine)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(" AND ");
-            joins.push(format!("JOIN {} {alias} ON {on}", quote_table(&to_display, req.engine)));
+            joins.push(format!(
+                "JOIN {} {alias} ON {on}",
+                quote_table(&to_display, req.engine)
+            ));
             alias_of.insert(edge.to.clone(), alias);
             table_names.insert(edge.to.clone(), to_display);
             used_rels.insert(edge.def_index);
@@ -899,30 +1153,51 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
         if let DefinitionBody::Attribute { table, column, .. } = &d.body {
             let a = &alias_of[&table_key(table)];
             let expr = format!("{a}.{}", quote_ident(column, req.engine));
-            select.push(format!("{expr} AS {}", quote_ident(&slug(&d.name), req.engine)));
+            select.push(format!(
+                "{expr} AS {}",
+                quote_ident(&slug(&d.name), req.engine)
+            ));
             group_by.push(expr);
         }
     }
     let metric_alias = quote_ident(&slug(&metric.name), req.engine);
     let metric_expr = match (aggregation, column) {
         (Aggregation::Count, None) => "COUNT(*)".to_string(),
-        (Aggregation::CountDistinct, Some(c)) => format!("COUNT(DISTINCT t0.{})", quote_ident(c, req.engine)),
+        (Aggregation::CountDistinct, Some(c)) => {
+            format!("COUNT(DISTINCT t0.{})", quote_ident(c, req.engine))
+        }
         (agg, Some(c)) => format!("{}(t0.{})", agg.sql_function(), quote_ident(c, req.engine)),
-        (_, None) => return plan.refuse(PlanStatus::NotAnswerable, "metric has no column to aggregate"),
+        (_, None) => {
+            return plan.refuse(
+                PlanStatus::NotAnswerable,
+                "metric has no column to aggregate",
+            )
+        }
     };
     select.push(format!("{metric_expr} AS {metric_alias}"));
     let mut params: Vec<Value> = Vec::new();
     let mut wheres = Vec::new();
     for f in &filters {
-        if let DefinitionBody::Filter { table, column, operator, value } = &f.body {
+        if let DefinitionBody::Filter {
+            table,
+            column,
+            operator,
+            value,
+        } = &f.body
+        {
             let a = &alias_of[&table_key(table)];
             let col = format!("{a}.{}", quote_ident(column, req.engine));
             match operator {
-                FilterOp::IsNull | FilterOp::IsNotNull => wheres.push(format!("{col} {}", operator.sql())),
+                FilterOp::IsNull | FilterOp::IsNotNull => {
+                    wheres.push(format!("{col} {}", operator.sql()))
+                }
                 FilterOp::In => {
                     let items = value.as_array().cloned().unwrap_or_default();
                     if items.is_empty() {
-                        return plan.refuse(PlanStatus::NotAnswerable, format!("filter '{}' has an empty IN list", f.name));
+                        return plan.refuse(
+                            PlanStatus::NotAnswerable,
+                            format!("filter '{}' has an empty IN list", f.name),
+                        );
                     }
                     let mut ph = Vec::new();
                     for v in items {
@@ -933,15 +1208,27 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
                 }
                 op => {
                     params.push(value.clone());
-                    wheres.push(format!("{col} {} {}", op.sql(), placeholder(params.len(), req.engine)));
+                    wheres.push(format!(
+                        "{col} {} {}",
+                        op.sql(),
+                        placeholder(params.len(), req.engine)
+                    ));
                 }
             }
         }
     }
     let row_cap = req.max_rows.clamp(1, 10_000);
     // T-SQL has no LIMIT: the row cap is `SELECT TOP (n)`.
-    let top = if req.engine == DatabaseEngine::SqlServer { format!("TOP ({row_cap}) ") } else { String::new() };
-    let mut sql = format!("SELECT {top}{} FROM {} t0", select.join(", "), quote_table(base_table, req.engine));
+    let top = if req.engine == DatabaseEngine::SqlServer {
+        format!("TOP ({row_cap}) ")
+    } else {
+        String::new()
+    };
+    let mut sql = format!(
+        "SELECT {top}{} FROM {} t0",
+        select.join(", "),
+        quote_table(base_table, req.engine)
+    );
     for j in &joins {
         sql.push(' ');
         sql.push_str(j);
@@ -950,7 +1237,10 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
         sql.push_str(&format!(" WHERE {}", wheres.join(" AND ")));
     }
     if !group_by.is_empty() {
-        sql.push_str(&format!(" GROUP BY {} ORDER BY {metric_alias} DESC", group_by.join(", ")));
+        sql.push_str(&format!(
+            " GROUP BY {} ORDER BY {metric_alias} DESC",
+            group_by.join(", ")
+        ));
     }
     if req.engine != DatabaseEngine::SqlServer {
         sql.push_str(&format!(" LIMIT {row_cap}"));
@@ -958,25 +1248,43 @@ pub fn plan(req: &PlanRequest<'_>) -> SemanticPlan {
 
     let tables: Vec<String> = table_names.values().cloned().collect();
     if let Err(why) = validate_generated_sql(req.engine, &sql, &tables) {
-        return plan.refuse(PlanStatus::NotAnswerable, format!("compiled SQL failed validation: {why}"));
+        return plan.refuse(
+            PlanStatus::NotAnswerable,
+            format!("compiled SQL failed validation: {why}"),
+        );
     }
 
     // ---- assemble ----
     plan.metric = Some(UsedDefinition::from(&metric));
     plan.dimensions = dims.iter().map(UsedDefinition::from).collect();
     plan.filters = filters.iter().map(UsedDefinition::from).collect();
-    plan.relationships = used_rels.iter().map(|i| UsedDefinition::from(live_rels[*i])).collect();
+    plan.relationships = used_rels
+        .iter()
+        .map(|i| UsedDefinition::from(live_rels[*i]))
+        .collect();
     plan.tables = tables;
     if let Some(u) = unit {
-        plan.limitations.push(format!("'{}' is expressed in {u}", metric.name));
+        plan.limitations
+            .push(format!("'{}' is expressed in {u}", metric.name));
     }
     if live_rels.iter().enumerate().any(|(i, d)| {
-        used_rels.contains(&i) && matches!(d.body, DefinitionBody::Relationship { source: crate::model::RelationshipSource::Inferred, .. })
+        used_rels.contains(&i)
+            && matches!(
+                d.body,
+                DefinitionBody::Relationship {
+                    source: crate::model::RelationshipSource::Inferred,
+                    ..
+                }
+            )
     }) {
-        plan.limitations.push("uses an inferred (non-FK) relationship certified by a reviewer".to_string());
+        plan.limitations
+            .push("uses an inferred (non-FK) relationship certified by a reviewer".to_string());
     }
     if filters.is_empty() && default_filters.is_empty() {
-        plan.assumptions.push("no certified filter matched the question; all rows of the metric grain are included".to_string());
+        plan.assumptions.push(
+            "no certified filter matched the question; all rows of the metric grain are included"
+                .to_string(),
+        );
     }
     let defs_sig = plan
         .all_used()
@@ -1019,9 +1327,14 @@ mod tests {
         assert_eq!(p.dimensions, vec!["user role"]);
         assert_eq!(p.clauses, vec!["for completed orders"]);
 
-        let p = split_question("order value by user role where status is completed and created in 2025");
+        let p = split_question(
+            "order value by user role where status is completed and created in 2025",
+        );
         assert_eq!(p.dimensions, vec!["user role"]);
-        assert_eq!(p.clauses, vec!["where status is completed and created in 2025"]);
+        assert_eq!(
+            p.clauses,
+            vec!["where status is completed and created in 2025"]
+        );
 
         let p = split_question("order value by user role, completed orders only");
         assert_eq!(p.dimensions, vec!["user role"]);
@@ -1052,22 +1365,62 @@ mod tests {
     fn golden_defs() -> Vec<Definition> {
         use serde_json::json;
         vec![
-            def("metric:order_value", "metric", "order value", &["order total", "sales", "revenue"],
-                json!({"type": "metric", "base_table": "main.orders", "aggregation": "sum", "column": "total_cents", "unit": "cents", "grain": "order"})),
-            def("metric:main.orders.count", "metric", "order count", &["number of orders", "count of orders", "orders count"],
-                json!({"type": "metric", "base_table": "main.orders", "aggregation": "count", "unit": "rows", "grain": "order"})),
-            def("metric:main.order_items.quantity.sum", "metric", "order item quantity", &["total quantity", "sum of quantity", "quantity"],
-                json!({"type": "metric", "base_table": "main.order_items", "aggregation": "sum", "column": "quantity", "grain": "order item"})),
-            def("filter:completed_order", "filter", "completed order", &["fulfilled order"],
-                json!({"type": "filter", "table": "main.orders", "column": "status", "operator": "eq", "value": "completed"})),
-            def("attribute:main.users.role", "attribute", "user role", &["role", "users.role"],
-                json!({"type": "attribute", "table": "main.users", "column": "role"})),
-            def("attribute:main.order_items.sku", "attribute", "order item sku", &["sku", "order_items.sku"],
-                json!({"type": "attribute", "table": "main.order_items", "column": "sku"})),
-            def("relationship:main.orders(user_id)->main.users", "relationship", "order user", &[],
-                json!({"type": "relationship", "from_table": "main.orders", "to_table": "main.users", "column_pairs": [["user_id", "id"]], "cardinality": "many_to_one", "source": "declared_fk"})),
-            def("relationship:main.order_items(order_id)->main.orders", "relationship", "order item order", &[],
-                json!({"type": "relationship", "from_table": "main.order_items", "to_table": "main.orders", "column_pairs": [["order_id", "id"]], "cardinality": "many_to_one", "source": "declared_fk"})),
+            def(
+                "metric:order_value",
+                "metric",
+                "order value",
+                &["order total", "sales", "revenue"],
+                json!({"type": "metric", "base_table": "main.orders", "aggregation": "sum", "column": "total_cents", "unit": "cents", "grain": "order"}),
+            ),
+            def(
+                "metric:main.orders.count",
+                "metric",
+                "order count",
+                &["number of orders", "count of orders", "orders count"],
+                json!({"type": "metric", "base_table": "main.orders", "aggregation": "count", "unit": "rows", "grain": "order"}),
+            ),
+            def(
+                "metric:main.order_items.quantity.sum",
+                "metric",
+                "order item quantity",
+                &["total quantity", "sum of quantity", "quantity"],
+                json!({"type": "metric", "base_table": "main.order_items", "aggregation": "sum", "column": "quantity", "grain": "order item"}),
+            ),
+            def(
+                "filter:completed_order",
+                "filter",
+                "completed order",
+                &["fulfilled order"],
+                json!({"type": "filter", "table": "main.orders", "column": "status", "operator": "eq", "value": "completed"}),
+            ),
+            def(
+                "attribute:main.users.role",
+                "attribute",
+                "user role",
+                &["role", "users.role"],
+                json!({"type": "attribute", "table": "main.users", "column": "role"}),
+            ),
+            def(
+                "attribute:main.order_items.sku",
+                "attribute",
+                "order item sku",
+                &["sku", "order_items.sku"],
+                json!({"type": "attribute", "table": "main.order_items", "column": "sku"}),
+            ),
+            def(
+                "relationship:main.orders(user_id)->main.users",
+                "relationship",
+                "order user",
+                &[],
+                json!({"type": "relationship", "from_table": "main.orders", "to_table": "main.users", "column_pairs": [["user_id", "id"]], "cardinality": "many_to_one", "source": "declared_fk"}),
+            ),
+            def(
+                "relationship:main.order_items(order_id)->main.orders",
+                "relationship",
+                "order item order",
+                &[],
+                json!({"type": "relationship", "from_table": "main.order_items", "to_table": "main.orders", "column_pairs": [["order_id", "id"]], "cardinality": "many_to_one", "source": "declared_fk"}),
+            ),
         ]
     }
 
@@ -1108,24 +1461,48 @@ mod tests {
             let p = ask(q);
             assert!(p.is_answerable(), "{q}: {:?}", p.missing);
             let sql = p.sql.clone().unwrap();
-            assert!(sql.contains("WHERE t0.status = ?1") && sql.contains("GROUP BY t1.role"), "{q}: {sql}");
+            assert!(
+                sql.contains("WHERE t0.status = ?1") && sql.contains("GROUP BY t1.role"),
+                "{q}: {sql}"
+            );
             assert_eq!(p.params, vec![Value::from("completed")], "{q}");
-            assert_eq!(p.filters.iter().map(|f| f.def_id.as_str()).collect::<Vec<_>>(), vec!["filter:completed_order"]);
-            assert_eq!(p.dimensions.iter().map(|d| d.def_id.as_str()).collect::<Vec<_>>(), vec!["attribute:main.users.role"]);
+            assert_eq!(
+                p.filters
+                    .iter()
+                    .map(|f| f.def_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["filter:completed_order"]
+            );
+            assert_eq!(
+                p.dimensions
+                    .iter()
+                    .map(|d| d.def_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["attribute:main.users.role"]
+            );
         }
         // Filter on a joined table, grouped by a base-table attribute.
         let p = ask("total quantity by sku for completed orders");
         assert!(p.is_answerable(), "{:?}", p.missing);
         let sql = p.sql.unwrap();
-        assert!(sql.contains("JOIN main.orders t1 ON t1.id = t0.order_id"), "{sql}");
-        assert!(sql.contains("WHERE t1.status = ?1") && sql.contains("GROUP BY t0.sku"), "{sql}");
+        assert!(
+            sql.contains("JOIN main.orders t1 ON t1.id = t0.order_id"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("WHERE t1.status = ?1") && sql.contains("GROUP BY t0.sku"),
+            "{sql}"
+        );
     }
 
     #[test]
     fn sqlserver_plans_use_top_and_named_parameters() {
         let rev = revision();
         let defs = golden_defs();
-        for q in ["count of completed orders by user role", "total order value for completed orders"] {
+        for q in [
+            "count of completed orders by user role",
+            "total order value for completed orders",
+        ] {
             let p = plan(&PlanRequest {
                 question: q,
                 engine: DatabaseEngine::SqlServer,
@@ -1166,19 +1543,29 @@ mod tests {
         for (q, word) in [
             ("total order value for pending orders", "'pending'"),
             ("count of pending orders", "'pending'"),
-            ("total order value by user role for pending orders", "'pending'"),
+            (
+                "total order value by user role for pending orders",
+                "'pending'",
+            ),
             ("count of orders that are not completed", "'not'"),
             ("count of non-completed orders", "'non'"),
             ("count of orders excluding completed orders", "'excluding'"),
             ("total order value in 2025", "'2025'"),
-            ("total order value by user role for completed orders in 2025", "'2025'"),
+            (
+                "total order value by user role for completed orders in 2025",
+                "'2025'",
+            ),
             ("total order value of admin users", "'admin'"),
             ("top 5 order value", "'top', '5'"),
         ] {
             let p = ask(q);
             assert_eq!(p.status, PlanStatus::NotAnswerable, "{q}: {:?}", p.sql);
             assert!(p.sql.is_none(), "{q}");
-            assert!(p.missing.iter().any(|m| m.contains(word)), "{q}: {:?}", p.missing);
+            assert!(
+                p.missing.iter().any(|m| m.contains(word)),
+                "{q}: {:?}",
+                p.missing
+            );
         }
         let p = ask("count of orders where status != completed");
         assert_eq!(p.status, PlanStatus::NotAnswerable);
@@ -1188,27 +1575,51 @@ mod tests {
     #[test]
     fn aggregation_mismatch_refuses() {
         for (q, why) in [
-            ("average order value", "certified metric 'order value' is a sum, not an average"),
+            (
+                "average order value",
+                "certified metric 'order value' is a sum, not an average",
+            ),
             ("mean order value by user role", "is a sum, not an average"),
-            ("avg order value for completed orders", "is a sum, not an average"),
+            (
+                "avg order value for completed orders",
+                "is a sum, not an average",
+            ),
             ("max order value", "is a sum, not a maximum"),
             ("lowest order value", "is a sum, not a minimum"),
             ("median order value", "is a sum, not a median"),
-            ("count of distinct orders", "is a count, not a distinct count"),
+            (
+                "count of distinct orders",
+                "is a count, not a distinct count",
+            ),
         ] {
             let p = ask(q);
             assert_eq!(p.status, PlanStatus::NotAnswerable, "{q}: {:?}", p.sql);
-            assert!(p.missing.iter().any(|m| m.contains(why)), "{q}: {:?}", p.missing);
+            assert!(
+                p.missing.iter().any(|m| m.contains(why)),
+                "{q}: {:?}",
+                p.missing
+            );
         }
         // The certified aggregation itself is fine.
         let mut defs = golden_defs();
-        defs[0] = def("metric:order_value", "metric", "order value", &["order total"],
-            serde_json::json!({"type": "metric", "base_table": "main.orders", "aggregation": "avg", "column": "total_cents"}));
+        defs[0] = def(
+            "metric:order_value",
+            "metric",
+            "order value",
+            &["order total"],
+            serde_json::json!({"type": "metric", "base_table": "main.orders", "aggregation": "avg", "column": "total_cents"}),
+        );
         let p = plan_with(&defs, "average order value");
         assert!(p.is_answerable(), "{:?}", p.missing);
         assert!(p.sql.unwrap().contains("AVG(t0.total_cents)"));
         let p = plan_with(&defs, "max order value");
-        assert!(p.missing.iter().any(|m| m.contains("is an average, not a maximum")), "{:?}", p.missing);
+        assert!(
+            p.missing
+                .iter()
+                .any(|m| m.contains("is an average, not a maximum")),
+            "{:?}",
+            p.missing
+        );
     }
 
     #[test]
@@ -1217,12 +1628,20 @@ mod tests {
         for q in ["how many order items", "total orders by user role"] {
             let p = ask(q);
             assert_eq!(p.status, PlanStatus::NotAnswerable, "{q}: {:?}", p.sql);
-            assert!(p.missing[0].contains("does not name what certified metric"), "{q}: {:?}", p.missing);
+            assert!(
+                p.missing[0].contains("does not name what certified metric"),
+                "{q}: {:?}",
+                p.missing
+            );
         }
         // "by user" is not "by user role"; an extra grouping must not be dropped.
         let p = ask("order value by user");
         assert_eq!(p.status, PlanStatus::NotAnswerable, "{:?}", p.sql);
-        assert!(p.missing[0].contains("no certified attribute"), "{:?}", p.missing);
+        assert!(
+            p.missing[0].contains("no certified attribute"),
+            "{:?}",
+            p.missing
+        );
         let p = ask("order count per user role for each sku");
         assert_eq!(p.status, PlanStatus::NotAnswerable, "{:?}", p.sql);
     }
@@ -1240,15 +1659,25 @@ mod tests {
         assert!(p.missing[0].contains("'or'"), "{:?}", p.missing);
         let p = plan_with(&defs, "total order value for completed and pending orders");
         assert_eq!(p.status, PlanStatus::NotAnswerable, "{:?}", p.sql);
-        assert!(p.missing[0].contains("both constrain orders.status"), "{:?}", p.missing);
+        assert!(
+            p.missing[0].contains("both constrain orders.status"),
+            "{:?}",
+            p.missing
+        );
     }
 
     #[test]
     fn quoting_is_minimal_and_engine_specific() {
         assert_eq!(quote_ident("orders", DatabaseEngine::Sqlite), "orders");
-        assert_eq!(quote_ident("Order Items", DatabaseEngine::Postgres), "\"Order Items\"");
+        assert_eq!(
+            quote_ident("Order Items", DatabaseEngine::Postgres),
+            "\"Order Items\""
+        );
         assert_eq!(quote_ident("a`b", DatabaseEngine::MySql), "`a``b`");
-        assert_eq!(quote_ident("Order Items", DatabaseEngine::SqlServer), "[Order Items]");
+        assert_eq!(
+            quote_ident("Order Items", DatabaseEngine::SqlServer),
+            "[Order Items]"
+        );
         assert_eq!(quote_ident("a]b", DatabaseEngine::SqlServer), "[a]]b]");
         assert_eq!(placeholder(2, DatabaseEngine::SqlServer), "@P2");
     }
@@ -1256,11 +1685,36 @@ mod tests {
     #[test]
     fn validator_rejects_unsafe_sql() {
         let allowed = vec!["main.orders".to_string()];
-        assert!(validate_generated_sql(DatabaseEngine::Sqlite, "SELECT COUNT(*) AS n FROM main.orders t0 LIMIT 5", &allowed).is_ok());
-        assert!(validate_generated_sql(DatabaseEngine::Sqlite, "SELECT 1 FROM main.orders; DROP TABLE users", &allowed).is_err());
-        assert!(validate_generated_sql(DatabaseEngine::Sqlite, "SELECT * FROM main.users", &allowed).is_err());
-        assert!(validate_generated_sql(DatabaseEngine::Sqlite, "DELETE FROM main.orders", &allowed).is_err());
-        assert!(validate_generated_sql(DatabaseEngine::Postgres, "SELECT pg_read_file('/etc/passwd') FROM orders", &allowed).is_err());
+        assert!(validate_generated_sql(
+            DatabaseEngine::Sqlite,
+            "SELECT COUNT(*) AS n FROM main.orders t0 LIMIT 5",
+            &allowed
+        )
+        .is_ok());
+        assert!(validate_generated_sql(
+            DatabaseEngine::Sqlite,
+            "SELECT 1 FROM main.orders; DROP TABLE users",
+            &allowed
+        )
+        .is_err());
+        assert!(validate_generated_sql(
+            DatabaseEngine::Sqlite,
+            "SELECT * FROM main.users",
+            &allowed
+        )
+        .is_err());
+        assert!(validate_generated_sql(
+            DatabaseEngine::Sqlite,
+            "DELETE FROM main.orders",
+            &allowed
+        )
+        .is_err());
+        assert!(validate_generated_sql(
+            DatabaseEngine::Postgres,
+            "SELECT pg_read_file('/etc/passwd') FROM orders",
+            &allowed
+        )
+        .is_err());
         assert!(validate_generated_sql(
             DatabaseEngine::Postgres,
             "WITH d AS (DELETE FROM orders RETURNING *) SELECT * FROM d",

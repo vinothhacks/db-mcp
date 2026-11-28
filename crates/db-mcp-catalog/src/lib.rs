@@ -73,8 +73,11 @@ fn wildcard_match(pattern: &str, text: &str) -> bool {
 pub fn canonicalize_objects(objects: &[CatalogObject]) -> Vec<CatalogObject> {
     let mut sorted = objects.to_vec();
     for obj in &mut sorted {
-        obj.columns
-            .sort_by(|a, b| a.ordinal_position.cmp(&b.ordinal_position).then_with(|| a.name.cmp(&b.name)));
+        obj.columns.sort_by(|a, b| {
+            a.ordinal_position
+                .cmp(&b.ordinal_position)
+                .then_with(|| a.name.cmp(&b.name))
+        });
         obj.indexes.sort_by(|a, b| a.name.cmp(&b.name));
         obj.foreign_keys
             .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.columns.cmp(&b.columns)));
@@ -138,7 +141,11 @@ pub fn filter_and_paginate_objects(
         .collect();
 
     let total_count = filtered.len();
-    let limit = if request.limit == 0 { 50 } else { request.limit };
+    let limit = if request.limit == 0 {
+        50
+    } else {
+        request.limit
+    };
     let offset = request.offset.min(total_count);
 
     let page: Vec<CatalogObject> = filtered
@@ -202,12 +209,10 @@ pub fn describe_object(
                 .unwrap_or(true);
             name_match && schema_match
         })
-        .ok_or_else(|| {
-            DbMcpError::PolicyDenied {
-                code: "OBJECT_NOT_FOUND".to_string(),
-                message: format!("Catalog object '{}' was not found", object_name),
-                next_action: Some("search_objects".to_string()),
-            }
+        .ok_or_else(|| DbMcpError::PolicyDenied {
+            code: "OBJECT_NOT_FOUND".to_string(),
+            message: format!("Catalog object '{}' was not found", object_name),
+            next_action: Some("search_objects".to_string()),
         })?;
 
     Ok(found.project(detail_level))
@@ -362,7 +367,11 @@ pub fn diff_schema(base: &SchemaSnapshot, target: &SchemaSnapshot) -> SchemaDiff
                 target_name: None,
                 before: None,
                 after: target_tbl.definition.clone().or_else(|| {
-                    Some(format!("table {} ({} columns)", qname, target_tbl.columns.len()))
+                    Some(format!(
+                        "table {} ({} columns)",
+                        qname,
+                        target_tbl.columns.len()
+                    ))
                 }),
                 destructive: false,
                 transactional: engine_transactional_ddl,
@@ -384,7 +393,11 @@ pub fn diff_schema(base: &SchemaSnapshot, target: &SchemaSnapshot) -> SchemaDiff
                 object_name: qname.clone(),
                 target_name: None,
                 before: base_tbl.definition.clone().or_else(|| {
-                    Some(format!("table {} ({} columns)", qname, base_tbl.columns.len()))
+                    Some(format!(
+                        "table {} ({} columns)",
+                        qname,
+                        base_tbl.columns.len()
+                    ))
                 }),
                 after: None,
                 destructive: true,
@@ -464,7 +477,12 @@ pub fn diff_schema(base: &SchemaSnapshot, target: &SchemaSnapshot) -> SchemaDiff
     }
 
     // 3. Compare routines (procedures/functions, on definition) and triggers
-    diff_routines_and_triggers(&base_other, &target_other, engine_transactional_ddl, &mut items);
+    diff_routines_and_triggers(
+        &base_other,
+        &target_other,
+        engine_transactional_ddl,
+        &mut items,
+    );
 
     let is_identical = items.is_empty();
     let has_destructive_changes = items.iter().any(|i| i.destructive);
@@ -554,9 +572,16 @@ fn diff_table_columns(
             if b_col.nullable != t_col.nullable {
                 let (suggested_ddl, compensating_ddl) = match engine {
                     DatabaseEngine::Postgres => {
-                        let action = if t_col.nullable { "DROP NOT NULL" } else { "SET NOT NULL" };
-                        let reverse_action =
-                            if b_col.nullable { "DROP NOT NULL" } else { "SET NOT NULL" };
+                        let action = if t_col.nullable {
+                            "DROP NOT NULL"
+                        } else {
+                            "SET NOT NULL"
+                        };
+                        let reverse_action = if b_col.nullable {
+                            "DROP NOT NULL"
+                        } else {
+                            "SET NOT NULL"
+                        };
                         (
                             Some(format!(
                                 "ALTER TABLE {table_qname} ALTER COLUMN {} {action};",
@@ -750,7 +775,10 @@ fn diff_table_indexes(
                     destructive: false,
                     transactional: engine_transactional_ddl,
                     reversal_safety: ReversalSafety::CompensatingMigrationRequired,
-                    suggested_ddl: Some(format!("{} {create_ddl}", drop_index_ddl(engine, table_qname, &b_idx.name))),
+                    suggested_ddl: Some(format!(
+                        "{} {create_ddl}",
+                        drop_index_ddl(engine, table_qname, &b_idx.name)
+                    )),
                     compensating_ddl: b_idx.definition.clone(),
                 });
             }
@@ -942,9 +970,9 @@ fn fk_drop_ddl(engine: DatabaseEngine, table_qname: &str, fk: &ForeignKeySpec) -
         DatabaseEngine::Postgres => {
             Some(format!("ALTER TABLE {table_qname} DROP CONSTRAINT {name};"))
         }
-        DatabaseEngine::MySql => {
-            Some(format!("ALTER TABLE {table_qname} DROP FOREIGN KEY {name};"))
-        }
+        DatabaseEngine::MySql => Some(format!(
+            "ALTER TABLE {table_qname} DROP FOREIGN KEY {name};"
+        )),
         DatabaseEngine::Sqlite => None,
         DatabaseEngine::SqlServer => {
             Some(format!("ALTER TABLE {table_qname} DROP CONSTRAINT {name};"))
@@ -1043,12 +1071,22 @@ fn routine_keyword(object_type: CatalogObjectType) -> &'static str {
 
 /// DDL that (re)creates a routine/trigger from `definition`: used as-is when it already
 /// says `CREATE OR REPLACE`, otherwise preceded by a `DROP`.
-fn recreate_ddl(object_type: CatalogObjectType, qname: &str, definition: Option<&str>) -> Option<String> {
+fn recreate_ddl(
+    object_type: CatalogObjectType,
+    qname: &str,
+    definition: Option<&str>,
+) -> Option<String> {
     let definition = definition?;
-    if definition.to_ascii_uppercase().contains("CREATE OR REPLACE") {
+    if definition
+        .to_ascii_uppercase()
+        .contains("CREATE OR REPLACE")
+    {
         return Some(definition.to_string());
     }
-    Some(format!("DROP {} {qname}; {definition}", routine_keyword(object_type)))
+    Some(format!(
+        "DROP {} {qname}; {definition}",
+        routine_keyword(object_type)
+    ))
 }
 
 fn diff_routines_and_triggers(
@@ -1289,13 +1327,8 @@ mod tests {
         assert_eq!(page1.objects[0].name, "orders");
         assert!(page1.objects[0].columns.is_empty()); // Names detail level strips columns
 
-        let described = describe_object(
-            &objects,
-            Some("public"),
-            "users",
-            CatalogDetailLevel::Full,
-        )
-        .unwrap();
+        let described =
+            describe_object(&objects, Some("public"), "users", CatalogDetailLevel::Full).unwrap();
         assert_eq!(described.columns.len(), 2);
         assert_eq!(described.indexes.len(), 1);
     }
@@ -1303,9 +1336,16 @@ mod tests {
     #[test]
     fn describe_object_accepts_schema_with_qualified_name_and_not_found_has_next_action() {
         let objects = sample_objects();
-        let d = describe_object(&objects, Some("public"), "public.users", CatalogDetailLevel::Names).unwrap();
+        let d = describe_object(
+            &objects,
+            Some("public"),
+            "public.users",
+            CatalogDetailLevel::Names,
+        )
+        .unwrap();
         assert_eq!(d.name, "users");
-        let err = describe_object(&objects, None, "missing_thing", CatalogDetailLevel::Names).unwrap_err();
+        let err = describe_object(&objects, None, "missing_thing", CatalogDetailLevel::Names)
+            .unwrap_err();
         assert_eq!(err.next_action(), Some("search_objects"));
     }
 
@@ -1416,7 +1456,12 @@ mod tests {
         }
     }
 
-    fn tbl(schema: &str, name: &str, cols: Vec<ColumnSpec>, fks: Vec<ForeignKeySpec>) -> CatalogObject {
+    fn tbl(
+        schema: &str,
+        name: &str,
+        cols: Vec<ColumnSpec>,
+        fks: Vec<ForeignKeySpec>,
+    ) -> CatalogObject {
         CatalogObject {
             schema: schema.to_string(),
             name: name.to_string(),
@@ -1448,7 +1493,15 @@ mod tests {
 
     #[test]
     fn mysql_drop_index_names_the_table() {
-        let mut t = tbl("appdb", "orders", vec![col("id", "int", false, true), col("status", "varchar(20)", false, false)], vec![]);
+        let mut t = tbl(
+            "appdb",
+            "orders",
+            vec![
+                col("id", "int", false, true),
+                col("status", "varchar(20)", false, false),
+            ],
+            vec![],
+        );
         let base = snap(DatabaseEngine::MySql, vec![t.clone()]);
         t.indexes.push(IndexSpec {
             name: "ix_status".to_string(),
@@ -1461,18 +1514,42 @@ mod tests {
             definition: None,
         });
         let target = snap(DatabaseEngine::MySql, vec![t]);
-        let comp: Vec<String> = diff_schema(&base, &target).items.iter().filter_map(|i| i.compensating_ddl.clone()).collect();
-        assert!(comp.contains(&"DROP INDEX ix_status ON appdb.orders;".to_string()), "{comp:?}");
-        let back: Vec<String> = diff_schema(&target, &base).items.iter().filter_map(|i| i.suggested_ddl.clone()).collect();
-        assert!(back.contains(&"DROP INDEX ix_status ON appdb.orders;".to_string()), "{back:?}");
+        let comp: Vec<String> = diff_schema(&base, &target)
+            .items
+            .iter()
+            .filter_map(|i| i.compensating_ddl.clone())
+            .collect();
+        assert!(
+            comp.contains(&"DROP INDEX ix_status ON appdb.orders;".to_string()),
+            "{comp:?}"
+        );
+        let back: Vec<String> = diff_schema(&target, &base)
+            .items
+            .iter()
+            .filter_map(|i| i.suggested_ddl.clone())
+            .collect();
+        assert!(
+            back.contains(&"DROP INDEX ix_status ON appdb.orders;".to_string()),
+            "{back:?}"
+        );
     }
 
     #[test]
     fn sqlserver_diff_emits_tsql_ddl() {
-        let mut idx_tbl = tbl("dbo", "orders", vec![col("id", "int", false, true), col("status", "nvarchar(20)", false, false)], vec![]);
+        let mut idx_tbl = tbl(
+            "dbo",
+            "orders",
+            vec![
+                col("id", "int", false, true),
+                col("status", "nvarchar(20)", false, false),
+            ],
+            vec![],
+        );
         let base = snap(DatabaseEngine::SqlServer, vec![idx_tbl.clone()]);
         idx_tbl.columns[1] = col("status", "nvarchar(40)", true, false);
-        idx_tbl.columns.push(col("note", "nvarchar(max)", true, false));
+        idx_tbl
+            .columns
+            .push(col("note", "nvarchar(max)", true, false));
         idx_tbl.indexes.push(IndexSpec {
             name: "ix_orders_status".to_string(),
             table_name: "dbo.orders".to_string(),
@@ -1486,16 +1563,36 @@ mod tests {
         let target = snap(DatabaseEngine::SqlServer, vec![idx_tbl]);
         let diff = diff_schema(&base, &target);
         assert!(diff.all_transactional);
-        let ddl: Vec<String> = diff.items.iter().filter_map(|i| i.suggested_ddl.clone()).collect();
-        let comp: Vec<String> = diff.items.iter().filter_map(|i| i.compensating_ddl.clone()).collect();
-        assert!(ddl.contains(&"ALTER TABLE dbo.orders ALTER COLUMN status nvarchar(40) NULL;".to_string()), "{ddl:?}");
-        assert!(ddl.contains(&"ALTER TABLE dbo.orders ADD note nvarchar(max);".to_string()), "{ddl:?}");
-        assert!(comp.contains(&"DROP INDEX ix_orders_status ON dbo.orders;".to_string()), "{comp:?}");
-        let back = diff_schema(&target, &base);
-        assert!(back
+        let ddl: Vec<String> = diff
             .items
             .iter()
-            .any(|i| i.suggested_ddl.as_deref().unwrap_or("").contains("sp_rename")));
+            .filter_map(|i| i.suggested_ddl.clone())
+            .collect();
+        let comp: Vec<String> = diff
+            .items
+            .iter()
+            .filter_map(|i| i.compensating_ddl.clone())
+            .collect();
+        assert!(
+            ddl.contains(
+                &"ALTER TABLE dbo.orders ALTER COLUMN status nvarchar(40) NULL;".to_string()
+            ),
+            "{ddl:?}"
+        );
+        assert!(
+            ddl.contains(&"ALTER TABLE dbo.orders ADD note nvarchar(max);".to_string()),
+            "{ddl:?}"
+        );
+        assert!(
+            comp.contains(&"DROP INDEX ix_orders_status ON dbo.orders;".to_string()),
+            "{comp:?}"
+        );
+        let back = diff_schema(&target, &base);
+        assert!(back.items.iter().any(|i| i
+            .suggested_ddl
+            .as_deref()
+            .unwrap_or("")
+            .contains("sp_rename")));
     }
 
     #[test]
@@ -1511,16 +1608,38 @@ mod tests {
         let base = snap(
             DatabaseEngine::Postgres,
             vec![
-                tbl("main", "orders", vec![col("id", "int", false, true)], vec![fk]),
-                routine("p1", CatalogObjectType::Procedure, "CREATE PROCEDURE p1() BEGIN END;"),
-                routine("f1", CatalogObjectType::Function, "CREATE FUNCTION f1() BEGIN END;"),
+                tbl(
+                    "main",
+                    "orders",
+                    vec![col("id", "int", false, true)],
+                    vec![fk],
+                ),
+                routine(
+                    "p1",
+                    CatalogObjectType::Procedure,
+                    "CREATE PROCEDURE p1() BEGIN END;",
+                ),
+                routine(
+                    "f1",
+                    CatalogObjectType::Function,
+                    "CREATE FUNCTION f1() BEGIN END;",
+                ),
             ],
         );
         let target = snap(
             DatabaseEngine::Postgres,
             vec![
-                tbl("main", "orders", vec![col("id", "int", false, false)], vec![]),
-                routine("p1", CatalogObjectType::Procedure, "CREATE PROCEDURE p1() BEGIN SELECT 1; END;"),
+                tbl(
+                    "main",
+                    "orders",
+                    vec![col("id", "int", false, false)],
+                    vec![],
+                ),
+                routine(
+                    "p1",
+                    CatalogObjectType::Procedure,
+                    "CREATE PROCEDURE p1() BEGIN SELECT 1; END;",
+                ),
                 routine("trg", CatalogObjectType::Trigger, "CREATE TRIGGER trg ..."),
             ],
         );
@@ -1549,23 +1668,60 @@ mod tests {
             &mk(DatabaseEngine::MySql, "int", None),
             &mk(DatabaseEngine::MySql, "bigint", Some("0")),
         );
-        let ty = d.items.iter().find(|i| i.kind == DiffOperationKind::AlterColumnType).unwrap();
-        assert_eq!(ty.suggested_ddl.as_deref(), Some("ALTER TABLE main.t MODIFY COLUMN qty bigint DEFAULT 0;"));
-        let df = d.items.iter().find(|i| i.kind == DiffOperationKind::AlterColumnDefault).unwrap();
-        assert!(df.suggested_ddl.as_deref().unwrap().contains("SET DEFAULT 0"));
+        let ty = d
+            .items
+            .iter()
+            .find(|i| i.kind == DiffOperationKind::AlterColumnType)
+            .unwrap();
+        assert_eq!(
+            ty.suggested_ddl.as_deref(),
+            Some("ALTER TABLE main.t MODIFY COLUMN qty bigint DEFAULT 0;")
+        );
+        let df = d
+            .items
+            .iter()
+            .find(|i| i.kind == DiffOperationKind::AlterColumnDefault)
+            .unwrap();
+        assert!(df
+            .suggested_ddl
+            .as_deref()
+            .unwrap()
+            .contains("SET DEFAULT 0"));
 
         let base = mk(DatabaseEngine::Sqlite, "int", None);
         let target = mk(DatabaseEngine::Sqlite, "bigint", None);
         let d = diff_schema(&base, &target);
-        let ty = d.items.iter().find(|i| i.kind == DiffOperationKind::AlterColumnType).unwrap();
+        let ty = d
+            .items
+            .iter()
+            .find(|i| i.kind == DiffOperationKind::AlterColumnType)
+            .unwrap();
         assert!(ty.suggested_ddl.is_none());
-        assert!(schema_diff_warnings(&base, &target, &d).iter().any(|w| w.contains("rebuild")));
+        assert!(schema_diff_warnings(&base, &target, &d)
+            .iter()
+            .any(|w| w.contains("rebuild")));
     }
 
     #[test]
     fn cross_engine_diff_strips_default_schema_and_capture_nulls_stats() {
-        let a = snap(DatabaseEngine::Sqlite, vec![tbl("main", "users", vec![col("id", "int", false, true)], vec![])]);
-        let b = snap(DatabaseEngine::Postgres, vec![tbl("public", "users", vec![col("id", "int", false, true)], vec![])]);
+        let a = snap(
+            DatabaseEngine::Sqlite,
+            vec![tbl(
+                "main",
+                "users",
+                vec![col("id", "int", false, true)],
+                vec![],
+            )],
+        );
+        let b = snap(
+            DatabaseEngine::Postgres,
+            vec![tbl(
+                "public",
+                "users",
+                vec![col("id", "int", false, true)],
+                vec![],
+            )],
+        );
         assert!(a.objects[0].estimated_rows.is_none() && a.objects[0].size_bytes.is_none());
         let d = diff_schema(&a, &b);
         assert!(d.items.is_empty(), "{:?}", d.items);
@@ -1573,14 +1729,32 @@ mod tests {
 
     #[test]
     fn tampered_snapshot_hash_and_unexplained_hash_diff_warn() {
-        let mut a = snap(DatabaseEngine::Sqlite, vec![tbl("main", "users", vec![col("id", "int", false, true)], vec![])]);
+        let mut a = snap(
+            DatabaseEngine::Sqlite,
+            vec![tbl(
+                "main",
+                "users",
+                vec![col("id", "int", false, true)],
+                vec![],
+            )],
+        );
         assert!(verify_snapshot_hash("base", &a).is_none());
         a.objects.clear();
-        assert!(verify_snapshot_hash("base", &a).unwrap().contains("mismatch"));
-        let x = snap(DatabaseEngine::Sqlite, vec![routine("s", CatalogObjectType::Sequence, "x")]);
-        let y = snap(DatabaseEngine::Sqlite, vec![routine("s", CatalogObjectType::Sequence, "y")]);
+        assert!(verify_snapshot_hash("base", &a)
+            .unwrap()
+            .contains("mismatch"));
+        let x = snap(
+            DatabaseEngine::Sqlite,
+            vec![routine("s", CatalogObjectType::Sequence, "x")],
+        );
+        let y = snap(
+            DatabaseEngine::Sqlite,
+            vec![routine("s", CatalogObjectType::Sequence, "y")],
+        );
         let d = diff_schema(&x, &y);
         assert!(d.is_identical);
-        assert!(schema_diff_warnings(&x, &y, &d).iter().any(|w| w.contains("hashes differ")));
+        assert!(schema_diff_warnings(&x, &y, &d)
+            .iter()
+            .any(|w| w.contains("hashes differ")));
     }
 }

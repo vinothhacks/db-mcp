@@ -26,8 +26,8 @@ use db_mcp_catalog::{
 use db_mcp_core::{
     AuthorizedQuery, CatalogDetailLevel, CatalogObject, CatalogObjectType, CatalogRequest,
     CatalogResponse, ColumnMetadata, ColumnSpec, DatabaseAdapter, DatabaseCapabilities,
-    DatabaseEngine, DbMcpError, DbMcpResult, ExplainFormat, ExplainPlan, ExplainRequest,
-    ExecutionId, ForeignKeySpec, IndexSpec, QueryResult, SchemaDiff, SchemaDiffProvider,
+    DatabaseEngine, DbMcpError, DbMcpResult, ExecutionId, ExplainFormat, ExplainPlan,
+    ExplainRequest, ForeignKeySpec, IndexSpec, QueryResult, SchemaDiff, SchemaDiffProvider,
     SchemaSnapshot, TransactionalDdlProvider,
 };
 use db_mcp_secrets::{redact_dsn, redact_sensitive_text, SecretString};
@@ -308,19 +308,18 @@ pub fn parse_postgres_explain_json(raw_json: &str) -> DbMcpResult<ParsedPostgres
         &parsed
     };
 
-    let total_cost = root_plan.get("Total Cost").and_then(serde_json::Value::as_f64);
-    let plan_rows = root_plan.get("Plan Rows").and_then(serde_json::Value::as_f64);
+    let total_cost = root_plan
+        .get("Total Cost")
+        .and_then(serde_json::Value::as_f64);
+    let plan_rows = root_plan
+        .get("Plan Rows")
+        .and_then(serde_json::Value::as_f64);
 
     let mut seq_scans = Vec::new();
     let mut index_scans = Vec::new();
     let mut node_types = Vec::new();
 
-    walk_pg_plan_node(
-        root_plan,
-        &mut seq_scans,
-        &mut index_scans,
-        &mut node_types,
-    );
+    walk_pg_plan_node(root_plan, &mut seq_scans, &mut index_scans, &mut node_types);
 
     let mut warnings = Vec::new();
     for tbl in &seq_scans {
@@ -350,7 +349,10 @@ fn walk_pg_plan_node(
         node_types.push(node_type.to_string());
         match node_type {
             "Seq Scan" => {
-                if let Some(rel) = node.get("Relation Name").and_then(serde_json::Value::as_str) {
+                if let Some(rel) = node
+                    .get("Relation Name")
+                    .and_then(serde_json::Value::as_str)
+                {
                     if !seq_scans.contains(&rel.to_string()) {
                         seq_scans.push(rel.to_string());
                     }
@@ -477,8 +479,8 @@ impl std::fmt::Debug for PostgresAdapter {
 impl PostgresAdapter {
     /// Create a new `PostgresAdapter` from `PostgresConfig`.
     pub fn new(config: PostgresConfig) -> DbMcpResult<Self> {
-        let conn = Connection::open_in_memory()
-            .map_err(|e| DbMcpError::AdapterError(e.to_string()))?;
+        let conn =
+            Connection::open_in_memory().map_err(|e| DbMcpError::AdapterError(e.to_string()))?;
 
         bootstrap_pg_system_tables(&conn)?;
 
@@ -842,7 +844,10 @@ fn find_routine_ddl_end(sql: &str, after_open_paren: usize) -> usize {
     let rest = &sql[i..];
 
     // Find whether a dollar-quote appears before a standalone semicolon or BEGIN
-    if let Some(m) = dollar_re.find(rest).filter(|m| dollar_quote_in_header(&rest[..m.start()])) {
+    if let Some(m) = dollar_re
+        .find(rest)
+        .filter(|m| dollar_quote_in_header(&rest[..m.start()]))
+    {
         let tag = m.as_str();
         let after_open_tag = i + m.end();
         if let Some(close_rel) = sql[after_open_tag..].find(tag) {
@@ -968,7 +973,10 @@ fn rewrite_pg_sql_for_embedded(sql: &str, default_schema: &str) -> String {
 
     while cursor < sql.len() {
         let Some(caps) = header_re.captures(&sql[cursor..]) else {
-            out.push_str(&rewrite_non_routine_pg_fragment(&sql[cursor..], default_schema));
+            out.push_str(&rewrite_non_routine_pg_fragment(
+                &sql[cursor..],
+                default_schema,
+            ));
             break;
         };
 
@@ -1007,7 +1015,10 @@ fn rewrite_pg_sql_for_embedded(sql: &str, default_schema: &str) -> String {
             .filter(|p| !p.is_empty())
             .collect();
         let (schema, proname) = if parts.len() >= 2 {
-            (parts[parts.len() - 2].clone(), parts[parts.len() - 1].clone())
+            (
+                parts[parts.len() - 2].clone(),
+                parts[parts.len() - 1].clone(),
+            )
         } else if parts.len() == 1 {
             (default_schema.to_string(), parts[0].clone())
         } else {
@@ -1098,7 +1109,10 @@ fn introspect_embedded_pg_catalog(
                 };
                 let estimated_rows = if is_table {
                     conn.query_row(
-                        &format!("SELECT COUNT(*) FROM \"{}\"", item.name.replace('"', "\"\"")),
+                        &format!(
+                            "SELECT COUNT(*) FROM \"{}\"",
+                            item.name.replace('"', "\"\"")
+                        ),
                         [],
                         |r| r.get::<_, i64>(0),
                     )
@@ -1196,13 +1210,12 @@ fn introspect_embedded_pg_catalog(
             } else {
                 nspname
             };
-            let object_type = if prokind.eq_ignore_ascii_case("f")
-                || prokind.eq_ignore_ascii_case("function")
-            {
-                CatalogObjectType::Function
-            } else {
-                CatalogObjectType::Procedure
-            };
+            let object_type =
+                if prokind.eq_ignore_ascii_case("f") || prokind.eq_ignore_ascii_case("function") {
+                    CatalogObjectType::Function
+                } else {
+                    CatalogObjectType::Procedure
+                };
             objects.push(CatalogObject {
                 schema,
                 name: proname,
@@ -1500,7 +1513,8 @@ impl DatabaseAdapter for PostgresAdapter {
             }
 
             let rewritten_sql = rewrite_pg_sql_for_embedded(&request.sql, &default_schema);
-            let params: Vec<SqliteValue> = request.params.iter().map(json_to_sqlite_param).collect();
+            let params: Vec<SqliteValue> =
+                request.params.iter().map(json_to_sqlite_param).collect();
             let max_rows = if request.max_rows == 0 {
                 usize::MAX
             } else {
@@ -1509,13 +1523,14 @@ impl DatabaseAdapter for PostgresAdapter {
             let max_bytes = request.max_bytes;
 
             let mut batch = Batch::new(&guard, &rewritten_sql);
-            let mut single = if analysis.is_multi_statement {
-                None
-            } else {
-                Some(guard.prepare(&rewritten_sql).map_err(|e| {
-                    DbMcpError::AdapterError(redact_sensitive_text(&e.to_string()))
-                })?)
-            };
+            let mut single =
+                if analysis.is_multi_statement {
+                    None
+                } else {
+                    Some(guard.prepare(&rewritten_sql).map_err(|e| {
+                        DbMcpError::AdapterError(redact_sensitive_text(&e.to_string()))
+                    })?)
+                };
             let mut executed = 0;
             let mut rows_affected = None;
             let mut columns: Vec<ColumnMetadata> = Vec::new();
@@ -1546,10 +1561,13 @@ impl DatabaseAdapter for PostgresAdapter {
                         .checked_sub(1)
                         .and_then(|index| params.get(index))
                         .ok_or_else(|| {
-                            DbMcpError::InvalidArgument(format!("Missing parameter at position {position}"))
+                            DbMcpError::InvalidArgument(format!(
+                                "Missing parameter at position {position}"
+                            ))
                         })?;
-                    stmt.raw_bind_parameter(slot, value)
-                        .map_err(|e| DbMcpError::AdapterError(redact_sensitive_text(&e.to_string())))?;
+                    stmt.raw_bind_parameter(slot, value).map_err(|e| {
+                        DbMcpError::AdapterError(redact_sensitive_text(&e.to_string()))
+                    })?;
                     required_params = required_params.max(position);
                 }
                 if params.len() != required_params {
@@ -1600,8 +1618,7 @@ impl DatabaseAdapter for PostgresAdapter {
                         row_bytes += b;
                         vals.push(jval);
                     }
-                    if max_bytes > 0 && bytes_used + row_bytes > max_bytes && !rows_out.is_empty()
-                    {
+                    if max_bytes > 0 && bytes_used + row_bytes > max_bytes && !rows_out.is_empty() {
                         truncated = true;
                         warnings.push(format!("Result truncated at max_bytes={max_bytes}"));
                         break;
@@ -1670,8 +1687,7 @@ impl DatabaseAdapter for PostgresAdapter {
         for raw_tbl in &analysis.referenced_tables {
             let base_tbl = raw_tbl.rsplit('.').next().unwrap_or(raw_tbl);
             let matching_table = all_objects.iter().find(|o| {
-                o.object_type == CatalogObjectType::Table
-                    && o.name.eq_ignore_ascii_case(base_tbl)
+                o.object_type == CatalogObjectType::Table && o.name.eq_ignore_ascii_case(base_tbl)
             });
 
             let table_preds: Vec<String> = analysis
@@ -1703,11 +1719,9 @@ impl DatabaseAdapter for PostgresAdapter {
                 }) {
                     return Some(idx.name.clone());
                 }
-                if let Some(pk_col) = tbl
-                    .columns
-                    .iter()
-                    .find(|c| c.is_primary_key && table_preds.contains(&c.name.to_ascii_lowercase()))
-                {
+                if let Some(pk_col) = tbl.columns.iter().find(|c| {
+                    c.is_primary_key && table_preds.contains(&c.name.to_ascii_lowercase())
+                }) {
                     return Some(format!("{}_{}_pkey", tbl.name, pk_col.name));
                 }
                 None
@@ -1777,8 +1791,8 @@ impl DatabaseAdapter for PostgresAdapter {
                 "Plan": root_plan
             }
         ]);
-        let raw_json_str = serde_json::to_string_pretty(&explain_json_array)
-            .unwrap_or_else(|_| "[]".to_string());
+        let raw_json_str =
+            serde_json::to_string_pretty(&explain_json_array).unwrap_or_else(|_| "[]".to_string());
         let parsed = parse_postgres_explain_json(&raw_json_str)?;
 
         let raw_plan = match request.format {
@@ -1883,7 +1897,10 @@ impl TransactionalDdlProvider for PostgresAdapter {
         true
     }
 
-    async fn execute_transactional_ddl(&self, request: AuthorizedQuery) -> DbMcpResult<QueryResult> {
+    async fn execute_transactional_ddl(
+        &self,
+        request: AuthorizedQuery,
+    ) -> DbMcpResult<QueryResult> {
         if self.config.read_only || request.read_only {
             return Err(DbMcpError::PolicyDenied {
                 code: "READONLY_VIOLATION".to_string(),
@@ -1893,11 +1910,7 @@ impl TransactionalDdlProvider for PostgresAdapter {
             });
         }
 
-        if request
-            .sql
-            .to_ascii_uppercase()
-            .contains("CONCURRENTLY")
-        {
+        if request.sql.to_ascii_uppercase().contains("CONCURRENTLY") {
             return Err(DbMcpError::InvalidArgument(
                 "CREATE/DROP INDEX CONCURRENTLY cannot run inside a PostgreSQL transaction block"
                     .to_string(),
@@ -1957,7 +1970,9 @@ impl TransactionalDdlProvider for PostgresAdapter {
             })
         })
         .await
-        .map_err(|e| DbMcpError::InternalError(format!("Postgres transactional DDL join error: {e}")))?
+        .map_err(|e| {
+            DbMcpError::InternalError(format!("Postgres transactional DDL join error: {e}"))
+        })?
     }
 }
 
@@ -2157,7 +2172,11 @@ mod tests {
             .find(|o| o.name == "calculate_order_discount")
             .unwrap();
         assert_eq!(discount_fn.object_type, CatalogObjectType::Function);
-        assert!(discount_fn.definition.as_deref().unwrap().contains("JOIN public.users"));
+        assert!(discount_fn
+            .definition
+            .as_deref()
+            .unwrap()
+            .contains("JOIN public.users"));
 
         let checkout_proc = routines
             .objects
@@ -2188,6 +2207,9 @@ $$ LANGUAGE plpgsql;
         assert!(out.contains("'first_proc'"), "{out}");
         assert!(out.contains("'dollar_fn'"), "{out}");
         let first = out.split("'dollar_fn'").next().unwrap();
-        assert!(!first.contains("RETURNS INTEGER AS $$"), "first_proc swallowed dollar_fn: {out}");
+        assert!(
+            !first.contains("RETURNS INTEGER AS $$"),
+            "first_proc swallowed dollar_fn: {out}"
+        );
     }
 }

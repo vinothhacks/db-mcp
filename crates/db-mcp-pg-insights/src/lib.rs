@@ -204,8 +204,7 @@ impl PgInsightsEngine {
             {
                 existing.calls += 1;
                 existing.total_exec_time_ms += exec_time_ms;
-                existing.mean_exec_time_ms =
-                    existing.total_exec_time_ms / (existing.calls as f64);
+                existing.mean_exec_time_ms = existing.total_exec_time_ms / (existing.calls as f64);
                 existing.rows += rows;
                 existing.shared_blks_hit += 4;
             } else {
@@ -264,7 +263,9 @@ impl PgInsightsEngine {
         let engine = adapter.capabilities().engine;
         let mut report = self.build_health_report(connection, engine, &catalog.objects, &snapshot);
         if engine == DatabaseEngine::Sqlite {
-            report.findings.extend(sqlite_health_findings(adapter, connection).await);
+            report
+                .findings
+                .extend(sqlite_health_findings(adapter, connection).await);
             report.overall_status = report
                 .findings
                 .iter()
@@ -1187,7 +1188,7 @@ impl PgInsightsEngine {
                 if let Some(ev) = matched_hypopg {
                     (
                         true,
-                         (ev.cost_reduction_pct() * 10.0).round() / 10.0,
+                        (ev.cost_reduction_pct() * 10.0).round() / 10.0,
                         ev.baseline_cost,
                         ev.hypothetical_cost,
                     )
@@ -1238,7 +1239,11 @@ impl PgInsightsEngine {
 
             // SQLite rejects a schema-qualified table after ON, so use the bare table name there.
             let ddl_table = if engine == DatabaseEngine::Sqlite {
-                table_key.rsplit('.').next().unwrap_or(table_key.as_str()).to_string()
+                table_key
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(table_key.as_str())
+                    .to_string()
             } else {
                 table_key.clone()
             };
@@ -1301,10 +1306,15 @@ impl PgInsightsEngine {
 
             let required_privileges_extensions = if engine == DatabaseEngine::Postgres {
                 vec![
-                    format!("Table ownership or CREATE privilege on schema containing '{table_key}'"),
-                    "CREATE INDEX CONCURRENTLY must run outside an explicit transaction block".to_string(),
-                    "Optional: hypopg extension for zero-cost virtual index verification".to_string(),
-                    "Optional: pg_stat_statements extension for post-deployment workload tracking".to_string(),
+                    format!(
+                        "Table ownership or CREATE privilege on schema containing '{table_key}'"
+                    ),
+                    "CREATE INDEX CONCURRENTLY must run outside an explicit transaction block"
+                        .to_string(),
+                    "Optional: hypopg extension for zero-cost virtual index verification"
+                        .to_string(),
+                    "Optional: pg_stat_statements extension for post-deployment workload tracking"
+                        .to_string(),
                 ]
             } else {
                 vec![format!(
@@ -1376,7 +1386,10 @@ impl PgInsightsEngine {
 }
 
 /// Engine-appropriate SQLite health checks (integrity and journal mode) via read-only PRAGMAs.
-async fn sqlite_health_findings(adapter: &dyn DatabaseAdapter, connection: &str) -> Vec<HealthFinding> {
+async fn sqlite_health_findings(
+    adapter: &dyn DatabaseAdapter,
+    connection: &str,
+) -> Vec<HealthFinding> {
     let limits = ExecutionLimits {
         timeout_ms: 3_000,
         max_rows: 50,
@@ -1404,7 +1417,11 @@ async fn sqlite_health_findings(adapter: &dyn DatabaseAdapter, connection: &str)
         findings.push(HealthFinding {
             check_id: "sqlite_quick_check".to_string(),
             category: "integrity".to_string(),
-            severity: if ok { HealthSeverity::Healthy } else { HealthSeverity::Critical },
+            severity: if ok {
+                HealthSeverity::Healthy
+            } else {
+                HealthSeverity::Critical
+            },
             summary: if ok {
                 "PRAGMA quick_check reported ok".to_string()
             } else {
@@ -1414,7 +1431,10 @@ async fn sqlite_health_findings(adapter: &dyn DatabaseAdapter, connection: &str)
             remediation: if ok {
                 None
             } else {
-                Some("Restore from backup or run PRAGMA integrity_check and rebuild the database.".to_string())
+                Some(
+                    "Restore from backup or run PRAGMA integrity_check and rebuild the database."
+                        .to_string(),
+                )
             },
         });
     }
@@ -1468,8 +1488,13 @@ impl PostgresIndexAdvisor for PgInsightsEngine {
         max_recommendations: usize,
     ) -> DbMcpResult<Vec<IndexRecommendation>> {
         let adapter = self.get_adapter(connection);
-        self.recommend_indexes_internal(connection, adapter.as_deref(), queries, max_recommendations)
-            .await
+        self.recommend_indexes_internal(
+            connection,
+            adapter.as_deref(),
+            queries,
+            max_recommendations,
+        )
+        .await
     }
 }
 
@@ -1777,8 +1802,7 @@ mod tests {
                 sql: request.sql,
                 analyze: request.analyze,
                 format: request.format,
-                raw_plan: "Seq Scan on orders (cost=0.00..1850.00 rows=50000 width=64)"
-                    .to_string(),
+                raw_plan: "Seq Scan on orders (cost=0.00..1850.00 rows=50000 width=64)".to_string(),
                 structured_plan: Some(serde_json::json!({
                     "Node Type": "Seq Scan",
                     "Relation Name": "orders",

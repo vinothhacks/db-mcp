@@ -18,11 +18,14 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use db_mcp_catalog::{capture_schema, compute_schema_version, diff_schema, filter_and_paginate_objects};
+use db_mcp_catalog::{
+    capture_schema, compute_schema_version, diff_schema, filter_and_paginate_objects,
+};
 use db_mcp_core::{
-    AuthorizedQuery, CatalogObject, CatalogRequest, CatalogResponse, ColumnMetadata, DatabaseAdapter,
-    DatabaseCapabilities, DatabaseEngine, DbMcpError, DbMcpResult, ExecutionId, ExplainFormat, ExplainPlan,
-    ExplainRequest, QueryResult, SchemaDiff, SchemaDiffProvider, SchemaSnapshot, SqlStatementClass,
+    AuthorizedQuery, CatalogObject, CatalogRequest, CatalogResponse, ColumnMetadata,
+    DatabaseAdapter, DatabaseCapabilities, DatabaseEngine, DbMcpError, DbMcpResult, ExecutionId,
+    ExplainFormat, ExplainPlan, ExplainRequest, QueryResult, SchemaDiff, SchemaDiffProvider,
+    SchemaSnapshot, SqlStatementClass,
 };
 use db_mcp_secrets::SecretString;
 use db_mcp_sql::parse_and_analyze_sql;
@@ -120,7 +123,10 @@ impl ServerInfo {
                 .database_permissions
                 .iter()
                 .any(|p| p.eq_ignore_ascii_case(perm) || p.eq_ignore_ascii_case("CONTROL"))
-            || self.roles.iter().any(|r| r.eq_ignore_ascii_case("db_owner"))
+            || self
+                .roles
+                .iter()
+                .any(|r| r.eq_ignore_ascii_case("db_owner"))
     }
     fn has_server(&self, perm: &str) -> bool {
         self.is_sysadmin
@@ -152,9 +158,15 @@ impl ServerInfo {
             out.push("server role sysadmin".to_string());
         }
         for r in &self.roles {
-            if ["db_owner", "db_datawriter", "db_ddladmin", "db_securityadmin", "db_accessadmin"]
-                .iter()
-                .any(|w| r.eq_ignore_ascii_case(w))
+            if [
+                "db_owner",
+                "db_datawriter",
+                "db_ddladmin",
+                "db_securityadmin",
+                "db_accessadmin",
+            ]
+            .iter()
+            .any(|w| r.eq_ignore_ascii_case(w))
             {
                 out.push(format!("database role {r}"));
             }
@@ -176,8 +188,16 @@ impl ServerInfo {
     }
     /// Optional grants that are missing, keyed by feature, with the statement to run.
     pub fn missing_grants(&self) -> Vec<(String, String)> {
-        let user = if self.database_user.is_empty() { "<user>".to_string() } else { self.database_user.clone() };
-        let login = if self.login.is_empty() { "<login>".to_string() } else { self.login.clone() };
+        let user = if self.database_user.is_empty() {
+            "<user>".to_string()
+        } else {
+            self.database_user.clone()
+        };
+        let login = if self.login.is_empty() {
+            "<login>".to_string()
+        } else {
+            self.login.clone()
+        };
         let mut out = Vec::new();
         if !self.can_view_definition() {
             out.push((
@@ -186,7 +206,10 @@ impl ServerInfo {
             ));
         }
         if !self.can_showplan() {
-            out.push(("explain".to_string(), format!("estimated plans need GRANT SHOWPLAN TO [{user}]")));
+            out.push((
+                "explain".to_string(),
+                format!("estimated plans need GRANT SHOWPLAN TO [{user}]"),
+            ));
         }
         if !self.can_view_database_state() {
             out.push((
@@ -255,7 +278,11 @@ fn unavailable(dsn: &SqlServerDsn, why: impl std::fmt::Display) -> DbMcpError {
 }
 
 /// Map a driver error to a fail-closed `DbMcpError` with the password scrubbed.
-pub(crate) fn map_tds_error(dsn: &SqlServerDsn, context: &str, err: tiberius::error::Error) -> DbMcpError {
+pub(crate) fn map_tds_error(
+    dsn: &SqlServerDsn,
+    context: &str,
+    err: tiberius::error::Error,
+) -> DbMcpError {
     use tiberius::error::Error as E;
     match &err {
         E::Server(token) => {
@@ -280,12 +307,22 @@ pub(crate) fn map_tds_error(dsn: &SqlServerDsn, context: &str, err: tiberius::er
                 _ => DbMcpError::AdapterError(format!("SQL Server error {code} ({context}): {msg}")),
             }
         }
-        E::Io { .. } | E::Tls(_) | E::Routing { .. } | E::Protocol(_) => unavailable(dsn, format!("{context}: {err}")),
-        _ => DbMcpError::AdapterError(format!("SQL Server driver error ({context}): {}", dsn.scrub(&err.to_string()))),
+        E::Io { .. } | E::Tls(_) | E::Routing { .. } | E::Protocol(_) => {
+            unavailable(dsn, format!("{context}: {err}"))
+        }
+        _ => DbMcpError::AdapterError(format!(
+            "SQL Server driver error ({context}): {}",
+            dsn.scrub(&err.to_string())
+        )),
     }
 }
 
-async fn run_simple(client: &mut TdsClient, dsn: &SqlServerDsn, sql: &str, context: &str) -> DbMcpResult<()> {
+async fn run_simple(
+    client: &mut TdsClient,
+    dsn: &SqlServerDsn,
+    sql: &str,
+    context: &str,
+) -> DbMcpResult<()> {
     client
         .simple_query(sql)
         .await
@@ -310,7 +347,13 @@ pub(crate) async fn run_read(
     in_transaction: bool,
 ) -> DbMcpResult<(Vec<FetchedRows>, bool)> {
     if in_transaction {
-        run_simple(client, dsn, "SET XACT_ABORT ON; SET IMPLICIT_TRANSACTIONS OFF; BEGIN TRANSACTION;", "begin transaction").await?;
+        run_simple(
+            client,
+            dsn,
+            "SET XACT_ABORT ON; SET IMPLICIT_TRANSACTIONS OFF; BEGIN TRANSACTION;",
+            "begin transaction",
+        )
+        .await?;
     }
     let refs: Vec<&dyn tiberius::ToSql> = params.iter().map(|p| p.as_tosql()).collect();
     let mut sets: Vec<FetchedRows> = Vec::new();
@@ -322,13 +365,19 @@ pub(crate) async fn run_read(
             client.query(sql, &refs).await
         };
         let mut stream = stream.map_err(|e| map_tds_error(dsn, "query", e))?;
-        while let Some(item) = stream.try_next().await.map_err(|e| map_tds_error(dsn, "query", e))? {
+        while let Some(item) = stream
+            .try_next()
+            .await
+            .map_err(|e| map_tds_error(dsn, "query", e))?
+        {
             match item {
                 QueryItem::Metadata(meta) => sets.push(FetchedRows {
                     columns: meta
                         .columns()
                         .iter()
-                        .map(|c| ColumnMetadata::new(c.name(), values::column_type_name(c.column_type())))
+                        .map(|c| {
+                            ColumnMetadata::new(c.name(), values::column_type_name(c.column_type()))
+                        })
                         .collect(),
                     ..FetchedRows::default()
                 }),
@@ -339,8 +388,10 @@ pub(crate) async fn run_read(
                         truncated = true;
                         break;
                     }
-                    let vals: Vec<Value> = row.cells().map(|(_, d)| column_data_to_json(d)).collect();
-                    let size: usize = vals.iter().map(values::json_size).sum::<usize>() + vals.len();
+                    let vals: Vec<Value> =
+                        row.cells().map(|(_, d)| column_data_to_json(d)).collect();
+                    let size: usize =
+                        vals.iter().map(values::json_size).sum::<usize>() + vals.len();
                     if set.bytes_used + size > max_bytes {
                         set.truncated = true;
                         truncated = true;
@@ -356,13 +407,22 @@ pub(crate) async fn run_read(
         return Ok((sets, false));
     }
     if in_transaction {
-        run_simple(client, dsn, "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;", "rollback").await?;
+        run_simple(
+            client,
+            dsn,
+            "IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;",
+            "rollback",
+        )
+        .await?;
     }
     Ok((sets, true))
 }
 
 /// Probe version, database, login and effective permissions.
-pub(crate) async fn probe_server_info(client: &mut TdsClient, dsn: &SqlServerDsn) -> DbMcpResult<ServerInfo> {
+pub(crate) async fn probe_server_info(
+    client: &mut TdsClient,
+    dsn: &SqlServerDsn,
+) -> DbMcpResult<ServerInfo> {
     let sql = "SELECT /* db-mcp:internal */ CAST(SERVERPROPERTY('ProductVersion') AS nvarchar(128)), CAST(SERVERPROPERTY('Edition') AS nvarchar(128)), \
         CAST(SERVERPROPERTY('ProductLevel') AS nvarchar(128)), CAST(SERVERPROPERTY('InstanceName') AS nvarchar(128)), \
         DB_NAME(), SUSER_SNAME(), USER_NAME(), CAST(IS_SRVROLEMEMBER('sysadmin') AS int); \
@@ -374,7 +434,12 @@ pub(crate) async fn probe_server_info(client: &mut TdsClient, dsn: &SqlServerDsn
     let mut info = ServerInfo::default();
     if let Some(row) = sets.first().and_then(|r| r.rows.first()) {
         info.product_version = s(&row[0]);
-        info.major_version = info.product_version.split('.').next().and_then(|m| m.parse().ok()).unwrap_or(0);
+        info.major_version = info
+            .product_version
+            .split('.')
+            .next()
+            .and_then(|m| m.parse().ok())
+            .unwrap_or(0);
         info.edition = s(&row[1]);
         info.product_level = s(&row[2]);
         info.instance_name = row[3].as_str().map(ToOwned::to_owned);
@@ -385,7 +450,12 @@ pub(crate) async fn probe_server_info(client: &mut TdsClient, dsn: &SqlServerDsn
     }
     let col = |i: usize| -> Vec<String> {
         sets.get(i)
-            .map(|r| r.rows.iter().filter_map(|row| row.first().and_then(|v| v.as_str()).map(ToOwned::to_owned)).collect())
+            .map(|r| {
+                r.rows
+                    .iter()
+                    .filter_map(|row| row.first().and_then(|v| v.as_str()).map(ToOwned::to_owned))
+                    .collect()
+            })
             .unwrap_or_default()
     };
     info.database_permissions = col(1);
@@ -399,9 +469,10 @@ impl SqlServerAdapter {
     /// first connection is opened lazily by the first tool call.
     pub fn new(config: SqlServerConfig) -> DbMcpResult<Self> {
         let dsn = SqlServerDsn::parse(config.dsn.expose_secret()).map_err(|e| match e {
-            DbMcpError::ConfigurationError(m) => {
-                DbMcpError::ConfigurationError(format!("Connection '{}': {m}", config.connection_id))
-            }
+            DbMcpError::ConfigurationError(m) => DbMcpError::ConfigurationError(format!(
+                "Connection '{}': {m}",
+                config.connection_id
+            )),
             other => other,
         })?;
         if dsn.encryption == SqlServerEncryption::Strict {
@@ -452,7 +523,9 @@ impl SqlServerAdapter {
         cfg.authentication(AuthMethod::sql_server(&d.user, d.password()));
         cfg.encryption(match d.encryption {
             SqlServerEncryption::Optional => EncryptionLevel::Off,
-            SqlServerEncryption::Required | SqlServerEncryption::Strict => EncryptionLevel::Required,
+            SqlServerEncryption::Required | SqlServerEncryption::Strict => {
+                EncryptionLevel::Required
+            }
             SqlServerEncryption::Disabled => EncryptionLevel::NotSupported,
         });
         if d.trust_server_certificate {
@@ -468,17 +541,28 @@ impl SqlServerAdapter {
         let by_browser = dsn.port.is_none() && dsn.instance.is_some();
         let connect = async move {
             let tcp = if by_browser {
-                TcpStream::connect_named(&cfg).await.map_err(|e| map_tds_error(&dsn, "SQL Browser lookup", e))?
+                TcpStream::connect_named(&cfg)
+                    .await
+                    .map_err(|e| map_tds_error(&dsn, "SQL Browser lookup", e))?
             } else {
                 let port = dsn.port.unwrap_or(1433);
-                TcpStream::connect((dsn.host.as_str(), port)).await.map_err(|e| unavailable(&dsn, e))?
+                TcpStream::connect((dsn.host.as_str(), port))
+                    .await
+                    .map_err(|e| unavailable(&dsn, e))?
             };
             let _ = tcp.set_nodelay(true);
-            Client::connect(cfg, tcp.compat_write()).await.map_err(|e| map_tds_error(&dsn, "login", e))
+            Client::connect(cfg, tcp.compat_write())
+                .await
+                .map_err(|e| map_tds_error(&dsn, "login", e))
         };
-        match tokio::time::timeout(Duration::from_secs(self.dsn.connect_timeout_secs), connect).await {
+        match tokio::time::timeout(Duration::from_secs(self.dsn.connect_timeout_secs), connect)
+            .await
+        {
             Ok(r) => r,
-            Err(_) => Err(unavailable(&self.dsn, format!("connect timed out after {}s", self.dsn.connect_timeout_secs))),
+            Err(_) => Err(unavailable(
+                &self.dsn,
+                format!("connect timed out after {}s", self.dsn.connect_timeout_secs),
+            )),
         }
     }
 
@@ -507,12 +591,26 @@ impl SqlServerAdapter {
     /// Check out a connection; a pooled connection that died is replaced once.
     async fn checkout_live(&self) -> DbMcpResult<TdsClient> {
         let mut client = self.checkout().await?;
-        if run_simple(&mut client, &self.dsn, "SELECT /* db-mcp:internal */ 1;", "ping").await.is_ok() {
+        if run_simple(
+            &mut client,
+            &self.dsn,
+            "SELECT /* db-mcp:internal */ 1;",
+            "ping",
+        )
+        .await
+        .is_ok()
+        {
             return Ok(client);
         }
         drop(client);
         let mut fresh = self.connect().await?;
-        run_simple(&mut fresh, &self.dsn, "SELECT /* db-mcp:internal */ 1;", "ping").await?;
+        run_simple(
+            &mut fresh,
+            &self.dsn,
+            "SELECT /* db-mcp:internal */ 1;",
+            "ping",
+        )
+        .await?;
         Ok(fresh)
     }
 
@@ -521,7 +619,11 @@ impl SqlServerAdapter {
         if let Some(info) = self.cached_server_info() {
             return Ok(info);
         }
-        let _permit = self.permits.acquire().await.map_err(|e| DbMcpError::InternalError(e.to_string()))?;
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .map_err(|e| DbMcpError::InternalError(e.to_string()))?;
         let mut client = self.checkout().await?;
         let info = probe_server_info(&mut client, &self.dsn).await?;
         if let Ok(mut g) = self.server_info.write() {
@@ -538,10 +640,19 @@ impl SqlServerAdapter {
 
     /// Run an internal read-only metadata/diagnostic batch (no parameters) inside
     /// BEGIN TRAN ... ROLLBACK and return every result set.
-    pub async fn query_internal(&self, sql: &str, max_rows: usize) -> DbMcpResult<Vec<FetchedRows>> {
-        let _permit = self.permits.acquire().await.map_err(|e| DbMcpError::InternalError(e.to_string()))?;
+    pub async fn query_internal(
+        &self,
+        sql: &str,
+        max_rows: usize,
+    ) -> DbMcpResult<Vec<FetchedRows>> {
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .map_err(|e| DbMcpError::InternalError(e.to_string()))?;
         let mut client = self.checkout_live().await?;
-        let (sets, clean) = run_read(&mut client, &self.dsn, sql, &[], max_rows, usize::MAX, true).await?;
+        let (sets, clean) =
+            run_read(&mut client, &self.dsn, sql, &[], max_rows, usize::MAX, true).await?;
         if clean {
             self.checkin(client).await;
         }
@@ -550,7 +661,12 @@ impl SqlServerAdapter {
 
     /// First result set of an internal query.
     pub async fn query_rows(&self, sql: &str, max_rows: usize) -> DbMcpResult<FetchedRows> {
-        Ok(self.query_internal(sql, max_rows).await?.into_iter().next().unwrap_or_default())
+        Ok(self
+            .query_internal(sql, max_rows)
+            .await?
+            .into_iter()
+            .next()
+            .unwrap_or_default())
     }
 
     /// Catalog objects of the current database, cached for `catalog_ttl`.
@@ -562,7 +678,10 @@ impl SqlServerAdapter {
         }
         let (objects, warnings) = catalog::load_catalog(self).await?;
         if let Ok(mut g) = self.catalog_cache.lock() {
-            *g = Some(CatalogCache { loaded_at: Instant::now(), objects: objects.clone() });
+            *g = Some(CatalogCache {
+                loaded_at: Instant::now(),
+                objects: objects.clone(),
+            });
         }
         if let Ok(mut w) = self.catalog_warnings.lock() {
             *w = warnings;
@@ -572,7 +691,10 @@ impl SqlServerAdapter {
 
     /// Warnings from the last catalog load (e.g. definitions hidden without VIEW DEFINITION).
     pub fn catalog_warnings(&self) -> Vec<String> {
-        self.catalog_warnings.lock().map(|w| w.clone()).unwrap_or_default()
+        self.catalog_warnings
+            .lock()
+            .map(|w| w.clone())
+            .unwrap_or_default()
     }
 
     fn invalidate_catalog(&self) {
@@ -620,13 +742,31 @@ impl SqlServerAdapter {
         params: &[SqlParam],
         is_read: bool,
     ) -> DbMcpResult<(FetchedRows, Option<u64>)> {
-        let _permit = self.permits.acquire().await.map_err(|e| DbMcpError::InternalError(e.to_string()))?;
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .map_err(|e| DbMcpError::InternalError(e.to_string()))?;
         let mut client = self.checkout_live().await?;
         let lock_ms = request.timeout_ms.clamp(1, 30_000);
-        run_simple(&mut client, &self.dsn, &format!("SET LOCK_TIMEOUT {lock_ms};"), "session setup").await?;
+        run_simple(
+            &mut client,
+            &self.dsn,
+            &format!("SET LOCK_TIMEOUT {lock_ms};"),
+            "session setup",
+        )
+        .await?;
         if is_read {
-            let (sets, clean) =
-                run_read(&mut client, &self.dsn, sql, params, request.max_rows, request.max_bytes, true).await?;
+            let (sets, clean) = run_read(
+                &mut client,
+                &self.dsn,
+                sql,
+                params,
+                request.max_rows,
+                request.max_bytes,
+                true,
+            )
+            .await?;
             if clean {
                 self.checkin(client).await;
             }
@@ -637,9 +777,18 @@ impl SqlServerAdapter {
         }
         // Write path: only reachable on a non-read-only connection (Development mode or an
         // approved change). Runs in a transaction and commits.
-        run_simple(&mut client, &self.dsn, "SET XACT_ABORT ON; BEGIN TRANSACTION;", "begin transaction").await?;
+        run_simple(
+            &mut client,
+            &self.dsn,
+            "SET XACT_ABORT ON; BEGIN TRANSACTION;",
+            "begin transaction",
+        )
+        .await?;
         let refs: Vec<&dyn tiberius::ToSql> = params.iter().map(|p| p.as_tosql()).collect();
-        let res = client.execute(sql, &refs).await.map_err(|e| map_tds_error(&self.dsn, "execute", e))?;
+        let res = client
+            .execute(sql, &refs)
+            .await
+            .map_err(|e| map_tds_error(&self.dsn, "execute", e))?;
         let affected: u64 = res.rows_affected().iter().sum();
         run_simple(&mut client, &self.dsn, "COMMIT TRANSACTION;", "commit").await?;
         self.checkin(client).await;
@@ -657,7 +806,10 @@ impl SqlServerAdapter {
                 if !info.has_query_store() {
                     caps.unavailable_reasons.insert(
                         "query_store".to_string(),
-                        format!("Query Store needs SQL Server 2016+ (server is {})", info.product_version),
+                        format!(
+                            "Query Store needs SQL Server 2016+ (server is {})",
+                            info.product_version
+                        ),
                     );
                 }
             }
@@ -712,7 +864,10 @@ impl DatabaseAdapter for SqlServerAdapter {
         let (fetched, rows_affected) = outcome?;
         let mut warnings = Vec::new();
         if fetched.extra_result_sets > 0 {
-            warnings.push(format!("{} additional result set(s) were discarded", fetched.extra_result_sets));
+            warnings.push(format!(
+                "{} additional result set(s) were discarded",
+                fetched.extra_result_sets
+            ));
         }
         Ok(QueryResult {
             execution_id: request.execution_id,
@@ -735,7 +890,11 @@ impl DatabaseAdapter for SqlServerAdapter {
     async fn cancel(&self, execution: ExecutionId) -> DbMcpResult<bool> {
         // KILL needs ALTER ANY CONNECTION, which a read-only login lacks: cancellation drops the
         // in-flight request and its connection instead (the server rolls the transaction back).
-        let token = self.inflight.lock().ok().and_then(|mut m| m.remove(&execution));
+        let token = self
+            .inflight
+            .lock()
+            .ok()
+            .and_then(|mut m| m.remove(&execution));
         Ok(match token {
             Some(t) => {
                 t.cancel();
@@ -748,7 +907,10 @@ impl DatabaseAdapter for SqlServerAdapter {
 
 fn count_named_params(sql: &str) -> usize {
     let re = regex::Regex::new(r"(?i)@P(\d+)\b").expect("valid param regex");
-    re.captures_iter(sql).filter_map(|c| c[1].parse::<usize>().ok()).max().unwrap_or(0)
+    re.captures_iter(sql)
+        .filter_map(|c| c[1].parse::<usize>().ok())
+        .max()
+        .unwrap_or(0)
 }
 
 fn showplan_denied(user: &str) -> DbMcpError {
@@ -783,15 +945,31 @@ impl SqlServerAdapter {
         // Parameters are declared without values so the batch compiles; the optimizer then
         // estimates with average selectivity.
         let declares: Vec<String> = (1..=n)
-            .map(|i| format!("DECLARE @P{i} {};", params.get(i - 1).map(|p| p.declared_type()).unwrap_or("nvarchar(4000)")))
+            .map(|i| {
+                format!(
+                    "DECLARE @P{i} {};",
+                    params
+                        .get(i - 1)
+                        .map(|p| p.declared_type())
+                        .unwrap_or("nvarchar(4000)")
+                )
+            })
             .collect();
         let batch = format!("{}\n{}", declares.join(" "), body);
-        let _permit = self.permits.acquire().await.map_err(|e| DbMcpError::InternalError(e.to_string()))?;
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .map_err(|e| DbMcpError::InternalError(e.to_string()))?;
         let mut client = self.checkout_live().await?;
-        run_simple(&mut client, &self.dsn, "SET SHOWPLAN_XML ON;", "showplan").await.map_err(|e| match &e {
-            DbMcpError::PolicyDenied { code, .. } if code == CODE_SERVER_PERMISSION_DENIED => showplan_denied(&info.database_user),
-            _ => e,
-        })?;
+        run_simple(&mut client, &self.dsn, "SET SHOWPLAN_XML ON;", "showplan")
+            .await
+            .map_err(|e| match &e {
+                DbMcpError::PolicyDenied { code, .. } if code == CODE_SERVER_PERMISSION_DENIED => {
+                    showplan_denied(&info.database_user)
+                }
+                _ => e,
+            })?;
         let fetched = async {
             client
                 .simple_query(batch.as_str())
@@ -802,7 +980,10 @@ impl SqlServerAdapter {
                 .map_err(|e| map_tds_error(&self.dsn, "showplan", e))
         }
         .await;
-        if run_simple(&mut client, &self.dsn, "SET SHOWPLAN_XML OFF;", "showplan").await.is_ok() {
+        if run_simple(&mut client, &self.dsn, "SET SHOWPLAN_XML OFF;", "showplan")
+            .await
+            .is_ok()
+        {
             self.checkin(client).await;
         }
         let sets = fetched?;
@@ -812,13 +993,18 @@ impl SqlServerAdapter {
             .flatten()
             .filter_map(|r| r.get::<&str, _>(0).map(ToOwned::to_owned))
             .last()
-            .ok_or_else(|| DbMcpError::AdapterError("SQL Server returned no estimated plan".to_string()))?;
+            .ok_or_else(|| {
+                DbMcpError::AdapterError("SQL Server returned no estimated plan".to_string())
+            })?;
         let parsed = showplan::parse_showplan_xml(&xml)?;
         let raw_plan = match request.format {
             ExplainFormat::Json => xml,
             ExplainFormat::Text => parsed.text_tree.clone(),
         };
-        let mut warnings = vec!["SQL Server estimated plan (SHOWPLAN_XML); the statement was compiled, not executed".to_string()];
+        let mut warnings = vec![
+            "SQL Server estimated plan (SHOWPLAN_XML); the statement was compiled, not executed"
+                .to_string(),
+        ];
         warnings.extend(parsed.warnings.clone());
         Ok(ExplainPlan {
             connection: request.connection,
@@ -838,16 +1024,28 @@ impl SqlServerAdapter {
 
 #[async_trait]
 impl SchemaDiffProvider for SqlServerAdapter {
-    async fn capture_schema(&self, connection: &str, schema_pattern: Option<String>) -> DbMcpResult<SchemaSnapshot> {
+    async fn capture_schema(
+        &self,
+        connection: &str,
+        schema_pattern: Option<String>,
+    ) -> DbMcpResult<SchemaSnapshot> {
         let mut req = CatalogRequest::new(connection);
         req.schema_pattern = schema_pattern;
         req.detail_level = db_mcp_core::CatalogDetailLevel::Full;
         req.limit = 10_000;
         let resp = self.discover(req).await?;
-        Ok(capture_schema(connection, DatabaseEngine::SqlServer, resp.objects))
+        Ok(capture_schema(
+            connection,
+            DatabaseEngine::SqlServer,
+            resp.objects,
+        ))
     }
 
-    async fn diff_schema(&self, base: &SchemaSnapshot, target: &SchemaSnapshot) -> DbMcpResult<SchemaDiff> {
+    async fn diff_schema(
+        &self,
+        base: &SchemaSnapshot,
+        target: &SchemaSnapshot,
+    ) -> DbMcpResult<SchemaDiff> {
         Ok(diff_schema(base, target))
     }
 }
@@ -900,8 +1098,16 @@ impl SqlServerAdapter {
         ));
         check.database = Some(info.database.clone());
         check.login = Some(info.login.clone());
-        let mut perms: Vec<String> = info.database_permissions.iter().map(|p| format!("database:{p}")).collect();
-        perms.extend(info.server_permissions.iter().map(|p| format!("server:{p}")));
+        let mut perms: Vec<String> = info
+            .database_permissions
+            .iter()
+            .map(|p| format!("database:{p}"))
+            .collect();
+        perms.extend(
+            info.server_permissions
+                .iter()
+                .map(|p| format!("server:{p}")),
+        );
         perms.extend(info.roles.iter().map(|r| format!("role:{r}")));
         check.permissions = perms;
         let writes = info.write_capabilities();
@@ -915,13 +1121,29 @@ impl SqlServerAdapter {
         for (_, why) in info.missing_grants() {
             check.warnings.push(format!("optional: {why}"));
         }
-        match self.query_rows("SELECT /* db-mcp:internal */ 1 AS ok", 1).await {
-            Ok(r) => check.select_1 = r.rows.first().and_then(|row| row.first()).and_then(|v| v.as_i64()) == Some(1),
-            Err(e) => check.warnings.push(format!("SELECT 1 failed: {}", self.dsn.scrub(&e.to_string()))),
+        match self
+            .query_rows("SELECT /* db-mcp:internal */ 1 AS ok", 1)
+            .await
+        {
+            Ok(r) => {
+                check.select_1 = r
+                    .rows
+                    .first()
+                    .and_then(|row| row.first())
+                    .and_then(|v| v.as_i64())
+                    == Some(1)
+            }
+            Err(e) => check.warnings.push(format!(
+                "SELECT 1 failed: {}",
+                self.dsn.scrub(&e.to_string())
+            )),
         }
         match self.catalog_objects().await {
             Ok(objs) => check.object_count = Some(objs.len()),
-            Err(e) => check.warnings.push(format!("catalog discovery failed: {}", self.dsn.scrub(&e.to_string()))),
+            Err(e) => check.warnings.push(format!(
+                "catalog discovery failed: {}",
+                self.dsn.scrub(&e.to_string())
+            )),
         }
         check.warnings.extend(self.catalog_warnings());
         check
@@ -941,8 +1163,12 @@ mod tests {
         let a = adapter("sqlserver://ro:P%40ss%29w%24rd@127.0.0.1:1?instance=X");
         assert!(!format!("{a:?}").contains("P@ss"));
         assert!(!a.display_target().contains("P@ss"));
-        let e = SqlServerAdapter::new(SqlServerConfig::new("bad", "sqlserver://ro:Secr3tPw@h:x")).unwrap_err();
-        assert!(e.to_string().contains("'bad'") && !e.to_string().contains("Secr3tPw"), "{e}");
+        let e = SqlServerAdapter::new(SqlServerConfig::new("bad", "sqlserver://ro:Secr3tPw@h:x"))
+            .unwrap_err();
+        assert!(
+            e.to_string().contains("'bad'") && !e.to_string().contains("Secr3tPw"),
+            "{e}"
+        );
         let caps = a.capabilities();
         assert_eq!(caps.engine, DatabaseEngine::SqlServer);
         assert!(!caps.supports_analyze_explain);
@@ -963,14 +1189,20 @@ mod tests {
         ] {
             assert!(a.guard(sql, false).is_err(), "{sql}");
         }
-        let rw = SqlServerAdapter::new(SqlServerConfig::new("rw", "sqlserver://u:pw@127.0.0.1:1").with_read_only(false)).unwrap();
+        let rw = SqlServerAdapter::new(
+            SqlServerConfig::new("rw", "sqlserver://u:pw@127.0.0.1:1").with_read_only(false),
+        )
+        .unwrap();
         assert!(!rw.guard("UPDATE dbo.users SET role = 'x'", false).unwrap());
         assert!(rw.guard("UPDATE dbo.users SET role = 'x'", true).is_err());
     }
 
     #[tokio::test]
     async fn unreachable_server_fails_closed_with_connection_unavailable() {
-        let mut cfg = SqlServerConfig::new("mssql", "sqlserver://ro:Secr3tPw@127.0.0.1:1?connectTimeout=2");
+        let mut cfg = SqlServerConfig::new(
+            "mssql",
+            "sqlserver://ro:Secr3tPw@127.0.0.1:1?connectTimeout=2",
+        );
         cfg.catalog_ttl = Duration::from_secs(0);
         let a = SqlServerAdapter::new(cfg).unwrap();
         let err = a.discover(CatalogRequest::new("mssql")).await.unwrap_err();
@@ -979,7 +1211,10 @@ mod tests {
         assert!(!err.to_string().contains("Secr3tPw"));
         let check = a.check_connection().await;
         assert!(!check.can_connect && !check.select_1);
-        assert_eq!(check.error_code.as_deref(), Some(CODE_CONNECTION_UNAVAILABLE));
+        assert_eq!(
+            check.error_code.as_deref(),
+            Some(CODE_CONNECTION_UNAVAILABLE)
+        );
         assert!(!serde_json::to_string(&check).unwrap().contains("Secr3tPw"));
     }
 
@@ -995,7 +1230,15 @@ mod tests {
         };
         assert!(ro.write_capabilities().is_empty());
         let missing: Vec<String> = ro.missing_grants().into_iter().map(|(k, _)| k).collect();
-        assert_eq!(missing, vec!["routine_definitions", "explain", "query_store", "server_state"]);
+        assert_eq!(
+            missing,
+            vec![
+                "routine_definitions",
+                "explain",
+                "query_store",
+                "server_state"
+            ]
+        );
         let rw = ServerInfo {
             roles: vec!["db_datawriter".into()],
             database_permissions: vec!["INSERT".into()],
@@ -1003,7 +1246,11 @@ mod tests {
         };
         assert_eq!(rw.write_capabilities().len(), 2);
         let full = ServerInfo {
-            database_permissions: vec!["VIEW DEFINITION".into(), "SHOWPLAN".into(), "VIEW DATABASE STATE".into()],
+            database_permissions: vec![
+                "VIEW DEFINITION".into(),
+                "SHOWPLAN".into(),
+                "VIEW DATABASE STATE".into(),
+            ],
             server_permissions: vec!["VIEW SERVER STATE".into()],
             ..Default::default()
         };

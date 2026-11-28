@@ -3,8 +3,13 @@
 pub mod config;
 pub mod schemas;
 
-pub use config::{AuditConfig, ChangeStoreConfig, ConnectionConfig, HttpServerConfig, OntologyConfig, ServerConfig};
-pub use schemas::{build_tool_definitions, JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpToolDefinition};
+pub use config::{
+    AuditConfig, ChangeStoreConfig, ConnectionConfig, HttpServerConfig, OntologyConfig,
+    ServerConfig,
+};
+pub use schemas::{
+    build_tool_definitions, JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpToolDefinition,
+};
 
 use std::collections::BTreeMap;
 use std::ops::Deref;
@@ -18,22 +23,24 @@ use std::sync::Mutex;
 use db_mcp_audit::{build_audit_sink, create_audit_event, AuditFilter, AuditSink};
 use db_mcp_catalog::{
     build_procedure_call_graph, capture_schema, compute_schema_version, describe_object,
-    diff_schema, filter_and_paginate_objects, schema_diff_warnings, verify_snapshot_hash, trace_table_dependencies,
+    diff_schema, filter_and_paginate_objects, schema_diff_warnings, trace_table_dependencies,
+    verify_snapshot_hash,
 };
 use db_mcp_changes::{ApplyChangeOptions, ChangeManager};
+use db_mcp_core::{
+    AuditDecision, AuditEvent, CallerIdentity, CatalogDetailLevel, CatalogObject,
+    CatalogObjectType, CatalogRequest, ChangeProposal, ColumnMetadata, ConnectionSummary,
+    DatabaseAdapter, DatabaseEngine, DbMcpError, DbMcpResult, ExplainFormat, ExplainRequest,
+    McpSuccessResponse, PostgresHealthProvider, PostgresIndexAdvisor, SchemaSnapshot,
+    SqlStatementClass,
+};
+use db_mcp_executor::{BoundedExecutor, GovernedQueryRequest};
+use db_mcp_mysql::{MySqlAdapter, MySqlBackendMode, MySqlConfig};
 use db_mcp_ontology::{
     Certification, Definition, DefinitionBody, DefinitionKind, DefinitionStatus, GovernanceOptions,
     OntologyRevision, OntologyService, OntologyStore, PlanRequest, ProposalInput, QuestionEvidence,
     ReviewAction, SemanticPlan,
 };
-use db_mcp_core::{
-    AuditDecision, AuditEvent, CallerIdentity, CatalogDetailLevel, CatalogObject, CatalogObjectType,
-    CatalogRequest, ChangeProposal, ColumnMetadata, ConnectionSummary, DatabaseAdapter,
-    DatabaseEngine, DbMcpError, DbMcpResult, ExplainFormat, ExplainRequest, McpSuccessResponse,
-    PostgresHealthProvider, PostgresIndexAdvisor, SchemaSnapshot, SqlStatementClass,
-};
-use db_mcp_executor::{BoundedExecutor, GovernedQueryRequest};
-use db_mcp_mysql::{MySqlAdapter, MySqlBackendMode, MySqlConfig};
 use db_mcp_pg_insights::PgInsightsEngine;
 use db_mcp_policy::{PolicyEngine, PolicyEvaluation, CODE_MUTATION_NOT_ALLOWED_IN_READ_ONLY};
 use db_mcp_postgres::{PostgresAdapter, PostgresConfig};
@@ -99,7 +106,9 @@ impl AuditSink for TrackingAuditSink {
 fn audit_decision_for_error(err: &DbMcpError) -> AuditDecision {
     match err {
         DbMcpError::ApprovalRequired(_) => AuditDecision::RequiresApproval,
-        DbMcpError::PolicyDenied { code, .. } if code == "APPROVAL_REQUIRED" => AuditDecision::RequiresApproval,
+        DbMcpError::PolicyDenied { code, .. } if code == "APPROVAL_REQUIRED" => {
+            AuditDecision::RequiresApproval
+        }
         DbMcpError::ExecutionCancelled(..) => AuditDecision::Cancelled,
         DbMcpError::AdapterError(_)
         | DbMcpError::StorageError(_)
@@ -114,10 +123,18 @@ fn mentions_restricted(text: &str, cfg: &db_mcp_policy::ConnectionPolicyConfig) 
     if cfg.restricted_tables.is_empty() {
         return false;
     }
-    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '"' || c == '`'))
-        .map(|t| t.trim_matches(|c| c == '"' || c == '`' || c == '.'))
-        .filter(|t| !t.is_empty())
-        .any(|t| cfg.is_restricted_table(t) || t.rsplit('.').next().map(|b| cfg.is_restricted_table(b)).unwrap_or(false))
+    text.split(|c: char| {
+        !(c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '"' || c == '`')
+    })
+    .map(|t| t.trim_matches(|c| c == '"' || c == '`' || c == '.'))
+    .filter(|t| !t.is_empty())
+    .any(|t| {
+        cfg.is_restricted_table(t)
+            || t.rsplit('.')
+                .next()
+                .map(|b| cfg.is_restricted_table(b))
+                .unwrap_or(false)
+    })
 }
 
 fn element_mentions_restricted(value: &Value, cfg: &db_mcp_policy::ConnectionPolicyConfig) -> bool {
@@ -181,15 +198,29 @@ pub struct DbMcpRuntime {
 ///
 /// A configured `review_key` that cannot be resolved is a startup error (fail closed).
 pub fn build_ontology_service(config: &ServerConfig) -> DbMcpResult<OntologyService> {
-    let store = match config.ontology.storage_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+    let store = match config
+        .ontology
+        .storage_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
         Some(path) => OntologyStore::open(path)?,
         None => OntologyStore::new_in_memory()?,
     };
-    let review_key = match config.ontology.review_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+    let review_key = match config
+        .ontology
+        .review_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    {
         Some(reference) => {
             let secrets = CompositeSecretProvider::with_static_and_env(StaticSecretProvider::new());
             let secret = secrets.resolve_dsn(reference).map_err(|e| {
-                DbMcpError::ConfigurationError(format!("ontology.review_key could not be resolved: {e}"))
+                DbMcpError::ConfigurationError(format!(
+                    "ontology.review_key could not be resolved: {e}"
+                ))
             })?;
             Some(secret.expose_secret().as_bytes().to_vec())
         }
@@ -213,7 +244,13 @@ pub const APPROVAL_KEY_ENV: &str = "DB_MCP_APPROVAL_KEY";
 ///
 /// A configured reference that cannot be resolved (or resolves to nothing) is an error (fail closed).
 pub fn resolve_approval_key(config: &ServerConfig) -> DbMcpResult<Option<Vec<u8>>> {
-    let Some(reference) = config.changes.approval_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) else {
+    let Some(reference) = config
+        .changes
+        .approval_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    else {
         return Ok(std::env::var(APPROVAL_KEY_ENV)
             .ok()
             .map(|v| v.trim().to_string())
@@ -222,19 +259,28 @@ pub fn resolve_approval_key(config: &ServerConfig) -> DbMcpResult<Option<Vec<u8>
     };
     let value = if let Some(path) = reference.strip_prefix("file:") {
         std::fs::read_to_string(path.trim()).map_err(|e| {
-            DbMcpError::ConfigurationError(format!("changes.approval_key file '{}' could not be read: {e}", path.trim()))
+            DbMcpError::ConfigurationError(format!(
+                "changes.approval_key file '{}' could not be read: {e}",
+                path.trim()
+            ))
         })?
     } else {
         let secrets = CompositeSecretProvider::with_static_and_env(StaticSecretProvider::new());
         secrets
             .resolve_dsn(reference)
-            .map_err(|e| DbMcpError::ConfigurationError(format!("changes.approval_key could not be resolved: {e}")))?
+            .map_err(|e| {
+                DbMcpError::ConfigurationError(format!(
+                    "changes.approval_key could not be resolved: {e}"
+                ))
+            })?
             .expose_secret()
             .to_string()
     };
     let value = value.trim();
     if value.is_empty() {
-        return Err(DbMcpError::ConfigurationError("changes.approval_key resolved to an empty value".to_string()));
+        return Err(DbMcpError::ConfigurationError(
+            "changes.approval_key resolved to an empty value".to_string(),
+        ));
     }
     Ok(Some(value.as_bytes().to_vec()))
 }
@@ -264,17 +310,18 @@ pub fn build_change_manager(config: &ServerConfig) -> DbMcpResult<ChangeManager>
 fn arg_u64(args: &Value, key: &str) -> DbMcpResult<Option<u64>> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
-        Some(v) => v
-            .as_u64()
-            .map(Some)
-            .ok_or_else(|| DbMcpError::InvalidArgument(format!("'{key}' must be a non-negative integer"))),
+        Some(v) => v.as_u64().map(Some).ok_or_else(|| {
+            DbMcpError::InvalidArgument(format!("'{key}' must be a non-negative integer"))
+        }),
     }
 }
 
 /// Like `arg_u64` but rejects zero (for limits and counts where zero is meaningless).
 fn arg_positive_u64(args: &Value, key: &str) -> DbMcpResult<Option<u64>> {
     match arg_u64(args, key)? {
-        Some(0) => Err(DbMcpError::InvalidArgument(format!("'{key}' must be a positive integer (>= 1)"))),
+        Some(0) => Err(DbMcpError::InvalidArgument(format!(
+            "'{key}' must be a positive integer (>= 1)"
+        ))),
         other => Ok(other),
     }
 }
@@ -292,12 +339,19 @@ fn arg_string_array(args: &Value, key: &str) -> DbMcpResult<Option<Vec<String>>>
             })
             .collect::<DbMcpResult<Vec<_>>>()
             .map(Some),
-        Some(_) => Err(DbMcpError::InvalidArgument(format!("'{key}' must be an array of strings"))),
+        Some(_) => Err(DbMcpError::InvalidArgument(format!(
+            "'{key}' must be an array of strings"
+        ))),
     }
 }
 
 /// Deny a diagnostics tool when the adapter does not advertise the capability behind it.
-fn unsupported_capability(tool: &str, conn: &str, adapter: &dyn DatabaseAdapter, capability: &str) -> DbMcpError {
+fn unsupported_capability(
+    tool: &str,
+    conn: &str,
+    adapter: &dyn DatabaseAdapter,
+    capability: &str,
+) -> DbMcpError {
     let caps = adapter.capabilities();
     DbMcpError::PolicyDenied {
         code: "UNSUPPORTED_CAPABILITY".to_string(),
@@ -306,7 +360,8 @@ fn unsupported_capability(tool: &str, conn: &str, adapter: &dyn DatabaseAdapter,
             caps.engine.as_str()
         ),
         next_action: Some(
-            "list_connections (check capabilities); use a connection whose capability is true".to_string(),
+            "list_connections (check capabilities); use a connection whose capability is true"
+                .to_string(),
         ),
     }
 }
@@ -326,7 +381,10 @@ fn positive_budget_arg(args: &Value, key: &str) -> DbMcpResult<Option<u64>> {
     }
 }
 
-fn definition_touches_restricted(def: &Definition, cfg: &db_mcp_policy::ConnectionPolicyConfig) -> bool {
+fn definition_touches_restricted(
+    def: &Definition,
+    cfg: &db_mcp_policy::ConnectionPolicyConfig,
+) -> bool {
     def.body.tables().iter().any(|t| cfg.is_restricted_table(t))
 }
 
@@ -412,15 +470,23 @@ impl DbMcpRuntime {
                     mysql
                 }
                 DatabaseEngine::SqlServer => {
-                    if conn.init_sql.as_deref().map(str::trim).filter(|s| !s.is_empty()).is_some() {
+                    if conn
+                        .init_sql
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .is_some()
+                    {
                         return Err(DbMcpError::ConfigurationError(format!(
                             "Connection '{}': init_sql is not supported for live SQL Server connections",
                             conn.id
                         )));
                     }
                     let read_only = conn.read_only
-                        || conn.effective_mode(config.default_mode) == db_mcp_core::OperatingMode::ReadOnly;
-                    let mut cfg = SqlServerConfig::new(&conn.id, resolved_dsn).with_read_only(read_only);
+                        || conn.effective_mode(config.default_mode)
+                            == db_mcp_core::OperatingMode::ReadOnly;
+                    let mut cfg =
+                        SqlServerConfig::new(&conn.id, resolved_dsn).with_read_only(read_only);
                     if let Some(schema) = &conn.default_schema {
                         cfg = cfg.with_default_schema(schema.clone());
                     }
@@ -437,21 +503,35 @@ impl DbMcpRuntime {
                     id: conn.id.clone(),
                     engine: conn.engine,
                     mode,
-                    read_only: conn.read_only || matches!(mode, db_mcp_core::OperatingMode::ReadOnly),
+                    read_only: conn.read_only
+                        || matches!(mode, db_mcp_core::OperatingMode::ReadOnly),
                     description: conn.description.clone(),
                     default_schema: conn.default_schema.clone(),
                     capabilities: adapter.capabilities(),
                     limits: conn.execution_limits(),
                 },
             );
-            policy_configs.push(conn.to_policy_config(config.default_mode, &config.changes.policy_revision));
+            policy_configs
+                .push(conn.to_policy_config(config.default_mode, &config.changes.policy_revision));
             adapters.insert(conn.id.clone(), adapter);
         }
 
         if config.default_mode == db_mcp_core::OperatingMode::GovernedProduction
             && !config.audit.in_memory
-            && config.audit.jsonl_path.as_deref().map(str::trim).unwrap_or("").is_empty()
-            && config.audit.sqlite_path.as_deref().map(str::trim).unwrap_or("").is_empty()
+            && config
+                .audit
+                .jsonl_path
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+            && config
+                .audit
+                .sqlite_path
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
         {
             return Err(DbMcpError::StorageError(
                 "governed_production requires a durable audit trail: set audit.jsonl_path or audit.sqlite_path (or audit.in_memory=true to opt in to a non-durable trail)".to_string(),
@@ -464,7 +544,10 @@ impl DbMcpRuntime {
         )?;
         let audit_tracker = Arc::new(TrackingAuditSink::new(base_sink));
         let audit: Arc<dyn AuditSink> = audit_tracker.clone();
-        let policy = Arc::new(PolicyEngine::with_configs(config.default_mode, policy_configs));
+        let policy = Arc::new(PolicyEngine::with_configs(
+            config.default_mode,
+            policy_configs,
+        ));
         let executor = BoundedExecutor::with_governance(policy.clone(), audit.clone());
         let named_tools = NamedToolRegistry::from_specs(config.named_tools.clone())?;
         let pg_insights = PgInsightsEngine::with_adapters(adapters.values().cloned());
@@ -559,20 +642,37 @@ impl DbMcpRuntime {
         sql: &str,
     ) -> DbMcpResult<()> {
         let analysis = parse_and_analyze_sql(engine, sql)?;
-        match self.policy.evaluate_sql_with_context(caller, connection, &analysis, true, false) {
-            PolicyEvaluation::Denied { code, message, next_action } => {
+        match self
+            .policy
+            .evaluate_sql_with_context(caller, connection, &analysis, true, false)
+        {
+            PolicyEvaluation::Denied {
+                code,
+                message,
+                next_action,
+            } => {
                 // A read-only connection cannot take this change at all: proposing again is no remedy.
                 let next_action = if code == CODE_MUTATION_NOT_ALLOWED_IN_READ_ONLY {
                     Some("list_connections".to_string())
                 } else {
                     next_action
                 };
-                return Err(DbMcpError::PolicyDenied { code, message, next_action });
+                return Err(DbMcpError::PolicyDenied {
+                    code,
+                    message,
+                    next_action,
+                });
             }
             other => other.into_result()?,
         }
-        let read_only_connection = self.summaries.get(connection).map(|s| s.read_only).unwrap_or(false);
-        if read_only_connection && (analysis.overall_class != SqlStatementClass::Read || analysis.has_cte_write) {
+        let read_only_connection = self
+            .summaries
+            .get(connection)
+            .map(|s| s.read_only)
+            .unwrap_or(false);
+        if read_only_connection
+            && (analysis.overall_class != SqlStatementClass::Read || analysis.has_cte_write)
+        {
             return Err(DbMcpError::PolicyDenied {
                 code: CODE_MUTATION_NOT_ALLOWED_IN_READ_ONLY.to_string(),
                 message: format!("Connection '{connection}' is read-only; mutating changes cannot be proposed or applied on it."),
@@ -590,9 +690,12 @@ impl DbMcpRuntime {
         conn: &str,
         top_n: usize,
     ) -> DbMcpResult<db_mcp_core::WorkloadAnalysis> {
-        let (found, mut notes) = db_mcp_sqlserver::diagnostics::server_workload(live, top_n).await?;
+        let (found, mut notes) =
+            db_mcp_sqlserver::diagnostics::server_workload(live, top_n).await?;
         if let Some((source, stats)) = found {
-            return Ok(db_mcp_sqlserver::diagnostics::workload_from_stats(conn, source, stats, top_n, notes));
+            return Ok(db_mcp_sqlserver::diagnostics::workload_from_stats(
+                conn, source, stats, top_n, notes,
+            ));
         }
         let mut recorded = self.pg_insights.analyze_workload(conn, top_n).await?;
         if recorded.source != "recorded_workload_history" {
@@ -626,7 +729,9 @@ impl DbMcpRuntime {
         notes.extend(dmv_notes);
         let mut server: Vec<db_mcp_core::IndexRecommendation> = dmv
             .into_iter()
-            .map(|(hint, evidence)| diag::hint_to_recommendation(&hint, evidence, Vec::new(), "Missing-index DMV"))
+            .map(|(hint, evidence)| {
+                diag::hint_to_recommendation(&hint, evidence, Vec::new(), "Missing-index DMV")
+            })
             .collect();
         if !queries.is_empty() {
             if info.can_showplan() {
@@ -640,8 +745,14 @@ impl DbMcpRuntime {
                 ));
             }
         }
-        let heuristic = self.pg_insights.recommend_indexes(conn, queries, max_recs).await?;
-        Ok((diag::merge_recommendations(&objects, server, heuristic, max_recs), notes))
+        let heuristic = self
+            .pg_insights
+            .recommend_indexes(conn, queries, max_recs)
+            .await?;
+        Ok((
+            diag::merge_recommendations(&objects, server, heuristic, max_recs),
+            notes,
+        ))
     }
 
     /// Live SQL Server adapter for a connection id (check-connection and diagnostics).
@@ -700,7 +811,9 @@ impl DbMcpRuntime {
         let Ok(analysis) = parse_and_analyze_sql(adapter.capabilities().engine, sql) else {
             return false;
         };
-        if analysis.disclosure.untracked_provenance.is_empty() || analysis.referenced_tables.is_empty() {
+        if analysis.disclosure.untracked_provenance.is_empty()
+            || analysis.referenced_tables.is_empty()
+        {
             return false;
         }
         let Ok(catalog) = adapter
@@ -718,16 +831,24 @@ impl DbMcpRuntime {
             return false;
         };
         analysis.referenced_tables.iter().all(|table| {
-            let wanted = table.trim_matches(|c| c == '"' || c == '`').to_ascii_lowercase();
+            let wanted = table
+                .trim_matches(|c| c == '"' || c == '`')
+                .to_ascii_lowercase();
             let base = wanted.rsplit('.').next().unwrap_or(&wanted).to_string();
             let found = catalog.objects.iter().find(|o| {
                 matches!(
                     o.object_type,
-                    CatalogObjectType::Table | CatalogObjectType::View | CatalogObjectType::MaterializedView
-                ) && (o.qualified_name().eq_ignore_ascii_case(&wanted) || o.name.eq_ignore_ascii_case(&base))
+                    CatalogObjectType::Table
+                        | CatalogObjectType::View
+                        | CatalogObjectType::MaterializedView
+                ) && (o.qualified_name().eq_ignore_ascii_case(&wanted)
+                    || o.name.eq_ignore_ascii_case(&base))
             });
             match found {
-                Some(obj) => !obj.columns.iter().any(|c| cfg.is_sensitive_column(Some(&obj.name), &c.name)),
+                Some(obj) => !obj
+                    .columns
+                    .iter()
+                    .any(|c| cfg.is_sensitive_column(Some(&obj.name), &c.name)),
                 None => false,
             }
         })
@@ -746,13 +867,25 @@ impl DbMcpRuntime {
     fn add_live_catalog_warnings(&self, tool_name: &str, val: &mut Value, args: &Value) {
         if !matches!(
             tool_name,
-            "search_objects" | "describe_object" | "trace_table_dependencies" | "get_procedure_call_graph" | "capture_schema" | "discover_ontology"
+            "search_objects"
+                | "describe_object"
+                | "trace_table_dependencies"
+                | "get_procedure_call_graph"
+                | "capture_schema"
+                | "discover_ontology"
         ) {
             return;
         }
-        let Some(conn) = args.get("connection").and_then(|v| v.as_str()) else { return };
-        let Some(mysql) = self.mysql_live.get(conn) else { return };
-        let notes = mysql.live().map(|l| l.catalog_warnings()).unwrap_or_default();
+        let Some(conn) = args.get("connection").and_then(|v| v.as_str()) else {
+            return;
+        };
+        let Some(mysql) = self.mysql_live.get(conn) else {
+            return;
+        };
+        let notes = mysql
+            .live()
+            .map(|l| l.catalog_warnings())
+            .unwrap_or_default();
         if notes.is_empty() {
             return;
         }
@@ -776,14 +909,26 @@ impl DbMcpRuntime {
         schema_pattern: Option<String>,
     ) -> DbMcpResult<SchemaSnapshot> {
         self.refresh_live_catalog(connection).await?;
-        let (objects, _) = self.discover_allowed(adapter, connection, schema_pattern).await?;
-        Ok(capture_schema(connection, adapter.capabilities().engine, objects))
+        let (objects, _) = self
+            .discover_allowed(adapter, connection, schema_pattern)
+            .await?;
+        Ok(capture_schema(
+            connection,
+            adapter.capabilities().engine,
+            objects,
+        ))
     }
 
     /// Post-process every successful tool response: envelope counts and simulation disclosure.
     fn finalize_response(&self, val: &mut Value, args: &Value) {
-        let Some(obj) = val.as_object_mut() else { return };
-        let rows_empty = obj.get("rows").and_then(|r| r.as_array()).map(|r| r.is_empty()).unwrap_or(true);
+        let Some(obj) = val.as_object_mut() else {
+            return;
+        };
+        let rows_empty = obj
+            .get("rows")
+            .and_then(|r| r.as_array())
+            .map(|r| r.is_empty())
+            .unwrap_or(true);
         let returned_zero = obj.get("returned_rows").and_then(|r| r.as_u64()) == Some(0);
         if rows_empty && returned_zero {
             if let Some(data) = obj.get("data").filter(|d| !d.is_null()) {
@@ -849,7 +994,12 @@ impl DbMcpRuntime {
         let req_id = format!("req_{}", &Uuid::new_v4().simple().to_string()[..12]);
         let (decision, code, msg, schema_version) = match outcome {
             Ok(sv) => (AuditDecision::Allowed, None, None, sv),
-            Err(e) => (AuditDecision::Denied, Some(e.code().to_string()), Some(e.to_string()), None),
+            Err(e) => (
+                AuditDecision::Denied,
+                Some(e.code().to_string()),
+                Some(e.to_string()),
+                None,
+            ),
         };
         let mode = self.policy.effective_config(connection).mode;
         let _ = self.audit.record(create_audit_event(
@@ -884,9 +1034,12 @@ impl DbMcpRuntime {
     ) -> DbMcpResult<(Definition, Certification)> {
         let started = Instant::now();
         let outcome = if self.adapters.contains_key(connection) {
-            self.ontology.review(reviewer, connection, def_id, version, action, reason)
+            self.ontology
+                .review(reviewer, connection, def_id, version, action, reason)
         } else {
-            Err(DbMcpError::ConnectionNotFound(format!("Unknown connection '{connection}'")))
+            Err(DbMcpError::ConnectionNotFound(format!(
+                "Unknown connection '{connection}'"
+            )))
         };
         self.audit_ontology_admin(
             reviewer,
@@ -944,15 +1097,22 @@ impl DbMcpRuntime {
     ) -> DbMcpResult<SemanticPlan> {
         let question = question.trim();
         if question.is_empty() || question.len() > 1000 {
-            return Err(DbMcpError::InvalidArgument("question must be 1-1000 characters".to_string()));
+            return Err(DbMcpError::InvalidArgument(
+                "question must be 1-1000 characters".to_string(),
+            ));
         }
         let adapter = self.get_authorized_adapter(caller, connection)?;
         let cfg = self.policy.effective_config(connection);
-        let (objects, _) = self.discover_allowed(adapter.as_ref(), connection, None).await?;
+        let (objects, _) = self
+            .discover_allowed(adapter.as_ref(), connection, None)
+            .await?;
         let fingerprint = compute_schema_version(&objects);
         self.ontology.check_drift(connection, &objects)?;
         let (revision, live, stale) = self.ontology.published_set(connection)?;
-        let live: Vec<Definition> = live.into_iter().filter(|d| !definition_touches_restricted(d, &cfg)).collect();
+        let live: Vec<Definition> = live
+            .into_iter()
+            .filter(|d| !definition_touches_restricted(d, &cfg))
+            .collect();
         let row_cap = max_rows
             .unwrap_or(self.config.ontology.default_max_rows)
             .min(self.config.ontology.default_max_rows.max(1))
@@ -972,7 +1132,12 @@ impl DbMcpRuntime {
                 let def = live
                     .iter()
                     .find(|d| d.def_id == used.def_id && d.version == used.version)
-                    .ok_or_else(|| DbMcpError::InternalError(format!("plan references unknown definition {}", used.def_id)))?;
+                    .ok_or_else(|| {
+                        DbMcpError::InternalError(format!(
+                            "plan references unknown definition {}",
+                            used.def_id
+                        ))
+                    })?;
                 self.ontology.verify_certification(def)?;
             }
         }
@@ -1099,26 +1264,49 @@ impl DbMcpRuntime {
                 message: format!("Tool '{tool_name}' is not enabled in active profiles"),
                 next_action: Some("Enable the required tool profile in ServerConfig".to_string()),
             };
-            self.audit_call_outcome(&req_id, tool_name, caller, conn_hint.as_deref(), Err(&err), started);
+            self.audit_call_outcome(
+                &req_id,
+                tool_name,
+                caller,
+                conn_hint.as_deref(),
+                Err(&err),
+                started,
+            );
             let denied = err.to_denied_response(Some(req_id), conn_hint);
             return serde_json::to_value(denied).unwrap_or_else(|_| json!({"status": "denied"}));
         }
 
-        let outcome = self.dispatch_tool(&req_id, tool_name, &arguments, caller).await;
+        let outcome = self
+            .dispatch_tool(&req_id, tool_name, &arguments, caller)
+            .await;
         let already_audited = self.audit_tracker.take_seen(&req_id);
         match outcome {
             Ok(mut val) => {
                 self.finalize_response(&mut val, &arguments);
                 self.add_live_catalog_warnings(tool_name, &mut val, &arguments);
                 if !already_audited {
-                    self.audit_call_outcome(&req_id, tool_name, caller, conn_hint.as_deref(), Ok(&val), started);
+                    self.audit_call_outcome(
+                        &req_id,
+                        tool_name,
+                        caller,
+                        conn_hint.as_deref(),
+                        Ok(&val),
+                        started,
+                    );
                     self.audit_tracker.take_seen(&req_id);
                 }
                 val
             }
             Err(err) => {
                 if !already_audited {
-                    self.audit_call_outcome(&req_id, tool_name, caller, conn_hint.as_deref(), Err(&err), started);
+                    self.audit_call_outcome(
+                        &req_id,
+                        tool_name,
+                        caller,
+                        conn_hint.as_deref(),
+                        Err(&err),
+                        started,
+                    );
                     self.audit_tracker.take_seen(&req_id);
                 }
                 let denied = err.to_denied_response(Some(req_id), conn_hint);
@@ -1148,11 +1336,17 @@ impl DbMcpRuntime {
                 AuditDecision::Allowed,
                 None,
                 None,
-                val.get("returned_rows").and_then(|v| v.as_u64()).map(|r| r as usize),
-                val.get("schema_version").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+                val.get("returned_rows")
+                    .and_then(|v| v.as_u64())
+                    .map(|r| r as usize),
+                val.get("schema_version")
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned),
             ),
             Err(err) => (
-                conn_hint.map(ToOwned::to_owned).unwrap_or_else(|| "server".to_string()),
+                conn_hint
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| "server".to_string()),
                 audit_decision_for_error(err),
                 Some(err.code().to_string()),
                 Some(err.to_string()),
@@ -1193,7 +1387,9 @@ impl DbMcpRuntime {
                 .and_then(|v| v.as_str())
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| DbMcpError::InvalidArgument(format!("Missing required parameter '{key}'")))
+                .ok_or_else(|| {
+                    DbMcpError::InvalidArgument(format!("Missing required parameter '{key}'"))
+                })
         };
 
         match tool_name {
@@ -1239,17 +1435,25 @@ impl DbMcpRuntime {
                 let conn = req_str("connection")?;
                 let adapter = self.get_authorized_adapter(caller, &conn)?;
                 let cfg = self.policy.effective_config(&conn);
-                let detail_level = parse_detail_level(args.get("detail_level"), CatalogDetailLevel::Summary)?;
+                let detail_level =
+                    parse_detail_level(args.get("detail_level"), CatalogDetailLevel::Summary)?;
                 let object_types = parse_object_types(args.get("object_types"))?;
                 let limit = arg_positive_u64(args, "limit")?.unwrap_or(50) as usize;
                 let offset = arg_u64(args, "offset")?.unwrap_or(0) as usize;
                 let _ = &cfg;
                 // Restricted objects are removed BEFORE filtering/pagination so totals never leak them.
-                let (visible, _hidden) = self.discover_allowed(adapter.as_ref(), &conn, None).await?;
+                let (visible, _hidden) =
+                    self.discover_allowed(adapter.as_ref(), &conn, None).await?;
                 let request = CatalogRequest {
                     connection: conn.clone(),
-                    schema_pattern: args.get("schema_pattern").and_then(|v| v.as_str()).map(ToOwned::to_owned),
-                    name_pattern: args.get("name_pattern").and_then(|v| v.as_str()).map(ToOwned::to_owned),
+                    schema_pattern: args
+                        .get("schema_pattern")
+                        .and_then(|v| v.as_str())
+                        .map(ToOwned::to_owned),
+                    name_pattern: args
+                        .get("name_pattern")
+                        .and_then(|v| v.as_str())
+                        .map(ToOwned::to_owned),
                     object_types,
                     detail_level,
                     limit,
@@ -1257,7 +1461,10 @@ impl DbMcpRuntime {
                 };
                 let mut catalog = filter_and_paginate_objects(&visible, &request);
                 catalog.schema_version = Some(compute_schema_version(&visible));
-                let sv = catalog.schema_version.clone().unwrap_or_else(|| "snapshot_catalog".to_string());
+                let sv = catalog
+                    .schema_version
+                    .clone()
+                    .unwrap_or_else(|| "snapshot_catalog".to_string());
                 to_json(McpSuccessResponse::with_data(
                     req_id,
                     &conn,
@@ -1274,11 +1481,14 @@ impl DbMcpRuntime {
                 if cfg.is_restricted_table(&object_name) {
                     return Err(DbMcpError::PolicyDenied {
                         code: "RESTRICTED_TABLE".to_string(),
-                        message: format!("Object '{object_name}' is restricted by connection policy"),
+                        message: format!(
+                            "Object '{object_name}' is restricted by connection policy"
+                        ),
                         next_action: Some("Query an allowed table or view".to_string()),
                     });
                 }
-                let detail_level = parse_detail_level(args.get("detail_level"), CatalogDetailLevel::Full)?;
+                let detail_level =
+                    parse_detail_level(args.get("detail_level"), CatalogDetailLevel::Full)?;
                 let schema = args.get("schema").and_then(|v| v.as_str());
                 let (visible, _) = self
                     .discover_allowed(adapter.as_ref(), &conn, schema.map(ToOwned::to_owned))
@@ -1303,7 +1513,9 @@ impl DbMcpRuntime {
                 if cfg.is_restricted_table(&table_name) {
                     return Err(DbMcpError::PolicyDenied {
                         code: "RESTRICTED_TABLE".to_string(),
-                        message: format!("Object '{table_name}' is restricted by connection policy"),
+                        message: format!(
+                            "Object '{table_name}' is restricted by connection policy"
+                        ),
                         next_action: Some("Query an allowed table or view".to_string()),
                     });
                 }
@@ -1316,7 +1528,9 @@ impl DbMcpRuntime {
                     if cfg.is_restricted_table(target) {
                         return Err(DbMcpError::PolicyDenied {
                             code: "RESTRICTED_TABLE".to_string(),
-                            message: format!("Object '{target}' is restricted by connection policy"),
+                            message: format!(
+                                "Object '{target}' is restricted by connection policy"
+                            ),
                             next_action: Some("Query an allowed table or view".to_string()),
                         });
                     }
@@ -1430,10 +1644,16 @@ impl DbMcpRuntime {
                         next_action: Some("apply_change".to_string()),
                     });
                 }
-                if self.sources_free_of_sensitive_columns(adapter.as_ref(), &conn, &sql).await {
+                if self
+                    .sources_free_of_sensitive_columns(adapter.as_ref(), &conn, &sql)
+                    .await
+                {
                     gov_req = gov_req.with_sources_verified_without_sensitive_columns(true);
                 }
-                let result = self.executor.execute_governed(adapter.as_ref(), gov_req).await?;
+                let result = self
+                    .executor
+                    .execute_governed(adapter.as_ref(), gov_req)
+                    .await?;
                 self.pg_insights.record_query_execution(
                     &conn,
                     &sql,
@@ -1458,14 +1678,30 @@ impl DbMcpRuntime {
                     request_id: req_id.to_string(),
                     connection: conn.clone(),
                     sql,
-                    params: args.get("params").and_then(|v| v.as_array()).cloned().unwrap_or_default(),
-                    analyze: args.get("analyze").and_then(|v| v.as_bool()).unwrap_or(false),
+                    params: args
+                        .get("params")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default(),
+                    analyze: args
+                        .get("analyze")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
                     format,
-                    timeout_ms: args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(10_000),
+                    timeout_ms: args
+                        .get("timeout_ms")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(10_000),
                 };
                 let plan = self
                     .executor
-                    .explain_governed_query(adapter.as_ref(), &self.policy, self.audit.as_ref(), caller, explain_req)
+                    .explain_governed_query(
+                        adapter.as_ref(),
+                        &self.policy,
+                        self.audit.as_ref(),
+                        caller,
+                        explain_req,
+                    )
                     .await?;
                 to_json(McpSuccessResponse::with_data(
                     req_id,
@@ -1485,7 +1721,9 @@ impl DbMcpRuntime {
                 let default_limits = self.policy.effective_config(&conn).limits;
                 let args_map: BTreeMap<String, Value> = match args.get("arguments") {
                     None | Some(Value::Null) => BTreeMap::new(),
-                    Some(Value::Object(m)) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    Some(Value::Object(m)) => {
+                        m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                    }
                     Some(_) => {
                         return Err(DbMcpError::InvalidArgument(
                             "`arguments` must be a JSON object of named parameters".to_string(),
@@ -1511,7 +1749,10 @@ impl DbMcpRuntime {
                 .with_max_rows(prepared.authorized_query.max_rows)
                 .with_max_bytes(prepared.authorized_query.max_bytes)
                 .with_named_tool(true);
-                let result = self.executor.execute_governed(adapter.as_ref(), gov_req).await?;
+                let result = self
+                    .executor
+                    .execute_governed(adapter.as_ref(), gov_req)
+                    .await?;
                 to_json(McpSuccessResponse::<Value>::from_query_result(
                     req_id, &conn, result, None,
                 ))
@@ -1529,10 +1770,13 @@ impl DbMcpRuntime {
                 }
                 let mysql_live = self.mysql_live.get(&conn).and_then(|m| m.live().cloned());
                 let report = match (self.sqlserver.get(&conn).cloned(), mysql_live) {
-                    (Some(live), _) => db_mcp_sqlserver::diagnostics::database_health(&live).await?,
+                    (Some(live), _) => {
+                        db_mcp_sqlserver::diagnostics::database_health(&live).await?
+                    }
                     // Live MySQL: server counters + catalog checks over the policy-visible catalog.
                     (None, Some(live)) => {
-                        let (visible, _) = self.discover_allowed(adapter.as_ref(), &conn, None).await?;
+                        let (visible, _) =
+                            self.discover_allowed(adapter.as_ref(), &conn, None).await?;
                         live.database_health(&visible).await?
                     }
                     (None, None) => self.pg_insights.database_health(&conn).await?,
@@ -1543,7 +1787,8 @@ impl DbMcpRuntime {
                     &report,
                 ))?;
                 if scrub_restricted(&mut val, &self.policy.effective_config(&conn)) > 0 {
-                    if let Some(rows) = val.get("rows").and_then(|r| r.as_array()).map(|r| r.len()) {
+                    if let Some(rows) = val.get("rows").and_then(|r| r.as_array()).map(|r| r.len())
+                    {
                         val["returned_rows"] = json!(rows);
                     }
                 }
@@ -1573,7 +1818,8 @@ impl DbMcpRuntime {
                     &workload,
                 ))?;
                 if scrub_restricted(&mut val, &self.policy.effective_config(&conn)) > 0 {
-                    if let Some(rows) = val.get("rows").and_then(|r| r.as_array()).map(|r| r.len()) {
+                    if let Some(rows) = val.get("rows").and_then(|r| r.as_array()).map(|r| r.len())
+                    {
                         val["returned_rows"] = json!(rows);
                     }
                 }
@@ -1605,7 +1851,10 @@ impl DbMcpRuntime {
                 }
                 let mysql_live = self.mysql_live.get(&conn).and_then(|m| m.live().cloned());
                 let (recs, advice_notes) = match (self.sqlserver.get(&conn).cloned(), mysql_live) {
-                    (Some(live), _) => self.sqlserver_index_advice(&live, &conn, queries, max_recs).await?,
+                    (Some(live), _) => {
+                        self.sqlserver_index_advice(&live, &conn, queries, max_recs)
+                            .await?
+                    }
                     (None, Some(live)) => {
                         // Without explicit queries, prefer the server's statement digests.
                         let mut queries = queries;
@@ -1619,16 +1868,30 @@ impl DbMcpRuntime {
                                     .collect();
                             }
                         }
-                        let recs = self.pg_insights.recommend_indexes(&conn, queries, max_recs).await?;
+                        let recs = self
+                            .pg_insights
+                            .recommend_indexes(&conn, queries, max_recs)
+                            .await?;
                         (live.finish_index_recommendations(recs).await, Vec::new())
                     }
-                    (None, None) => (self.pg_insights.recommend_indexes(&conn, queries, max_recs).await?, Vec::new()),
+                    (None, None) => (
+                        self.pg_insights
+                            .recommend_indexes(&conn, queries, max_recs)
+                            .await?,
+                        Vec::new(),
+                    ),
                 };
-                let mut resp = PgInsightsEngine::recommendations_to_response(req_id, &conn, "snapshot_indexes", recs);
+                let mut resp = PgInsightsEngine::recommendations_to_response(
+                    req_id,
+                    &conn,
+                    "snapshot_indexes",
+                    recs,
+                );
                 resp.warnings.extend(advice_notes);
                 let mut val = to_json(resp)?;
                 if scrub_restricted(&mut val, &cfg) > 0 {
-                    if let Some(rows) = val.get("rows").and_then(|r| r.as_array()).map(|r| r.len()) {
+                    if let Some(rows) = val.get("rows").and_then(|r| r.as_array()).map(|r| r.len())
+                    {
                         val["returned_rows"] = json!(rows);
                     }
                 }
@@ -1638,12 +1901,18 @@ impl DbMcpRuntime {
                 let conn = req_str("connection")?;
                 let sql = req_str("sql")?;
                 let adapter = self.get_authorized_adapter(caller, &conn)?;
-                let params = args.get("params").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+                let params = args
+                    .get("params")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
                 let constraints = args.get("constraints").cloned();
                 let ttl = match args.get("ttl_seconds") {
                     None | Some(Value::Null) => None,
                     Some(v) => Some(v.as_i64().ok_or_else(|| {
-                        DbMcpError::InvalidArgument("'ttl_seconds' must be an integer number of seconds".to_string())
+                        DbMcpError::InvalidArgument(
+                            "'ttl_seconds' must be an integer number of seconds".to_string(),
+                        )
                     })?),
                 };
                 // Same connection policy execute_query enforces (restricted tables, multi-statement,
@@ -1652,7 +1921,14 @@ impl DbMcpRuntime {
                 self.refresh_live_catalog(&conn).await?;
                 let proposal = self
                     .changes
-                    .propose_change_with_adapter(caller, adapter.as_ref(), sql, params, constraints, ttl)
+                    .propose_change_with_adapter(
+                        caller,
+                        adapter.as_ref(),
+                        sql,
+                        params,
+                        constraints,
+                        ttl,
+                    )
                     .await?;
                 let mode = self.policy.effective_config(&conn).mode;
                 let _ = self.audit.record(create_audit_event(
@@ -1686,7 +1962,12 @@ impl DbMcpRuntime {
                 let existing = self.changes.get_change(&change_id)?;
                 let adapter = self.get_authorized_adapter(caller, &existing.connection)?;
                 // Re-check the connection policy: it may have changed since the proposal.
-                self.authorize_change_sql(caller, &existing.connection, adapter.capabilities().engine, &existing.sql)?;
+                self.authorize_change_sql(
+                    caller,
+                    &existing.connection,
+                    adapter.capabilities().engine,
+                    &existing.sql,
+                )?;
                 self.refresh_live_catalog(&existing.connection).await?;
                 let mode = self.policy.effective_config(&existing.connection).mode;
                 let options = ApplyChangeOptions {
@@ -1723,9 +2004,14 @@ impl DbMcpRuntime {
             "capture_schema" => {
                 let conn = req_str("connection")?;
                 let adapter = self.get_authorized_adapter(caller, &conn)?;
-                let schema_pattern = args.get("schema_pattern").and_then(|v| v.as_str()).map(ToOwned::to_owned);
+                let schema_pattern = args
+                    .get("schema_pattern")
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned);
                 let filtered = schema_pattern.is_some();
-                let snapshot = self.capture_allowed(adapter.as_ref(), &conn, schema_pattern).await?;
+                let snapshot = self
+                    .capture_allowed(adapter.as_ref(), &conn, schema_pattern)
+                    .await?;
                 let table_count = snapshot
                     .objects
                     .iter()
@@ -1762,22 +2048,29 @@ impl DbMcpRuntime {
                 to_json(response)
             }
             "diff_schema" => {
-                let schema_pattern = args.get("schema_pattern").and_then(|v| v.as_str()).map(ToOwned::to_owned);
+                let schema_pattern = args
+                    .get("schema_pattern")
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned);
                 let base: SchemaSnapshot = if let Some(b) = args.get("base_snapshot") {
-                    serde_json::from_value(b.clone())
-                        .map_err(|e| DbMcpError::InvalidArgument(format!("Invalid base_snapshot: {e}")))?
+                    serde_json::from_value(b.clone()).map_err(|e| {
+                        DbMcpError::InvalidArgument(format!("Invalid base_snapshot: {e}"))
+                    })?
                 } else {
                     let conn = req_str("base_connection")?;
                     let adapter = self.get_authorized_adapter(caller, &conn)?;
-                    self.capture_allowed(adapter.as_ref(), &conn, schema_pattern.clone()).await?
+                    self.capture_allowed(adapter.as_ref(), &conn, schema_pattern.clone())
+                        .await?
                 };
                 let target: SchemaSnapshot = if let Some(t) = args.get("target_snapshot") {
-                    serde_json::from_value(t.clone())
-                        .map_err(|e| DbMcpError::InvalidArgument(format!("Invalid target_snapshot: {e}")))?
+                    serde_json::from_value(t.clone()).map_err(|e| {
+                        DbMcpError::InvalidArgument(format!("Invalid target_snapshot: {e}"))
+                    })?
                 } else {
                     let conn = req_str("target_connection")?;
                     let adapter = self.get_authorized_adapter(caller, &conn)?;
-                    self.capture_allowed(adapter.as_ref(), &conn, schema_pattern).await?
+                    self.capture_allowed(adapter.as_ref(), &conn, schema_pattern)
+                        .await?
                 };
                 let diff = diff_schema(&base, &target);
                 let mut warnings = Vec::new();
@@ -1802,16 +2095,25 @@ impl DbMcpRuntime {
                 let conn = req_str("connection")?;
                 let adapter = self.get_authorized_adapter(caller, &conn)?;
                 let cfg = self.policy.effective_config(&conn);
-                let (objects, hidden) = self.discover_allowed(adapter.as_ref(), &conn, None).await?;
+                let (objects, hidden) =
+                    self.discover_allowed(adapter.as_ref(), &conn, None).await?;
                 let fingerprint = compute_schema_version(&objects);
                 let drift = self.ontology.check_drift(&conn, &objects)?;
                 let tenant = self.config.ontology.tenant_id.clone();
                 let counts = self.ontology.store.stats(&tenant, &conn)?;
                 let (revision, live, stale) = self.ontology.published_set(&conn)?;
-                let live: Vec<Definition> = live.into_iter().filter(|d| !definition_touches_restricted(d, &cfg)).collect();
+                let live: Vec<Definition> = live
+                    .into_iter()
+                    .filter(|d| !definition_touches_restricted(d, &cfg))
+                    .collect();
                 let tables_total = objects
                     .iter()
-                    .filter(|o| matches!(o.object_type, CatalogObjectType::Table | CatalogObjectType::View))
+                    .filter(|o| {
+                        matches!(
+                            o.object_type,
+                            CatalogObjectType::Table | CatalogObjectType::View
+                        )
+                    })
                     .count();
                 let covered: std::collections::BTreeSet<String> = live
                     .iter()
@@ -1819,7 +2121,10 @@ impl DbMcpRuntime {
                     .flat_map(|d| d.body.tables())
                     .map(|t| t.to_ascii_lowercase())
                     .collect();
-                let metrics = live.iter().filter(|d| d.kind == DefinitionKind::Metric).count();
+                let metrics = live
+                    .iter()
+                    .filter(|d| d.kind == DefinitionKind::Metric)
+                    .count();
                 let mut reasons = Vec::new();
                 let readiness = match &revision {
                     None => {
@@ -1836,7 +2141,11 @@ impl DbMcpRuntime {
                         if rev.schema_fingerprint != fingerprint {
                             reasons.push(format!("schema changed since publication ({} -> {}); dependencies are re-verified on every plan", rev.schema_fingerprint, fingerprint));
                         }
-                        if !stale.is_empty() || metrics == 0 { "degraded" } else { "ready" }
+                        if !stale.is_empty() || metrics == 0 {
+                            "degraded"
+                        } else {
+                            "ready"
+                        }
                     }
                 };
                 let data = json!({
@@ -1865,28 +2174,45 @@ impl DbMcpRuntime {
                     "drift": drift,
                     "store": { "persistent": self.ontology.store.is_persistent() },
                 });
-                let sv = revision.as_ref().map(|r| r.revision_id.clone()).unwrap_or_else(|| "ontology_unpublished".to_string());
-                to_json(McpSuccessResponse::with_data(req_id, &conn, sv, "ontology_status", data))
+                let sv = revision
+                    .as_ref()
+                    .map(|r| r.revision_id.clone())
+                    .unwrap_or_else(|| "ontology_unpublished".to_string());
+                to_json(McpSuccessResponse::with_data(
+                    req_id,
+                    &conn,
+                    sv,
+                    "ontology_status",
+                    data,
+                ))
             }
             "discover_ontology" => {
                 let started = Instant::now();
                 let conn = req_str("connection")?;
                 let adapter = self.get_authorized_adapter(caller, &conn)?;
                 let cfg = self.policy.effective_config(&conn);
-                let (mut objects, hidden) = self.discover_allowed(adapter.as_ref(), &conn, None).await?;
+                let (mut objects, hidden) =
+                    self.discover_allowed(adapter.as_ref(), &conn, None).await?;
                 let fingerprint = compute_schema_version(&objects);
                 let mut warnings = Vec::new();
                 if hidden > 0 {
-                    warnings.push(format!("{hidden} restricted object(s) were excluded from discovery"));
+                    warnings.push(format!(
+                        "{hidden} restricted object(s) were excluded from discovery"
+                    ));
                 }
                 let cap = self.config.ontology.max_discovery_objects;
                 if objects.len() > cap {
-                    warnings.push(format!("catalog has {} objects; discovery limited to the first {cap}", objects.len()));
+                    warnings.push(format!(
+                        "catalog has {} objects; discovery limited to the first {cap}",
+                        objects.len()
+                    ));
                     objects.truncate(cap);
                 }
                 let infer = match args.get("infer_joins") {
                     None | Some(Value::Null) => self.config.ontology.infer_joins,
-                    Some(v) => v.as_bool().ok_or_else(|| DbMcpError::InvalidArgument("'infer_joins' must be a boolean".to_string()))?,
+                    Some(v) => v.as_bool().ok_or_else(|| {
+                        DbMcpError::InvalidArgument("'infer_joins' must be a boolean".to_string())
+                    })?,
                 };
                 let scope = db_mcp_ontology::DiscoveryScope {
                     tenant_id: self.config.ontology.tenant_id.clone(),
@@ -1923,23 +2249,35 @@ impl DbMcpRuntime {
                 let query = req_str("query")?;
                 self.authorize_conn(caller, &conn)?;
                 if !self.adapters.contains_key(&conn) {
-                    return Err(DbMcpError::ConnectionNotFound(format!("Unknown connection '{conn}'")));
+                    return Err(DbMcpError::ConnectionNotFound(format!(
+                        "Unknown connection '{conn}'"
+                    )));
                 }
                 let cfg = self.policy.effective_config(&conn);
-                let kinds: Vec<DefinitionKind> = match args.get("kinds").and_then(|v| v.as_array()) {
+                let kinds: Vec<DefinitionKind> = match args.get("kinds").and_then(|v| v.as_array())
+                {
                     Some(arr) => arr
                         .iter()
-                        .map(|v| v.as_str().and_then(DefinitionKind::parse).ok_or_else(|| DbMcpError::InvalidArgument(format!("unknown kind {v}"))))
+                        .map(|v| {
+                            v.as_str().and_then(DefinitionKind::parse).ok_or_else(|| {
+                                DbMcpError::InvalidArgument(format!("unknown kind {v}"))
+                            })
+                        })
                         .collect::<DbMcpResult<_>>()?,
                     None => Vec::new(),
                 };
-                let statuses: Vec<DefinitionStatus> = match args.get("statuses").and_then(|v| v.as_array()) {
-                    Some(arr) => arr
-                        .iter()
-                        .map(|v| v.as_str().and_then(DefinitionStatus::parse).ok_or_else(|| DbMcpError::InvalidArgument(format!("unknown status {v}"))))
-                        .collect::<DbMcpResult<_>>()?,
-                    None => Vec::new(),
-                };
+                let statuses: Vec<DefinitionStatus> =
+                    match args.get("statuses").and_then(|v| v.as_array()) {
+                        Some(arr) => arr
+                            .iter()
+                            .map(|v| {
+                                v.as_str().and_then(DefinitionStatus::parse).ok_or_else(|| {
+                                    DbMcpError::InvalidArgument(format!("unknown status {v}"))
+                                })
+                            })
+                            .collect::<DbMcpResult<_>>()?,
+                        None => Vec::new(),
+                    };
                 let limit = arg_u64(args, "limit")?.unwrap_or(20).clamp(1, 100) as usize;
                 let pool: Vec<Definition> = self
                     .ontology
@@ -1950,7 +2288,10 @@ impl DbMcpRuntime {
                     .filter(|d| kinds.is_empty() || kinds.contains(&d.kind))
                     .filter(|d| {
                         if statuses.is_empty() {
-                            !matches!(d.status, DefinitionStatus::Rejected | DefinitionStatus::Deprecated)
+                            !matches!(
+                                d.status,
+                                DefinitionStatus::Rejected | DefinitionStatus::Deprecated
+                            )
                         } else {
                             statuses.contains(&d.status)
                         }
@@ -1963,21 +2304,33 @@ impl DbMcpRuntime {
                         let mut v = definition_summary(&r.definition);
                         v["score"] = json!(r.score);
                         v["matched_terms"] = json!(r.matched_terms);
-                        v["usable_for_sql"] = json!(r.definition.status == DefinitionStatus::Published);
+                        v["usable_for_sql"] =
+                            json!(r.definition.status == DefinitionStatus::Published);
                         v
                     })
                     .collect();
-                to_json(McpSuccessResponse::with_data(req_id, &conn, "ontology_search", "ontology_terms", results))
+                to_json(McpSuccessResponse::with_data(
+                    req_id,
+                    &conn,
+                    "ontology_search",
+                    "ontology_terms",
+                    results,
+                ))
             }
             "describe_term" => {
                 let conn = req_str("connection")?;
                 self.authorize_conn(caller, &conn)?;
                 if !self.adapters.contains_key(&conn) {
-                    return Err(DbMcpError::ConnectionNotFound(format!("Unknown connection '{conn}'")));
+                    return Err(DbMcpError::ConnectionNotFound(format!(
+                        "Unknown connection '{conn}'"
+                    )));
                 }
                 let cfg = self.policy.effective_config(&conn);
                 let tenant = self.config.ontology.tenant_id.clone();
-                let def_id = match (args.get("def_id").and_then(|v| v.as_str()), args.get("name").and_then(|v| v.as_str())) {
+                let def_id = match (
+                    args.get("def_id").and_then(|v| v.as_str()),
+                    args.get("name").and_then(|v| v.as_str()),
+                ) {
                     (Some(id), _) if !id.trim().is_empty() => id.trim().to_string(),
                     (_, Some(name)) if !name.trim().is_empty() => self
                         .ontology
@@ -1991,7 +2344,11 @@ impl DbMcpRuntime {
                             message: format!("No definition named '{}'", name.trim()),
                             next_action: Some("search_terms".to_string()),
                         })?,
-                    _ => return Err(DbMcpError::InvalidArgument("Provide 'def_id' or 'name'".to_string())),
+                    _ => {
+                        return Err(DbMcpError::InvalidArgument(
+                            "Provide 'def_id' or 'name'".to_string(),
+                        ))
+                    }
                 };
                 let versions = self.ontology.store.versions(&tenant, &conn, &def_id)?;
                 let Some(latest) = versions.last().cloned() else {
@@ -2008,9 +2365,15 @@ impl DbMcpRuntime {
                         next_action: None,
                     });
                 }
-                let certifications = self.ontology.store.certifications(&tenant, &conn, &def_id)?;
+                let certifications = self
+                    .ontology
+                    .store
+                    .certifications(&tenant, &conn, &def_id)?;
                 let revision = self.ontology.store.latest_revision(&tenant, &conn)?;
-                let in_revision = revision.as_ref().map(|r| versions.iter().any(|v| r.contains(v))).unwrap_or(false);
+                let in_revision = revision
+                    .as_ref()
+                    .map(|r| versions.iter().any(|v| r.contains(v)))
+                    .unwrap_or(false);
                 let data = json!({
                     "definition": latest,
                     "versions": versions.iter().map(|v| json!({
@@ -2034,16 +2397,27 @@ impl DbMcpRuntime {
                     "in_published_revision": in_revision,
                     "revision_id": revision.map(|r| r.revision_id),
                 });
-                to_json(McpSuccessResponse::with_data(req_id, &conn, latest.content_hash.clone(), "ontology_definition", data))
+                to_json(McpSuccessResponse::with_data(
+                    req_id,
+                    &conn,
+                    latest.content_hash.clone(),
+                    "ontology_definition",
+                    data,
+                ))
             }
             "trace_semantic_relationships" => {
                 let conn = req_str("connection")?;
                 self.authorize_conn(caller, &conn)?;
                 if !self.adapters.contains_key(&conn) {
-                    return Err(DbMcpError::ConnectionNotFound(format!("Unknown connection '{conn}'")));
+                    return Err(DbMcpError::ConnectionNotFound(format!(
+                        "Unknown connection '{conn}'"
+                    )));
                 }
                 let cfg = self.policy.effective_config(&conn);
-                let certified_only = args.get("certified_only").and_then(|v| v.as_bool()).unwrap_or(false);
+                let certified_only = args
+                    .get("certified_only")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let max_depth = arg_u64(args, "max_depth")?.unwrap_or(3).clamp(1, 10) as usize;
                 let rels: Vec<Definition> = self
                     .ontology
@@ -2052,16 +2426,36 @@ impl DbMcpRuntime {
                     .into_iter()
                     .filter(|d| d.kind == DefinitionKind::Relationship)
                     .filter(|d| !definition_touches_restricted(d, &cfg))
-                    .filter(|d| !matches!(d.status, DefinitionStatus::Rejected | DefinitionStatus::Deprecated))
-                    .filter(|d| !certified_only || matches!(d.status, DefinitionStatus::Published | DefinitionStatus::Certified))
+                    .filter(|d| {
+                        !matches!(
+                            d.status,
+                            DefinitionStatus::Rejected | DefinitionStatus::Deprecated
+                        )
+                    })
+                    .filter(|d| {
+                        !certified_only
+                            || matches!(
+                                d.status,
+                                DefinitionStatus::Published | DefinitionStatus::Certified
+                            )
+                    })
                     .collect();
                 let key = |t: &str| t.to_ascii_lowercase();
-                let mut keep: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-                if let Some(entity) = args.get("entity").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) {
+                let mut keep: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                if let Some(entity) = args
+                    .get("entity")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
                     let start: Vec<String> = rels
                         .iter()
                         .flat_map(|d| d.body.tables())
-                        .filter(|t| key(t) == key(entity) || db_mcp_ontology::base_table_name(t) == key(entity))
+                        .filter(|t| {
+                            key(t) == key(entity)
+                                || db_mcp_ontology::base_table_name(t) == key(entity)
+                        })
                         .map(|t| key(&t))
                         .collect();
                     let Some(first) = start.first().cloned() else {
@@ -2090,9 +2484,17 @@ impl DbMcpRuntime {
                 }
                 let edges: Vec<Value> = rels
                     .iter()
-                    .filter(|d| keep.is_empty() || d.body.tables().iter().all(|t| keep.contains(&key(t))))
+                    .filter(|d| {
+                        keep.is_empty() || d.body.tables().iter().all(|t| keep.contains(&key(t)))
+                    })
                     .filter_map(|d| match &d.body {
-                        DefinitionBody::Relationship { from_table, to_table, column_pairs, cardinality, source } => Some(json!({
+                        DefinitionBody::Relationship {
+                            from_table,
+                            to_table,
+                            column_pairs,
+                            cardinality,
+                            source,
+                        } => Some(json!({
                             "def_id": d.def_id,
                             "version": d.version,
                             "name": d.name,
@@ -2113,10 +2515,19 @@ impl DbMcpRuntime {
                     let id = |t: &str| db_mcp_ontology::slug(t);
                     let from = e["from"].as_str().unwrap_or_default();
                     let to = e["to"].as_str().unwrap_or_default();
-                    let arrow = if e["usable_for_sql"].as_bool() == Some(true) { "-->" } else { "-.->" };
+                    let arrow = if e["usable_for_sql"].as_bool() == Some(true) {
+                        "-->"
+                    } else {
+                        "-.->"
+                    };
                     mermaid.push_str(&format!(
                         "    {}[\"{}\"] {}|{}| {}[\"{}\"]\n",
-                        id(from), from, arrow, e["status"].as_str().unwrap_or_default(), id(to), to
+                        id(from),
+                        from,
+                        arrow,
+                        e["status"].as_str().unwrap_or_default(),
+                        id(to),
+                        to
                     ));
                 }
                 to_json(McpSuccessResponse::with_data(
@@ -2131,13 +2542,18 @@ impl DbMcpRuntime {
                 let conn = req_str("connection")?;
                 let adapter = self.get_authorized_adapter(caller, &conn)?;
                 let cfg = self.policy.effective_config(&conn);
-                let draft = args
-                    .get("definition")
-                    .cloned()
-                    .ok_or_else(|| DbMcpError::InvalidArgument("Missing required parameter 'definition'".to_string()))?;
+                let draft = args.get("definition").cloned().ok_or_else(|| {
+                    DbMcpError::InvalidArgument(
+                        "Missing required parameter 'definition'".to_string(),
+                    )
+                })?;
                 let mut input: ProposalInput = serde_json::from_value(draft)
                     .map_err(|e| DbMcpError::InvalidArgument(format!("invalid definition: {e}")))?;
-                if let Some(id) = args.get("def_id").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()) {
+                if let Some(id) = args
+                    .get("def_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                {
                     input.def_id = Some(id.trim().to_string());
                 }
                 if let Some(v) = arg_u64(args, "expected_version")? {
@@ -2145,12 +2561,25 @@ impl DbMcpRuntime {
                 }
                 let (objects, _) = self.discover_allowed(adapter.as_ref(), &conn, None).await?;
                 let fingerprint = compute_schema_version(&objects);
-                let def = self.ontology.propose(caller, &conn, input, &objects, &cfg.sensitive_columns, &fingerprint)?;
+                let def = self.ontology.propose(
+                    caller,
+                    &conn,
+                    input,
+                    &objects,
+                    &cfg.sensitive_columns,
+                    &fingerprint,
+                )?;
                 let next = format!(
                     "A reviewer (admin/dba, not '{}') must certify it: db-mcp ontology review --connection {} --def-id {} --version {} --action approve --reviewer <name> --config <file>; then publish.",
                     def.proposed_by, conn, def.def_id, def.version
                 );
-                let mut resp = McpSuccessResponse::with_data(req_id, &conn, def.content_hash.clone(), "ontology_proposal", json!({ "definition": def, "next_action": next }));
+                let mut resp = McpSuccessResponse::with_data(
+                    req_id,
+                    &conn,
+                    def.content_hash.clone(),
+                    "ontology_proposal",
+                    json!({ "definition": def, "next_action": next }),
+                );
                 resp.warnings.push("Proposals are drafts: they are not used for SQL until certified and published.".to_string());
                 to_json(resp)
             }
@@ -2159,9 +2588,15 @@ impl DbMcpRuntime {
                 let conn = req_str("connection")?;
                 let question = req_str("question")?;
                 let max_rows = arg_u64(args, "max_rows")?.map(|v| v as usize);
-                let plan = self.plan_question(caller, &conn, &question, max_rows).await?;
-                let sv = plan.revision_id.clone().unwrap_or_else(|| "ontology_unpublished".to_string());
-                let mut resp = McpSuccessResponse::with_data(req_id, &conn, sv, "ontology_plan", &plan);
+                let plan = self
+                    .plan_question(caller, &conn, &question, max_rows)
+                    .await?;
+                let sv = plan
+                    .revision_id
+                    .clone()
+                    .unwrap_or_else(|| "ontology_unpublished".to_string());
+                let mut resp =
+                    McpSuccessResponse::with_data(req_id, &conn, sv, "ontology_plan", &plan);
                 resp.warnings = plan.limitations.clone();
                 if !plan.is_answerable() {
                     resp.warnings.extend(plan.missing.iter().cloned());
@@ -2175,8 +2610,14 @@ impl DbMcpRuntime {
                 let question = req_str("question")?;
                 let max_rows = arg_u64(args, "max_rows")?.map(|v| v as usize);
                 let adapter = self.get_authorized_adapter(caller, &conn)?;
-                let plan = self.plan_question(caller, &conn, &question, max_rows).await?;
-                if let Some(pinned) = args.get("plan_hash").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()) {
+                let plan = self
+                    .plan_question(caller, &conn, &question, max_rows)
+                    .await?;
+                if let Some(pinned) = args
+                    .get("plan_hash")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                {
                     if plan.plan_hash.as_deref() != Some(pinned.trim()) {
                         return Err(DbMcpError::PolicyDenied {
                             code: "ONTOLOGY_PLAN_MISMATCH".to_string(),
@@ -2185,26 +2626,49 @@ impl DbMcpRuntime {
                         });
                     }
                 }
-                let sv = plan.revision_id.clone().unwrap_or_else(|| "ontology_unpublished".to_string());
+                let sv = plan
+                    .revision_id
+                    .clone()
+                    .unwrap_or_else(|| "ontology_unpublished".to_string());
                 if !plan.is_answerable() {
-                    let mut resp = McpSuccessResponse::with_data(req_id, &conn, sv, "ontology_answer", json!({ "answered": false, "plan": plan }));
+                    let mut resp = McpSuccessResponse::with_data(
+                        req_id,
+                        &conn,
+                        sv,
+                        "ontology_answer",
+                        json!({ "answered": false, "plan": plan }),
+                    );
                     resp.warnings = plan.missing.clone();
                     resp.execution_time_ms = Some(started.elapsed().as_millis() as u64);
                     return to_json(resp);
                 }
                 let sql = plan.sql.clone().unwrap_or_default();
-                let metric_id = plan.metric.as_ref().map(|m| m.def_id.clone()).unwrap_or_default();
+                let metric_id = plan
+                    .metric
+                    .as_ref()
+                    .map(|m| m.def_id.clone())
+                    .unwrap_or_default();
                 let gov_req = GovernedQueryRequest::new(req_id, &conn, caller.clone(), sql)
                     .with_tool_name(format!("ask_semantic_question:{metric_id}"))
                     .with_params(plan.params.clone())
-                    .with_max_rows(max_rows.unwrap_or(self.config.ontology.default_max_rows).min(self.config.ontology.default_max_rows.max(1)));
-                let result = self.executor.execute_governed(adapter.as_ref(), gov_req).await?;
-                let mut resp = McpSuccessResponse::from_query_result(req_id, &conn, result, Some(sv));
+                    .with_max_rows(
+                        max_rows
+                            .unwrap_or(self.config.ontology.default_max_rows)
+                            .min(self.config.ontology.default_max_rows.max(1)),
+                    );
+                let result = self
+                    .executor
+                    .execute_governed(adapter.as_ref(), gov_req)
+                    .await?;
+                let mut resp =
+                    McpSuccessResponse::from_query_result(req_id, &conn, result, Some(sv));
                 resp.warnings.extend(plan.limitations.iter().cloned());
                 resp.data = Some(json!({ "answered": true, "plan": plan }));
                 to_json(resp)
             }
-            other => Err(DbMcpError::InvalidArgument(format!("Unknown tool '{other}'"))),
+            other => Err(DbMcpError::InvalidArgument(format!(
+                "Unknown tool '{other}'"
+            ))),
         }
     }
 
@@ -2247,11 +2711,22 @@ impl DbMcpRuntime {
                     .or_else(|| params.get("tool_name"))
                     .and_then(|v| v.as_str())
                 else {
-                    return JsonRpcResponse::err(id, -32602, "Missing tool 'name' in tools/call params", None);
+                    return JsonRpcResponse::err(
+                        id,
+                        -32602,
+                        "Missing tool 'name' in tools/call params",
+                        None,
+                    );
                 };
-                let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                let arguments = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
                 let payload = match tool_request_id {
-                    Some(req_id) => self.call_tool_with_id(req_id, name, arguments, caller).await,
+                    Some(req_id) => {
+                        self.call_tool_with_id(req_id, name, arguments, caller)
+                            .await
+                    }
                     None => self.call_tool(name, arguments, caller).await,
                 };
                 let is_error = payload.get("status").and_then(|v| v.as_str()) == Some("denied");
@@ -2282,14 +2757,20 @@ impl DbMcpRuntime {
     }
 
     pub async fn handle_jsonrpc_str(&self, raw_json: &str, caller: &CallerIdentity) -> String {
-        self.handle_jsonrpc_line(raw_json, caller).await.unwrap_or_default()
+        self.handle_jsonrpc_line(raw_json, caller)
+            .await
+            .unwrap_or_default()
     }
 
     /// Handle one raw JSON-RPC message. Returns `None` for notifications (no reply allowed).
     ///
     /// Invalid JSON -> `-32700`; valid JSON that is not a request object (array batch, missing or
     /// non-string `method`, bad `id` type) -> `-32600` with the id echoed when available.
-    pub async fn handle_jsonrpc_line(&self, raw_json: &str, caller: &CallerIdentity) -> Option<String> {
+    pub async fn handle_jsonrpc_line(
+        &self,
+        raw_json: &str,
+        caller: &CallerIdentity,
+    ) -> Option<String> {
         self.handle_jsonrpc_line_with_tool_id(raw_json, caller, None)
             .await
     }
@@ -2306,7 +2787,10 @@ impl DbMcpRuntime {
             Ok(Value::Object(map)) => {
                 let has_id = map.contains_key("id");
                 let id = map.get("id").cloned();
-                let id_ok = matches!(id, None | Some(Value::Null) | Some(Value::String(_)) | Some(Value::Number(_)));
+                let id_ok = matches!(
+                    id,
+                    None | Some(Value::Null) | Some(Value::String(_)) | Some(Value::Number(_))
+                );
                 let echo_id = if id_ok { id.clone() } else { None };
                 if !id_ok || !map.get("method").map(Value::is_string).unwrap_or(false) {
                     JsonRpcResponse::err(
@@ -2318,13 +2802,20 @@ impl DbMcpRuntime {
                 } else {
                     match serde_json::from_value::<JsonRpcRequest>(Value::Object(map)) {
                         Ok(req) => {
-                            let resp = self.handle_jsonrpc_with_tool_id(req, caller, tool_request_id).await;
+                            let resp = self
+                                .handle_jsonrpc_with_tool_id(req, caller, tool_request_id)
+                                .await;
                             if !has_id {
                                 return None;
                             }
                             resp
                         }
-                        Err(e) => JsonRpcResponse::err(echo_id, -32600, format!("Invalid Request: {e}"), None),
+                        Err(e) => JsonRpcResponse::err(
+                            echo_id,
+                            -32600,
+                            format!("Invalid Request: {e}"),
+                            None,
+                        ),
                     }
                 }
             }
@@ -2370,7 +2861,10 @@ impl Deref for McpProtocolHandler {
     }
 }
 
-fn parse_detail_level(val: Option<&Value>, default: CatalogDetailLevel) -> DbMcpResult<CatalogDetailLevel> {
+fn parse_detail_level(
+    val: Option<&Value>,
+    default: CatalogDetailLevel,
+) -> DbMcpResult<CatalogDetailLevel> {
     match val {
         None | Some(Value::Null) => Ok(default),
         Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
@@ -2395,7 +2889,9 @@ fn parse_object_types(val: Option<&Value>) -> DbMcpResult<Vec<CatalogObjectType>
             .map(|item| {
                 item.as_str()
                     .ok_or_else(|| {
-                        DbMcpError::InvalidArgument("'object_types' must be an array of strings".to_string())
+                        DbMcpError::InvalidArgument(
+                            "'object_types' must be an array of strings".to_string(),
+                        )
                     })
                     .and_then(|s| s.parse::<CatalogObjectType>())
             })
@@ -2412,8 +2908,8 @@ mod tests {
 
     #[test]
     fn example_toml_parses_and_validates() {
-        let toml_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../config/db-mcp.example.toml");
+        let toml_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/db-mcp.example.toml");
         let cfg = ServerConfig::from_file(&toml_path).expect("example config should parse");
         assert_eq!(cfg.server_name, "db-mcp");
         assert_eq!(cfg.connections.len(), 3);
@@ -2437,11 +2933,15 @@ dsn = \"sqlserver://ro:Secr3tPw@127.0.0.1:1?connectTimeout=2\"
         let entry = &list["data"][0];
         assert_eq!(entry["backend"], "live");
         assert_eq!(entry["engine"], "sqlserver");
-        let denied = rt.call_tool("search_objects", json!({"connection": "ms"}), &caller).await;
+        let denied = rt
+            .call_tool("search_objects", json!({"connection": "ms"}), &caller)
+            .await;
         assert_eq!(denied["code"], "CONNECTION_UNAVAILABLE", "{denied}");
         assert!(!denied.to_string().contains("Secr3tPw"));
-        let init = format!("{toml}init_sql = \"SELECT 1\"
-");
+        let init = format!(
+            "{toml}init_sql = \"SELECT 1\"
+"
+        );
         assert!(DbMcpRuntime::from_config(ServerConfig::from_toml_str(&init).unwrap()).is_err());
     }
 
@@ -2477,7 +2977,10 @@ dsn = \"sqlserver://ro:Secr3tPw@127.0.0.1:1?connectTimeout=2\"
             .await;
         assert_eq!(dep["status"], "ok");
         assert_eq!(dep["_meta"]["provenance"]["untrusted_content"], true);
-        assert_eq!(dep["data"]["join_path"]["hops"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            dep["data"]["join_path"]["hops"].as_array().unwrap().len(),
+            2
+        );
         assert!(dep["data"]["mermaid_diagram"]
             .as_str()
             .unwrap()
@@ -2542,7 +3045,8 @@ dsn = \"sqlserver://ro:Secr3tPw@127.0.0.1:1?connectTimeout=2\"
         let caller = CallerIdentity::local_agent("local-agent");
         for key in ["max_rows", "max_bytes", "timeout_ms"] {
             for bad in [json!(0), json!(-1), json!("5"), json!(1.5)] {
-                let mut args = json!({ "connection": "local-sqlite", "sql": "SELECT id FROM users" });
+                let mut args =
+                    json!({ "connection": "local-sqlite", "sql": "SELECT id FROM users" });
                 args[key] = bad.clone();
                 let r = handler.call_tool("execute_query", args, &caller).await;
                 assert_eq!(r["status"], "denied", "{key}={bad}: {r}");
@@ -2619,13 +3123,21 @@ dsn = \"sqlserver://ro:Secr3tPw@127.0.0.1:1?connectTimeout=2\"
         ];
         for (conn, sql, code) in cases {
             let r = handler
-                .call_tool("propose_change", json!({ "connection": conn, "sql": sql }), &agent)
+                .call_tool(
+                    "propose_change",
+                    json!({ "connection": conn, "sql": sql }),
+                    &agent,
+                )
                 .await;
             assert_eq!(r["status"], "denied", "{conn}: {sql} -> {r}");
             assert_eq!(r["code"], code, "{conn}: {sql} -> {r}");
         }
         let vacuum = handler
-            .call_tool("propose_change", json!({ "connection": "local-sqlite", "sql": "VACUUM" }), &agent)
+            .call_tool(
+                "propose_change",
+                json!({ "connection": "local-sqlite", "sql": "VACUUM" }),
+                &agent,
+            )
             .await;
         assert_eq!(vacuum["status"], "denied", "{vacuum}");
         let ttl = handler
@@ -2641,10 +3153,13 @@ dsn = \"sqlserver://ro:Secr3tPw@127.0.0.1:1?connectTimeout=2\"
     #[tokio::test]
     async fn apply_change_rechecks_policy_and_requires_keyed_approval_in_production() {
         if std::env::var(APPROVAL_KEY_ENV).is_ok() {
-            eprintln!("skipped: {APPROVAL_KEY_ENV} is set in the environment, so no runtime is unkeyed");
+            eprintln!(
+                "skipped: {APPROVAL_KEY_ENV} is set in the environment, so no runtime is unkeyed"
+            );
             return;
         }
-        let store = std::env::temp_dir().join(format!("db_mcp_mcp_keyed_{}.db", Uuid::new_v4().simple()));
+        let store =
+            std::env::temp_dir().join(format!("db_mcp_mcp_keyed_{}.db", Uuid::new_v4().simple()));
         let agent = CallerIdentity::local_agent("local-agent");
         let admin = CallerIdentity::admin("dba-approver");
         let mut cfg = ServerConfig::default_demo();
@@ -2660,12 +3175,22 @@ dsn = \"sqlserver://ro:Secr3tPw@127.0.0.1:1?connectTimeout=2\"
             )
             .await;
         let prod_id = prop["data"]["change_id"].as_str().unwrap().to_string();
-        let early = unkeyed.call_tool("apply_change", json!({ "change_id": prod_id }), &agent).await;
+        let early = unkeyed
+            .call_tool("apply_change", json!({ "change_id": prod_id }), &agent)
+            .await;
         assert_eq!(early["code"], "APPROVAL_REQUIRED", "{early}");
-        assert!(early["next_action"].as_str().unwrap().contains("db-mcp approve --change-id"), "{early}");
+        assert!(
+            early["next_action"]
+                .as_str()
+                .unwrap()
+                .contains("db-mcp approve --change-id"),
+            "{early}"
+        );
         unkeyed.approve_change(&prod_id, &admin, None).unwrap();
         assert!(!unkeyed.approval_warnings().is_empty());
-        let refused = unkeyed.call_tool("apply_change", json!({ "change_id": prod_id }), &agent).await;
+        let refused = unkeyed
+            .call_tool("apply_change", json!({ "change_id": prod_id }), &agent)
+            .await;
         assert_eq!(refused["code"], "APPROVAL_KEY_REQUIRED", "{refused}");
 
         // Development connection without a key: applies, with an "approval records are not keyed" warning.
@@ -2678,15 +3203,21 @@ dsn = \"sqlserver://ro:Secr3tPw@127.0.0.1:1?connectTimeout=2\"
             .await;
         let dev_id = dev["data"]["change_id"].as_str().unwrap().to_string();
         unkeyed.approve_change(&dev_id, &admin, None).unwrap();
-        let dev_applied = unkeyed.call_tool("apply_change", json!({ "change_id": dev_id }), &agent).await;
+        let dev_applied = unkeyed
+            .call_tool("apply_change", json!({ "change_id": dev_id }), &agent)
+            .await;
         assert_eq!(dev_applied["status"], "ok", "{dev_applied}");
-        assert!(dev_applied["warnings"].to_string().contains("approval records are not keyed"));
+        assert!(dev_applied["warnings"]
+            .to_string()
+            .contains("approval records are not keyed"));
 
         // Keyed runtime on the same store: the unkeyed approval is not trusted, a fresh one is.
         cfg.changes.approval_key = Some("unit-test-approval-key-0123456789".to_string());
         let keyed = DbMcpRuntime::from_config(cfg).expect("keyed runtime");
         assert!(keyed.approval_warnings().is_empty());
-        let stale = keyed.call_tool("apply_change", json!({ "change_id": prod_id }), &agent).await;
+        let stale = keyed
+            .call_tool("apply_change", json!({ "change_id": prod_id }), &agent)
+            .await;
         assert_eq!(stale["code"], "APPROVAL_HASH_MISMATCH", "{stale}");
         let prop2 = keyed
             .call_tool(
@@ -2698,9 +3229,13 @@ dsn = \"sqlserver://ro:Secr3tPw@127.0.0.1:1?connectTimeout=2\"
         let id2 = prop2["data"]["change_id"].as_str().unwrap().to_string();
         let approved = keyed.approve_change(&id2, &admin, None).unwrap();
         assert!(approved.approval.as_ref().unwrap().approval_mac.is_some());
-        let second = keyed.approve_change(&id2, &CallerIdentity::admin("dba-other"), None).unwrap_err();
+        let second = keyed
+            .approve_change(&id2, &CallerIdentity::admin("dba-other"), None)
+            .unwrap_err();
         assert_eq!(second.code(), "CHANGE_NOT_PENDING");
-        let applied = keyed.call_tool("apply_change", json!({ "change_id": id2 }), &agent).await;
+        let applied = keyed
+            .call_tool("apply_change", json!({ "change_id": id2 }), &agent)
+            .await;
         assert_eq!(applied["status"], "ok", "{applied}");
         let _ = std::fs::remove_file(&store);
     }

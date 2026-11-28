@@ -90,12 +90,21 @@ const READ_ONLY_PRAGMAS_WITH_ARGUMENT: &[&str] = &[
 ];
 
 /// SQLite pragmas that change state even without an argument.
-const SIDE_EFFECT_PRAGMAS: &[&str] = &["optimize", "shrink_memory", "wal_checkpoint", "incremental_vacuum"];
+const SIDE_EFFECT_PRAGMAS: &[&str] = &[
+    "optimize",
+    "shrink_memory",
+    "wal_checkpoint",
+    "incremental_vacuum",
+];
 
 /// Classify a pragma: any assignment (`PRAGMA x = v`), any argument to a pragma that is not a
 /// known read-only introspection pragma (`PRAGMA journal_mode(WAL)`), and side-effecting
 /// pragmas are writes.
-fn classify_pragma(name: &str, has_argument: bool, is_assignment: bool) -> (SqlStatementClass, &'static str) {
+fn classify_pragma(
+    name: &str,
+    has_argument: bool,
+    is_assignment: bool,
+) -> (SqlStatementClass, &'static str) {
     let base = name
         .rsplit('.')
         .next()
@@ -279,7 +288,12 @@ fn normalize_sql_tokens(sql: &str, mask_literals: bool) -> String {
                             | Token::Colon
                             | Token::DoubleColon
                     );
-                    if prev_was_word_or_num && !is_punct && !out.ends_with('(') && !out.ends_with('.') && !out.ends_with("::") {
+                    if prev_was_word_or_num
+                        && !is_punct
+                        && !out.ends_with('(')
+                        && !out.ends_with('.')
+                        && !out.ends_with("::")
+                    {
                         out.push(' ');
                     } else if !out.is_empty()
                         && !is_punct
@@ -339,20 +353,31 @@ fn dialect_for_engine(engine: DatabaseEngine) -> Box<dyn Dialect> {
 fn tsql_keyword_class(word: &str, next: Option<&str>) -> Option<(SqlStatementClass, &'static str)> {
     let class = match word {
         "exec" | "execute" => (SqlStatementClass::PrivilegeOrAdmin, "TSQL_EXEC"),
-        "openrowset" | "openquery" | "opendatasource" => (SqlStatementClass::PrivilegeOrAdmin, "TSQL_REMOTE_ACCESS"),
+        "openrowset" | "openquery" | "opendatasource" => {
+            (SqlStatementClass::PrivilegeOrAdmin, "TSQL_REMOTE_ACCESS")
+        }
         "bulk" => (SqlStatementClass::PrivilegeOrAdmin, "TSQL_BULK"),
         "dbcc" => (SqlStatementClass::PrivilegeOrAdmin, "TSQL_DBCC"),
-        "shutdown" | "reconfigure" | "kill" | "checkpoint" => (SqlStatementClass::PrivilegeOrAdmin, "TSQL_SERVER_ADMIN"),
+        "shutdown" | "reconfigure" | "kill" | "checkpoint" => {
+            (SqlStatementClass::PrivilegeOrAdmin, "TSQL_SERVER_ADMIN")
+        }
         "backup" | "restore" => (SqlStatementClass::PrivilegeOrAdmin, "TSQL_BACKUP_RESTORE"),
-        "grant" | "revoke" | "deny" | "setuser" | "revert" => (SqlStatementClass::PrivilegeOrAdmin, "TSQL_PERMISSIONS"),
+        "grant" | "revoke" | "deny" | "setuser" | "revert" => {
+            (SqlStatementClass::PrivilegeOrAdmin, "TSQL_PERMISSIONS")
+        }
         "waitfor" => (SqlStatementClass::PrivilegeOrAdmin, "TSQL_WAITFOR"),
         // `OPTION (USE HINT (...))` / `USE PLAN` are query hints inside a read.
-        "use" if !matches!(next, Some("hint") | Some("plan")) => (SqlStatementClass::PrivilegeOrAdmin, "TSQL_USE_DATABASE"),
-        "create" | "alter" | "drop" | "truncate" | "enable" | "disable" => (SqlStatementClass::Ddl, "TSQL_DDL"),
-        "insert" | "update" | "delete" | "merge" | "into" | "writetext" | "updatetext" | "send" | "receive" => {
-            (SqlStatementClass::Write, "TSQL_WRITE")
+        "use" if !matches!(next, Some("hint") | Some("plan")) => {
+            (SqlStatementClass::PrivilegeOrAdmin, "TSQL_USE_DATABASE")
         }
-        "begin" | "commit" | "rollback" | "save" | "set" | "declare" => (SqlStatementClass::Transaction, "TSQL_SESSION"),
+        "create" | "alter" | "drop" | "truncate" | "enable" | "disable" => {
+            (SqlStatementClass::Ddl, "TSQL_DDL")
+        }
+        "insert" | "update" | "delete" | "merge" | "into" | "writetext" | "updatetext" | "send"
+        | "receive" => (SqlStatementClass::Write, "TSQL_WRITE"),
+        "begin" | "commit" | "rollback" | "save" | "set" | "declare" => {
+            (SqlStatementClass::Transaction, "TSQL_SESSION")
+        }
         _ => return None,
     };
     Some(class)
@@ -393,7 +418,10 @@ pub fn tsql_hazard_class(raw_sql: &str) -> Option<(SqlStatementClass, &'static s
         let leading_procedure = (i == 0 && (w.starts_with("xp_") || w.starts_with("sp_")))
             .then_some((SqlStatementClass::PrivilegeOrAdmin, "TSQL_SYSTEM_PROCEDURE"));
         if let Some(found) = leading_procedure.or_else(|| tsql_keyword_class(w, next)) {
-            if worst.map(|(c, _)| tsql_class_rank(found.0) > tsql_class_rank(c)).unwrap_or(true) {
+            if worst
+                .map(|(c, _)| tsql_class_rank(found.0) > tsql_class_rank(c))
+                .unwrap_or(true)
+            {
                 worst = Some(found);
             }
         }
@@ -497,13 +525,16 @@ pub fn parse_and_analyze_sql(engine: DatabaseEngine, sql: &str) -> DbMcpResult<S
                 match Parser::parse_sql(dialect.as_ref(), raw_stmt) {
                     Ok(mut stmts) if !stmts.is_empty() => {
                         let stmt = stmts.remove(0);
-                        statement_analyses.push(analyze_ast_statement(
-                            engine, idx, raw_stmt, &stmt,
-                        ));
+                        statement_analyses
+                            .push(analyze_ast_statement(engine, idx, raw_stmt, &stmt));
                     }
                     _ => {
-                        let fallback =
-                            analyze_fallback_statement(engine, idx, raw_stmt, &parse_err.to_string());
+                        let fallback = analyze_fallback_statement(
+                            engine,
+                            idx,
+                            raw_stmt,
+                            &parse_err.to_string(),
+                        );
                         statement_analyses.push(fallback);
                     }
                 }
@@ -609,11 +640,7 @@ fn clean_ident(ident: &Ident) -> String {
 }
 
 fn clean_object_name(name: &ObjectName) -> String {
-    name.0
-        .iter()
-        .map(clean_ident)
-        .collect::<Vec<_>>()
-        .join(".")
+    name.0.iter().map(clean_ident).collect::<Vec<_>>().join(".")
 }
 
 struct AstInspector {
@@ -660,8 +687,7 @@ impl AstInspector {
                 self.referenced_tables.insert(table_name.clone());
             }
             if let Some(a) = alias {
-                self.alias_to_table
-                    .insert(clean_ident(&a.name), table_name);
+                self.alias_to_table.insert(clean_ident(&a.name), table_name);
             }
         }
     }
@@ -931,7 +957,9 @@ impl Visitor for AstInspector {
 
     fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<Self::Break> {
         let (class, _) = classify_top_level_statement(statement);
-        if self.in_cte_depth > 0 && matches!(class, SqlStatementClass::Write | SqlStatementClass::Ddl) {
+        if self.in_cte_depth > 0
+            && matches!(class, SqlStatementClass::Write | SqlStatementClass::Ddl)
+        {
             self.has_cte_write = true;
         }
         self.nested_classes.push(class);
@@ -1021,7 +1049,9 @@ impl Visitor for AstInspector {
 fn classify_top_level_statement(stmt: &Statement) -> (SqlStatementClass, &'static str) {
     match stmt {
         Statement::Query(_) => (SqlStatementClass::Read, "SELECT"),
-        Statement::Explain { statement, analyze, .. } => {
+        Statement::Explain {
+            statement, analyze, ..
+        } => {
             let (inner_class, _) = classify_top_level_statement(statement);
             if inner_class != SqlStatementClass::Read {
                 if *analyze {
@@ -1064,9 +1094,7 @@ fn classify_top_level_statement(stmt: &Statement) -> (SqlStatementClass, &'stati
         Statement::Commit { .. } => (SqlStatementClass::Transaction, "COMMIT"),
         Statement::Rollback { .. } => (SqlStatementClass::Transaction, "ROLLBACK"),
         Statement::Savepoint { .. } => (SqlStatementClass::Transaction, "SAVEPOINT"),
-        Statement::ReleaseSavepoint { .. } => {
-            (SqlStatementClass::Transaction, "RELEASE_SAVEPOINT")
-        }
+        Statement::ReleaseSavepoint { .. } => (SqlStatementClass::Transaction, "RELEASE_SAVEPOINT"),
         Statement::SetTransaction { .. } => (SqlStatementClass::Transaction, "SET_TRANSACTION"),
         Statement::Grant { .. } => (SqlStatementClass::PrivilegeOrAdmin, "GRANT"),
         Statement::Revoke { .. } => (SqlStatementClass::PrivilegeOrAdmin, "REVOKE"),
@@ -1237,7 +1265,10 @@ fn analyze_fallback_statement(
     let (class, kind) = if let Some((hazard, hazard_kind)) = tsql_hazard {
         (hazard, hazard_kind)
     } else if !priv_fns.is_empty()
-        || matches!(first_word, "ATTACH" | "DETACH" | "VACUUM" | "COPY" | "GRANT" | "REVOKE")
+        || matches!(
+            first_word,
+            "ATTACH" | "DETACH" | "VACUUM" | "COPY" | "GRANT" | "REVOKE"
+        )
     {
         (SqlStatementClass::PrivilegeOrAdmin, first_word)
     } else if engine == DatabaseEngine::Sqlite && first_word == "PRAGMA" {
@@ -1280,8 +1311,12 @@ mod tests {
         assert!(!analysis.has_writes);
         assert!(!analysis.has_ddl);
         assert!(!analysis.has_cte_write);
-        assert!(analysis.referenced_tables.contains(&"public.users".to_string()));
-        assert!(analysis.referenced_tables.contains(&"public.orders".to_string()));
+        assert!(analysis
+            .referenced_tables
+            .contains(&"public.users".to_string()));
+        assert!(analysis
+            .referenced_tables
+            .contains(&"public.orders".to_string()));
 
         assert!(analysis.predicates.iter().any(|p| {
             p.table.as_deref() == Some("public.users")
@@ -1336,16 +1371,43 @@ mod tests {
         );
 
         for (engine, sql, name) in [
-            (DatabaseEngine::Sqlite, "SELECT readfile('/etc/passwd')", "readfile"),
-            (DatabaseEngine::Sqlite, "SELECT writefile('/tmp/x', 'abc')", "writefile"),
+            (
+                DatabaseEngine::Sqlite,
+                "SELECT readfile('/etc/passwd')",
+                "readfile",
+            ),
+            (
+                DatabaseEngine::Sqlite,
+                "SELECT writefile('/tmp/x', 'abc')",
+                "writefile",
+            ),
             (DatabaseEngine::Sqlite, "SELECT edit('x', 'vi')", "edit"),
-            (DatabaseEngine::Postgres, "SELECT set_config('search_path', 'evil', false)", "set_config"),
-            (DatabaseEngine::Postgres, "SELECT lo_import('/etc/passwd')", "lo_import"),
-            (DatabaseEngine::Postgres, "SELECT lo_export(1, '/tmp/x')", "lo_export"),
+            (
+                DatabaseEngine::Postgres,
+                "SELECT set_config('search_path', 'evil', false)",
+                "set_config",
+            ),
+            (
+                DatabaseEngine::Postgres,
+                "SELECT lo_import('/etc/passwd')",
+                "lo_import",
+            ),
+            (
+                DatabaseEngine::Postgres,
+                "SELECT lo_export(1, '/tmp/x')",
+                "lo_export",
+            ),
         ] {
             let analysis = parse_and_analyze_sql(engine, sql).unwrap();
-            assert!(analysis.privileged_functions.contains(&name.to_string()), "{sql}");
-            assert_eq!(analysis.overall_class, SqlStatementClass::PrivilegeOrAdmin, "{sql}");
+            assert!(
+                analysis.privileged_functions.contains(&name.to_string()),
+                "{sql}"
+            );
+            assert_eq!(
+                analysis.overall_class,
+                SqlStatementClass::PrivilegeOrAdmin,
+                "{sql}"
+            );
         }
 
         let mysql_sql = "SELECT LOAD_FILE('/var/lib/mysql-files/secret.txt')";
@@ -1363,8 +1425,11 @@ mod tests {
     #[test]
     fn test_unknown_construct_fails_closed_in_governed_mode() {
         let bad_sql = "FOOBAR_VENDOR_COMMAND table_x WITH MAGIC";
-        let dev_res =
-            analyze_sql_for_mode(DatabaseEngine::Postgres, bad_sql, OperatingMode::Development);
+        let dev_res = analyze_sql_for_mode(
+            DatabaseEngine::Postgres,
+            bad_sql,
+            OperatingMode::Development,
+        );
         assert!(dev_res.is_ok());
         assert_eq!(dev_res.unwrap().overall_class, SqlStatementClass::Unknown);
 
@@ -1405,19 +1470,25 @@ mod tests {
             assert_eq!(class(sql).0, SqlStatementClass::Read, "{sql}");
         }
         // Not SQLite: PRAGMA stays unknown (fails closed in governed modes).
-        let pg = parse_and_analyze_sql(DatabaseEngine::Postgres, "PRAGMA journal_mode = WAL").unwrap();
+        let pg =
+            parse_and_analyze_sql(DatabaseEngine::Postgres, "PRAGMA journal_mode = WAL").unwrap();
         assert_ne!(pg.overall_class, SqlStatementClass::Read);
     }
 
     #[test]
     fn test_explain_analyze_kinds() {
         let kind = |sql: &str| {
-            parse_and_analyze_sql(DatabaseEngine::Postgres, sql).unwrap().statements[0]
+            parse_and_analyze_sql(DatabaseEngine::Postgres, sql)
+                .unwrap()
+                .statements[0]
                 .statement_kind
                 .clone()
         };
         assert_eq!(kind("EXPLAIN ANALYZE SELECT 1"), "EXPLAIN_ANALYZE");
-        assert_eq!(kind("EXPLAIN ANALYZE DELETE FROM users"), "EXPLAIN_ANALYZE_MUTATING");
+        assert_eq!(
+            kind("EXPLAIN ANALYZE DELETE FROM users"),
+            "EXPLAIN_ANALYZE_MUTATING"
+        );
         assert_eq!(kind("EXPLAIN DELETE FROM users"), "EXPLAIN_MUTATING");
         assert_eq!(kind("EXPLAIN SELECT 1"), "EXPLAIN");
     }
@@ -1449,7 +1520,11 @@ mod tests {
 
     #[test]
     fn test_disclosure_bare_projection_and_predicates_are_not_exposures() {
-        for engine in [DatabaseEngine::Sqlite, DatabaseEngine::Postgres, DatabaseEngine::MySql] {
+        for engine in [
+            DatabaseEngine::Sqlite,
+            DatabaseEngine::Postgres,
+            DatabaseEngine::MySql,
+        ] {
             for sql in [
                 "SELECT password_hash FROM users",
                 "SELECT users.password_hash FROM users",
@@ -1481,35 +1556,71 @@ mod tests {
     #[test]
     fn test_disclosure_renamed_and_derived_projections_are_exposures() {
         let ph = |out: Option<&str>| ("password_hash".to_string(), out.map(str::to_string));
-        for engine in [DatabaseEngine::Sqlite, DatabaseEngine::Postgres, DatabaseEngine::MySql] {
+        for engine in [
+            DatabaseEngine::Sqlite,
+            DatabaseEngine::Postgres,
+            DatabaseEngine::MySql,
+        ] {
             let cases: [(&str, Option<&str>); 11] = [
                 ("SELECT password_hash AS ph FROM users", Some("ph")),
                 ("SELECT upper(password_hash) FROM users", None),
-                ("SELECT email || ':' || password_hash AS creds FROM users", Some("creds")),
-                ("SELECT ph FROM (SELECT password_hash AS ph FROM users) t", Some("ph")),
+                (
+                    "SELECT email || ':' || password_hash AS creds FROM users",
+                    Some("creds"),
+                ),
+                (
+                    "SELECT ph FROM (SELECT password_hash AS ph FROM users) t",
+                    Some("ph"),
+                ),
                 ("SELECT 1 UNION SELECT password_hash FROM users", None),
-                ("SELECT (SELECT password_hash FROM users LIMIT 1) AS v", Some("v")),
-                ("WITH c(x) AS (SELECT password_hash FROM users) SELECT x FROM c", Some("x")),
+                (
+                    "SELECT (SELECT password_hash FROM users LIMIT 1) AS v",
+                    Some("v"),
+                ),
+                (
+                    "WITH c(x) AS (SELECT password_hash FROM users) SELECT x FROM c",
+                    Some("x"),
+                ),
                 ("INSERT INTO notes SELECT password_hash FROM users", None),
-                ("INSERT INTO notes (body) SELECT password_hash FROM users", Some("body")),
+                (
+                    "INSERT INTO notes (body) SELECT password_hash FROM users",
+                    Some("body"),
+                ),
                 ("UPDATE users SET email = password_hash", Some("email")),
-                ("CREATE VIEW v AS SELECT password_hash AS x FROM users", Some("x")),
+                (
+                    "CREATE VIEW v AS SELECT password_hash AS x FROM users",
+                    Some("x"),
+                ),
             ];
             for (sql, out) in cases {
-                assert!(exposed(engine, sql).contains(&ph(out)), "{engine} {sql}: {:?}", exposed(engine, sql));
+                assert!(
+                    exposed(engine, sql).contains(&ph(out)),
+                    "{engine} {sql}: {:?}",
+                    exposed(engine, sql)
+                );
             }
             // The leftmost branch names the column: a sensitive name stays masked.
-            assert!(exposed(engine, "SELECT password_hash FROM users UNION SELECT password_hash FROM users")
-                .iter()
-                .all(|(_, out)| out.as_deref() == Some("password_hash")));
+            assert!(exposed(
+                engine,
+                "SELECT password_hash FROM users UNION SELECT password_hash FROM users"
+            )
+            .iter()
+            .all(|(_, out)| out.as_deref() == Some("password_hash")));
         }
-        assert!(exposed(DatabaseEngine::Sqlite, "ALTER TABLE users RENAME COLUMN password_hash TO ph")
-            .contains(&ph(Some("ph"))));
+        assert!(exposed(
+            DatabaseEngine::Sqlite,
+            "ALTER TABLE users RENAME COLUMN password_hash TO ph"
+        )
+        .contains(&ph(Some("ph"))));
     }
 
     #[test]
     fn test_disclosure_untracked_provenance() {
-        for engine in [DatabaseEngine::Sqlite, DatabaseEngine::Postgres, DatabaseEngine::MySql] {
+        for engine in [
+            DatabaseEngine::Sqlite,
+            DatabaseEngine::Postgres,
+            DatabaseEngine::MySql,
+        ] {
             for sql in [
                 "SELECT id, email, role, created_at, 1 FROM orders UNION SELECT * FROM users",
                 "INSERT INTO copy SELECT * FROM users",
@@ -1518,7 +1629,10 @@ mod tests {
                 assert!(!untracked(engine, sql).is_empty(), "{engine} {sql}");
             }
             assert!(untracked(engine, "SELECT * FROM users").is_empty());
-            assert!(untracked(engine, "SELECT * INTO new_table FROM users").is_empty(), "{engine}");
+            assert!(
+                untracked(engine, "SELECT * INTO new_table FROM users").is_empty(),
+                "{engine}"
+            );
             assert!(untracked(engine, "SELECT count(*) FROM users").is_empty());
         }
         let pg = DatabaseEngine::Postgres;
@@ -1545,8 +1659,11 @@ mod tests {
             .opaque_sql
             .iter()
             .any(|t| t.contains("password_hash")));
-        let unparsed =
-            parse_and_analyze_sql(DatabaseEngine::Sqlite, "FOOBAR_VENDOR password_hash WITH MAGIC").unwrap();
+        let unparsed = parse_and_analyze_sql(
+            DatabaseEngine::Sqlite,
+            "FOOBAR_VENDOR password_hash WITH MAGIC",
+        )
+        .unwrap();
         assert_eq!(unparsed.disclosure.opaque_sql.len(), 1);
     }
 
@@ -1567,7 +1684,11 @@ mod tests {
             assert!(!a.is_multi_statement, "{sql}");
         }
         let a = tsql("SELECT [id] FROM [dbo].[users] WHERE [id] = @P1");
-        assert!(a.referenced_tables.iter().any(|t| t == "dbo.users"), "{:?}", a.referenced_tables);
+        assert!(
+            a.referenced_tables.iter().any(|t| t == "dbo.users"),
+            "{:?}",
+            a.referenced_tables
+        );
     }
 
     #[test]
@@ -1591,7 +1712,11 @@ mod tests {
         ];
         for sql in privileged {
             let a = tsql(sql);
-            assert_eq!(a.overall_class, SqlStatementClass::PrivilegeOrAdmin, "{sql}");
+            assert_eq!(
+                a.overall_class,
+                SqlStatementClass::PrivilegeOrAdmin,
+                "{sql}"
+            );
         }
         for (sql, class) in [
             ("SELECT id INTO dbo.copy FROM dbo.users", SqlStatementClass::Write),
@@ -1614,18 +1739,27 @@ mod tests {
             assert_ne!(a.overall_class, SqlStatementClass::Read, "{sql}");
         }
         // Statements sqlparser cannot represent still never classify as a read.
-        for sql in ["USE master", "SELECT o.id FROM dbo.orders o OPTION (USE HINT ('X'))"] {
+        for sql in [
+            "USE master",
+            "SELECT o.id FROM dbo.orders o OPTION (USE HINT ('X'))",
+        ] {
             assert_ne!(tsql(sql).overall_class, SqlStatementClass::Read, "{sql}");
         }
         // Bracket-quoted identifiers named like keywords are data, not statements.
-        assert_eq!(tsql("SELECT [update], [delete] FROM dbo.flags").overall_class, SqlStatementClass::Read);
+        assert_eq!(
+            tsql("SELECT [update], [delete] FROM dbo.flags").overall_class,
+            SqlStatementClass::Read
+        );
     }
 
     #[test]
     fn tsql_mode_fails_closed_on_unclassified_batches() {
         for sql in ["dbo.reserve_inventory 1", "SELECT 1 GO SELECT 2 FROM"] {
             let r = analyze_sql_for_mode(DatabaseEngine::SqlServer, sql, OperatingMode::ReadOnly);
-            assert!(r.is_err() || r.unwrap().overall_class != SqlStatementClass::Read, "{sql}");
+            assert!(
+                r.is_err() || r.unwrap().overall_class != SqlStatementClass::Read,
+                "{sql}"
+            );
         }
     }
 }
@@ -1657,6 +1791,11 @@ mod tsql_read_coverage {
         }
         // Known gap: sqlparser cannot represent some query hints; they fail closed, never read.
         let hinted = "WITH r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 5) SELECT n FROM r OPTION (MAXRECURSION 10)";
-        assert_ne!(parse_and_analyze_sql(DatabaseEngine::SqlServer, hinted).unwrap().overall_class, SqlStatementClass::Read);
+        assert_ne!(
+            parse_and_analyze_sql(DatabaseEngine::SqlServer, hinted)
+                .unwrap()
+                .overall_class,
+            SqlStatementClass::Read
+        );
     }
 }

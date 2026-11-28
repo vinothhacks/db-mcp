@@ -16,7 +16,9 @@ use db_mcp_secrets::{redact_sensitive_text, SecretString};
 use db_mcp_sql::split_sql_statements;
 use mysql_async::consts::{ColumnFlags, ColumnType};
 use mysql_async::prelude::*;
-use mysql_async::{Conn, Opts, OptsBuilder, Params, Pool, PoolConstraints, PoolOpts, Value as MyValue};
+use mysql_async::{
+    Conn, Opts, OptsBuilder, Params, Pool, PoolConstraints, PoolOpts, Value as MyValue,
+};
 use percent_encoding::percent_decode_str;
 use url::Url;
 
@@ -110,11 +112,14 @@ pub fn parse_mysql_dsn(connection_id: &str, dsn: &str) -> DbMcpResult<MySqlDsn> 
     for (key, value) in url.query_pairs() {
         match key.as_ref() {
             "connect_timeout" | "connect_timeout_ms" => {
-                connect_timeout_ms = value
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|v| *v > 0)
-                    .ok_or_else(|| invalid("connect_timeout must be a positive number of milliseconds"))?;
+                connect_timeout_ms =
+                    value
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|v| *v > 0)
+                        .ok_or_else(|| {
+                            invalid("connect_timeout must be a positive number of milliseconds")
+                        })?;
             }
             "ssl-mode" | "ssl_mode" | "sslmode" => {
                 if !value.eq_ignore_ascii_case("disabled") {
@@ -164,7 +169,9 @@ pub const CODE_DATABASE_PERMISSION_DENIED: &str = "DATABASE_PERMISSION_DENIED";
 
 fn server_reason(e: &mysql_async::Error) -> String {
     redact_sensitive_text(&match e {
-        mysql_async::Error::Server(se) => format!("MySQL error {} ({}): {}", se.code, se.state, se.message),
+        mysql_async::Error::Server(se) => {
+            format!("MySQL error {} ({}): {}", se.code, se.state, se.message)
+        }
         mysql_async::Error::Io(io) => format!("I/O error: {io}"),
         mysql_async::Error::Driver(d) => format!("driver error: {d}"),
         mysql_async::Error::Other(o) => format!("error: {o}"),
@@ -173,10 +180,17 @@ fn server_reason(e: &mysql_async::Error) -> String {
 }
 
 /// Map an error raised while opening a connection (always fail closed, never simulated).
-pub(crate) fn map_connect_error(connection_id: &str, dsn: &MySqlDsn, e: &mysql_async::Error) -> DbMcpError {
+pub(crate) fn map_connect_error(
+    connection_id: &str,
+    dsn: &MySqlDsn,
+    e: &mysql_async::Error,
+) -> DbMcpError {
     let reason = match e {
         mysql_async::Error::Server(se) if se.code == 1045 => {
-            format!("authentication failed for user '{}' (MySQL error 1045)", dsn.user)
+            format!(
+                "authentication failed for user '{}' (MySQL error 1045)",
+                dsn.user
+            )
         }
         mysql_async::Error::Server(se) if se.code == 1049 => format!(
             "database '{}' does not exist or is not visible to user '{}' (MySQL error 1049)",
@@ -189,7 +203,12 @@ pub(crate) fn map_connect_error(connection_id: &str, dsn: &MySqlDsn, e: &mysql_a
 }
 
 /// Map an error raised while running a statement.
-pub(crate) fn map_exec_error(connection_id: &str, dsn: &MySqlDsn, timeout_ms: u64, e: &mysql_async::Error) -> DbMcpError {
+pub(crate) fn map_exec_error(
+    connection_id: &str,
+    dsn: &MySqlDsn,
+    timeout_ms: u64,
+    e: &mysql_async::Error,
+) -> DbMcpError {
     match e {
         mysql_async::Error::Server(se) => match se.code {
             3024 => DbMcpError::ExecutionTimeout { timeout_ms },
@@ -287,8 +306,9 @@ impl LiveMySql {
         if read_only {
             setup.push("SET SESSION transaction_read_only = 1".to_string());
         }
-        let constraints = PoolConstraints::new(0, MAX_POOL_CONNECTIONS)
-            .ok_or_else(|| DbMcpError::InternalError("invalid MySQL pool constraints".to_string()))?;
+        let constraints = PoolConstraints::new(0, MAX_POOL_CONNECTIONS).ok_or_else(|| {
+            DbMcpError::InternalError("invalid MySQL pool constraints".to_string())
+        })?;
         let opts = OptsBuilder::default()
             .ip_or_hostname(parsed.host.clone())
             .tcp_port(parsed.port)
@@ -339,7 +359,9 @@ impl LiveMySql {
 
     /// Visibility warnings (missing optional grants) of the last catalog read.
     pub fn catalog_warnings(&self) -> Vec<String> {
-        self.cached_catalog().map(|c| c.warnings).unwrap_or_default()
+        self.cached_catalog()
+            .map(|c| c.warnings)
+            .unwrap_or_default()
     }
 
     pub fn read_only(&self) -> bool {
@@ -354,8 +376,15 @@ impl LiveMySql {
     /// `(major, minor, patch)` of the server, when known.
     pub fn server_version_tuple(&self) -> Option<(u16, u16, u16)> {
         let v = self.server_version()?;
-        let mut parts = v.split(|c: char| !c.is_ascii_digit()).filter(|p| !p.is_empty()).map(|p| p.parse::<u16>().unwrap_or(0));
-        Some((parts.next()?, parts.next().unwrap_or(0), parts.next().unwrap_or(0)))
+        let mut parts = v
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|p| !p.is_empty())
+            .map(|p| p.parse::<u16>().unwrap_or(0));
+        Some((
+            parts.next()?,
+            parts.next().unwrap_or(0),
+            parts.next().unwrap_or(0),
+        ))
     }
 
     /// Check a connection out of the pool within the connect timeout (fail closed).
@@ -373,7 +402,10 @@ impl LiveMySql {
             Err(_) => Err(connection_unavailable(
                 &self.connection_id,
                 &self.dsn,
-                &format!("no connection could be opened within {} ms", self.dsn.connect_timeout_ms),
+                &format!(
+                    "no connection could be opened within {} ms",
+                    self.dsn.connect_timeout_ms
+                ),
             )),
         }
     }
@@ -389,7 +421,12 @@ impl LiveMySql {
     }
 
     /// Run an internal read-only query (text protocol) and map every row to JSON.
-    pub(crate) async fn query_json(&self, conn: &mut Conn, sql: &str, timeout_ms: u64) -> DbMcpResult<(Vec<String>, Vec<Vec<serde_json::Value>>)> {
+    pub(crate) async fn query_json(
+        &self,
+        conn: &mut Conn,
+        sql: &str,
+        timeout_ms: u64,
+    ) -> DbMcpResult<(Vec<String>, Vec<Vec<serde_json::Value>>)> {
         let mut result = conn
             .query_iter(sql)
             .await
@@ -407,7 +444,9 @@ impl LiveMySql {
                 values
                     .iter()
                     .zip(columns.iter())
-                    .map(|(v, c)| mysql_value_to_json(v, c.column_type(), c.flags(), c.character_set()))
+                    .map(|(v, c)| {
+                        mysql_value_to_json(v, c.column_type(), c.flags(), c.character_set())
+                    })
                     .collect(),
             );
         }
@@ -416,12 +455,23 @@ impl LiveMySql {
     }
 
     /// Execute an authorized statement on the server with row/byte budgets.
-    pub async fn execute(&self, request: &AuthorizedQuery, read_only: bool, timeout_ms: u64) -> DbMcpResult<QueryResult> {
+    pub async fn execute(
+        &self,
+        request: &AuthorizedQuery,
+        read_only: bool,
+        timeout_ms: u64,
+    ) -> DbMcpResult<QueryResult> {
         let started = Instant::now();
         let statements = split_sql_statements(DatabaseEngine::MySql, &request.sql);
-        let statements: Vec<String> = statements.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        let statements: Vec<String> = statements
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
         if statements.is_empty() {
-            return Err(DbMcpError::InvalidArgument("empty SQL statement".to_string()));
+            return Err(DbMcpError::InvalidArgument(
+                "empty SQL statement".to_string(),
+            ));
         }
         if statements.len() > 1 && !request.params.is_empty() {
             return Err(DbMcpError::InvalidArgument(
@@ -438,7 +488,15 @@ impl LiveMySql {
             let last = idx + 1 == statements.len();
             let (sql, params) = bind_mysql_placeholders(stmt, &request.params)?;
             let params: Vec<MyValue> = params.iter().map(json_to_mysql_param).collect();
-            let result = run_prepared(&mut conn, &sql, params, if last { request.max_rows } else { 0 }, if last { request.max_bytes } else { 0 }, last).await;
+            let result = run_prepared(
+                &mut conn,
+                &sql,
+                params,
+                if last { request.max_rows } else { 0 },
+                if last { request.max_bytes } else { 0 },
+                last,
+            )
+            .await;
             match result {
                 Ok((out, kill)) => {
                     needs_kill |= kill;
@@ -448,7 +506,12 @@ impl LiveMySql {
                 }
                 Err(e) => {
                     self.active.remove(&request.execution_id);
-                    return Err(map_exec_error(&self.connection_id, &self.dsn, timeout_ms, &e));
+                    return Err(map_exec_error(
+                        &self.connection_id,
+                        &self.dsn,
+                        timeout_ms,
+                        &e,
+                    ));
                 }
             }
         }
@@ -461,7 +524,10 @@ impl LiveMySql {
         let out = outcome.expect("at least one statement");
         warnings.extend(out.warnings);
         if statements.len() > 1 {
-            warnings.push(format!("{} statements were executed; only the last result is returned", statements.len()));
+            warnings.push(format!(
+                "{} statements were executed; only the last result is returned",
+                statements.len()
+            ));
         }
         Ok(QueryResult {
             execution_id: request.execution_id.clone(),
@@ -511,7 +577,11 @@ async fn run_prepared(
     max_bytes: usize,
     collect: bool,
 ) -> Result<(StatementOutcome, bool), mysql_async::Error> {
-    let params = if params.is_empty() { Params::Empty } else { Params::Positional(params) };
+    let params = if params.is_empty() {
+        Params::Empty
+    } else {
+        Params::Positional(params)
+    };
     let mut result = conn.exec_iter(sql, params).await?;
     let cols = result.columns().map(|c| c.to_vec()).unwrap_or_default();
     let mut out = StatementOutcome {
@@ -545,7 +615,8 @@ async fn run_prepared(
         }
         if out.rows.len() >= max_rows {
             out.truncated = true;
-            out.warnings.push(format!("Result truncated at max_rows={max_rows}"));
+            out.warnings
+                .push(format!("Result truncated at max_rows={max_rows}"));
             still_streaming = true;
             break;
         }
@@ -558,7 +629,8 @@ async fn run_prepared(
         let row_bytes: usize = mapped.iter().map(json_size).sum();
         if max_bytes > 0 && out.bytes_used + row_bytes > max_bytes && !out.rows.is_empty() {
             out.truncated = true;
-            out.warnings.push(format!("Result truncated at max_bytes={max_bytes}"));
+            out.warnings
+                .push(format!("Result truncated at max_bytes={max_bytes}"));
             still_streaming = true;
             break;
         }
@@ -647,7 +719,10 @@ pub fn mysql_column_type_name(t: ColumnType, flags: ColumnFlags, charset: u16) -
         }
         _ => "unknown",
     };
-    if is_integer_type(t) && t != ColumnType::MYSQL_TYPE_YEAR && flags.contains(ColumnFlags::UNSIGNED_FLAG) {
+    if is_integer_type(t)
+        && t != ColumnType::MYSQL_TYPE_YEAR
+        && flags.contains(ColumnFlags::UNSIGNED_FLAG)
+    {
         format!("{base} unsigned")
     } else {
         base.to_string()
@@ -675,30 +750,54 @@ fn fraction(us: u32) -> String {
 /// string (no precision loss), DATE/DATETIME/TIMESTAMP as ISO-8601 (`T` separator), TIME as
 /// `[-]HH:MM:SS[.ffffff]`, BIT as an unsigned number, binary-collation bytes as `0x..` hex, text
 /// as UTF-8 (hex if not valid UTF-8), JSON as its text.
-pub fn mysql_value_to_json(value: &MyValue, t: ColumnType, flags: ColumnFlags, charset: u16) -> serde_json::Value {
+pub fn mysql_value_to_json(
+    value: &MyValue,
+    t: ColumnType,
+    flags: ColumnFlags,
+    charset: u16,
+) -> serde_json::Value {
     use serde_json::Value as J;
     match value {
         MyValue::NULL => J::Null,
         MyValue::Int(i) => J::from(*i),
         MyValue::UInt(u) => J::from(*u),
-        MyValue::Float(f) => serde_json::Number::from_f64(f64::from(*f)).map(J::Number).unwrap_or_else(|| J::String(f.to_string())),
-        MyValue::Double(f) => serde_json::Number::from_f64(*f).map(J::Number).unwrap_or_else(|| J::String(f.to_string())),
+        MyValue::Float(f) => serde_json::Number::from_f64(f64::from(*f))
+            .map(J::Number)
+            .unwrap_or_else(|| J::String(f.to_string())),
+        MyValue::Double(f) => serde_json::Number::from_f64(*f)
+            .map(J::Number)
+            .unwrap_or_else(|| J::String(f.to_string())),
         MyValue::Date(y, m, d, h, mi, s, us) => {
-            if matches!(t, ColumnType::MYSQL_TYPE_DATE | ColumnType::MYSQL_TYPE_NEWDATE) {
+            if matches!(
+                t,
+                ColumnType::MYSQL_TYPE_DATE | ColumnType::MYSQL_TYPE_NEWDATE
+            ) {
                 J::String(format!("{y:04}-{m:02}-{d:02}"))
             } else {
-                J::String(format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}{}", fraction(*us)))
+                J::String(format!(
+                    "{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}{}",
+                    fraction(*us)
+                ))
             }
         }
         MyValue::Time(neg, days, h, mi, s, us) => {
             let hours = u64::from(*days) * 24 + u64::from(*h);
-            J::String(format!("{}{hours:02}:{mi:02}:{s:02}{}", if *neg { "-" } else { "" }, fraction(*us)))
+            J::String(format!(
+                "{}{hours:02}:{mi:02}:{s:02}{}",
+                if *neg { "-" } else { "" },
+                fraction(*us)
+            ))
         }
         MyValue::Bytes(bytes) => bytes_to_json(bytes, t, flags, charset),
     }
 }
 
-fn bytes_to_json(bytes: &[u8], t: ColumnType, flags: ColumnFlags, charset: u16) -> serde_json::Value {
+fn bytes_to_json(
+    bytes: &[u8],
+    t: ColumnType,
+    flags: ColumnFlags,
+    charset: u16,
+) -> serde_json::Value {
     use serde_json::Value as J;
     let text = std::str::from_utf8(bytes).ok();
     if is_integer_type(t) {
@@ -713,7 +812,10 @@ fn bytes_to_json(bytes: &[u8], t: ColumnType, flags: ColumnFlags, charset: u16) 
     }
     match t {
         ColumnType::MYSQL_TYPE_FLOAT | ColumnType::MYSQL_TYPE_DOUBLE => {
-            if let Some(n) = text.and_then(|s| s.parse::<f64>().ok()).and_then(serde_json::Number::from_f64) {
+            if let Some(n) = text
+                .and_then(|s| s.parse::<f64>().ok())
+                .and_then(serde_json::Number::from_f64)
+            {
                 return J::Number(n);
             }
         }
@@ -796,7 +898,10 @@ fn json_size(v: &serde_json::Value) -> usize {
 
 /// Rewrite numbered placeholders (`?1`, `$1`) to MySQL's positional `?`, reordering the
 /// parameters. Quotes, backticks and comments are skipped. Mixing styles is rejected.
-pub fn bind_mysql_placeholders(sql: &str, params: &[serde_json::Value]) -> DbMcpResult<(String, Vec<serde_json::Value>)> {
+pub fn bind_mysql_placeholders(
+    sql: &str,
+    params: &[serde_json::Value],
+) -> DbMcpResult<(String, Vec<serde_json::Value>)> {
     let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
     let mut numbered: Vec<usize> = Vec::new();
@@ -842,7 +947,10 @@ pub fn bind_mysql_placeholders(sql: &str, params: &[serde_json::Value]) -> DbMcp
                 i += 2;
             }
             b'?' | b'$' => {
-                let prev_ident = i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_' || bytes[i - 1] == b'$');
+                let prev_ident = i > 0
+                    && (bytes[i - 1].is_ascii_alphanumeric()
+                        || bytes[i - 1] == b'_'
+                        || bytes[i - 1] == b'$');
                 let mut j = i + 1;
                 while j < bytes.len() && bytes[j].is_ascii_digit() {
                     j += 1;
@@ -878,7 +986,12 @@ pub fn bind_mysql_placeholders(sql: &str, params: &[serde_json::Value]) -> DbMcp
         let v = n
             .checked_sub(1)
             .and_then(|idx| params.get(idx))
-            .ok_or_else(|| DbMcpError::InvalidArgument(format!("placeholder {n} has no matching parameter ({} given)", params.len())))?;
+            .ok_or_else(|| {
+                DbMcpError::InvalidArgument(format!(
+                    "placeholder {n} has no matching parameter ({} given)",
+                    params.len()
+                ))
+            })?;
         bound.push(v.clone());
     }
     Ok((out, bound))
@@ -890,10 +1003,32 @@ pub fn bind_mysql_placeholders(sql: &str, params: &[serde_json::Value]) -> DbMcp
 
 /// Privileges that let an account change data, schema or server state.
 const WRITE_PRIVILEGES: &[&str] = &[
-    "ALL", "ALL PRIVILEGES", "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "INDEX",
-    "CREATE VIEW", "CREATE ROUTINE", "ALTER ROUTINE", "EXECUTE", "TRIGGER", "EVENT", "FILE",
-    "SUPER", "GRANT OPTION", "CREATE USER", "CREATE ROLE", "DROP ROLE", "RELOAD", "SHUTDOWN",
-    "CREATE TABLESPACE", "REFERENCES", "LOCK TABLES",
+    "ALL",
+    "ALL PRIVILEGES",
+    "INSERT",
+    "UPDATE",
+    "DELETE",
+    "CREATE",
+    "DROP",
+    "ALTER",
+    "INDEX",
+    "CREATE VIEW",
+    "CREATE ROUTINE",
+    "ALTER ROUTINE",
+    "EXECUTE",
+    "TRIGGER",
+    "EVENT",
+    "FILE",
+    "SUPER",
+    "GRANT OPTION",
+    "CREATE USER",
+    "CREATE ROLE",
+    "DROP ROLE",
+    "RELOAD",
+    "SHUTDOWN",
+    "CREATE TABLESPACE",
+    "REFERENCES",
+    "LOCK TABLES",
 ];
 
 /// What the account's `SHOW GRANTS` lines allow, for warnings and feature notes.
@@ -913,12 +1048,20 @@ pub fn summarize_grants(grants: &[String]) -> GrantSummary {
     let mut out = GrantSummary::default();
     for line in grants {
         let upper = line.trim().to_ascii_uppercase();
-        let Some(rest) = upper.strip_prefix("GRANT ") else { continue };
+        let Some(rest) = upper.strip_prefix("GRANT ") else {
+            continue;
+        };
         let Some((privs, after_on)) = rest.split_once(" ON ") else {
             out.role_grants = true;
             continue;
         };
-        let scope = after_on.split(" TO ").next().unwrap_or("").replace('`', "").trim().to_string();
+        let scope = after_on
+            .split(" TO ")
+            .next()
+            .unwrap_or("")
+            .replace('`', "")
+            .trim()
+            .to_string();
         let global = scope == "*.*";
         for raw in privs.split(',') {
             let p = raw.split('(').next().unwrap_or("").trim().to_string();
@@ -949,7 +1092,8 @@ pub fn summarize_grants(grants: &[String]) -> GrantSummary {
             }
         }
         if line.to_ascii_uppercase().contains("WITH GRANT OPTION") {
-            out.write_privileges.push(format!("GRANT OPTION ON {scope}"));
+            out.write_privileges
+                .push(format!("GRANT OPTION ON {scope}"));
         }
     }
     out
@@ -968,7 +1112,13 @@ impl LiveMySql {
 
     /// Read-only `check-connection` report. Never contains the DSN or the password.
     pub async fn check(&self) -> serde_json::Value {
-        let report = |can_connect: bool, version: serde_json::Value, select_1: bool, objects: serde_json::Value, perms: Vec<String>, can_write: serde_json::Value, warnings: Vec<String>| {
+        let report = |can_connect: bool,
+                      version: serde_json::Value,
+                      select_1: bool,
+                      objects: serde_json::Value,
+                      perms: Vec<String>,
+                      can_write: serde_json::Value,
+                      warnings: Vec<String>| {
             serde_json::json!({
                 "connection": self.connection_id,
                 "engine": "mysql",
@@ -985,11 +1135,24 @@ impl LiveMySql {
         let mut conn = match self.session(true, 10_000).await {
             Ok(c) => c,
             Err(e) => {
-                return report(false, serde_json::Value::Null, false, serde_json::Value::Null, Vec::new(), serde_json::Value::Null, vec![e.to_string()])
+                return report(
+                    false,
+                    serde_json::Value::Null,
+                    false,
+                    serde_json::Value::Null,
+                    Vec::new(),
+                    serde_json::Value::Null,
+                    vec![e.to_string()],
+                )
             }
         };
         let mut warnings = Vec::new();
-        let first = |rows: &[Vec<serde_json::Value>], i: usize| rows.first().and_then(|r| r.get(i)).cloned().unwrap_or(serde_json::Value::Null);
+        let first = |rows: &[Vec<serde_json::Value>], i: usize| {
+            rows.first()
+                .and_then(|r| r.get(i))
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        };
         let version = match self.query_json(&mut conn, "SELECT VERSION()", 5_000).await {
             Ok((_, rows)) => first(&rows, 0),
             Err(e) => {
@@ -1007,9 +1170,12 @@ impl LiveMySql {
             warnings.push("the session could not be switched to READ ONLY (SET SESSION transaction_read_only = 1)".to_string());
         }
         if first(&session, 1).is_null() {
-            warnings.push("the DSN names no database; unqualified table names will not resolve".to_string());
+            warnings.push(
+                "the DSN names no database; unqualified table names will not resolve".to_string(),
+            );
         }
-        let server_read_only = first(&session, 3) == serde_json::json!(1) || first(&session, 4) == serde_json::json!(1);
+        let server_read_only = first(&session, 3) == serde_json::json!(1)
+            || first(&session, 4) == serde_json::json!(1);
         let grants = match self.grants(&mut conn).await {
             Ok(g) => g,
             Err(e) => {
@@ -1029,7 +1195,11 @@ impl LiveMySql {
             .map(|(_, rows)| first(&rows, 0))
             .unwrap_or(serde_json::Value::Null);
         let digest_readable = self
-            .query_json(&mut conn, "SELECT 1 FROM performance_schema.events_statements_summary_by_digest LIMIT 1", 5_000)
+            .query_json(
+                &mut conn,
+                "SELECT 1 FROM performance_schema.events_statements_summary_by_digest LIMIT 1",
+                5_000,
+            )
             .await
             .is_ok();
         drop(conn);
@@ -1043,10 +1213,16 @@ impl LiveMySql {
             ));
         }
         if summary.role_grants {
-            warnings.push("role grants are present; effective privileges depend on the activated roles".to_string());
+            warnings.push(
+                "role grants are present; effective privileges depend on the activated roles"
+                    .to_string(),
+            );
         }
         if !summary.has_show_view {
-            warnings.push("SHOW VIEW is not granted: view definitions (lineage through views) are hidden".to_string());
+            warnings.push(
+                "SHOW VIEW is not granted: view definitions (lineage through views) are hidden"
+                    .to_string(),
+            );
         }
         if !summary.can_read_routine_definitions {
             warnings.push(format!(
@@ -1068,7 +1244,15 @@ impl LiveMySql {
                 warnings.push("EXPLAIN ANALYZE needs MySQL 8.0.18 or later".to_string());
             }
         }
-        report(true, version, select_1, object_count, grants, serde_json::json!(can_write), warnings)
+        report(
+            true,
+            version,
+            select_1,
+            object_count,
+            grants,
+            serde_json::json!(can_write),
+            warnings,
+        )
     }
 }
 
@@ -1089,7 +1273,10 @@ mod tests {
         assert!(!format!("{d:?}").contains("p@ss"));
 
         let d = parse_mysql_dsn("m", "mariadb://u:p@db.local:3307?connect_timeout=500").unwrap();
-        assert_eq!((d.port, d.database.clone(), d.connect_timeout_ms), (3307, None, 500));
+        assert_eq!(
+            (d.port, d.database.clone(), d.connect_timeout_ms),
+            (3307, None, 500)
+        );
         assert_eq!(d.address(), "db.local:3307");
     }
 
@@ -1111,7 +1298,12 @@ mod tests {
 
     #[tokio::test]
     async fn unreachable_server_fails_closed_with_next_action() {
-        let live = LiveMySql::new("m", "mysql://u:topsecret@127.0.0.1:1/db?connect_timeout=500", true).unwrap();
+        let live = LiveMySql::new(
+            "m",
+            "mysql://u:topsecret@127.0.0.1:1/db?connect_timeout=500",
+            true,
+        )
+        .unwrap();
         let e = live.checkout().await.unwrap_err();
         assert_eq!(e.code(), CODE_CONNECTION_UNAVAILABLE);
         assert!(e.next_action().unwrap().contains("check-connection"));
@@ -1126,31 +1318,143 @@ mod tests {
         let f = ColumnFlags::empty();
         let utf8 = 255u16;
         let j = |v: MyValue, t: ColumnType, cs: u16| mysql_value_to_json(&v, t, f, cs);
-        assert_eq!(j(MyValue::Bytes(b"-7".to_vec()), ColumnType::MYSQL_TYPE_TINY, 63), serde_json::json!(-7));
-        assert_eq!(j(MyValue::Bytes(b"18446744073709551615".to_vec()), ColumnType::MYSQL_TYPE_LONGLONG, 63), serde_json::json!(u64::MAX));
-        assert_eq!(j(MyValue::Bytes(b"12345.678900".to_vec()), ColumnType::MYSQL_TYPE_NEWDECIMAL, 63), serde_json::json!("12345.678900"));
-        assert_eq!(j(MyValue::Bytes(b"3.5".to_vec()), ColumnType::MYSQL_TYPE_DOUBLE, 63), serde_json::json!(3.5));
-        assert_eq!(j(MyValue::Bytes(b"2025-01-03 10:00:00.123".to_vec()), ColumnType::MYSQL_TYPE_DATETIME, 63), serde_json::json!("2025-01-03T10:00:00.123"));
-        assert_eq!(j(MyValue::Date(2025, 1, 3, 10, 0, 0, 123000), ColumnType::MYSQL_TYPE_DATETIME, 63), serde_json::json!("2025-01-03T10:00:00.123000"));
-        assert_eq!(j(MyValue::Date(2025, 1, 3, 0, 0, 0, 0), ColumnType::MYSQL_TYPE_DATE, 63), serde_json::json!("2025-01-03"));
-        assert_eq!(j(MyValue::Time(true, 1, 2, 3, 4, 0), ColumnType::MYSQL_TYPE_TIME, 63), serde_json::json!("-26:03:04"));
-        assert_eq!(j(MyValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef]), ColumnType::MYSQL_TYPE_VAR_STRING, 63), serde_json::json!("0xdeadbeef"));
-        assert_eq!(j(MyValue::Bytes(vec![0b1010_0101]), ColumnType::MYSQL_TYPE_BIT, 63), serde_json::json!(165));
-        assert_eq!(j(MyValue::Bytes("héllo".as_bytes().to_vec()), ColumnType::MYSQL_TYPE_BLOB, utf8), serde_json::json!("héllo"));
-        assert_eq!(j(MyValue::Bytes(vec![0xff, 0xfe]), ColumnType::MYSQL_TYPE_VAR_STRING, utf8), serde_json::json!("0xfffe"));
-        assert_eq!(j(MyValue::NULL, ColumnType::MYSQL_TYPE_VAR_STRING, utf8), serde_json::Value::Null);
-        assert_eq!(j(MyValue::UInt(7), ColumnType::MYSQL_TYPE_LONGLONG, 63), serde_json::json!(7));
-        assert_eq!(mysql_column_type_name(ColumnType::MYSQL_TYPE_LONGLONG, ColumnFlags::UNSIGNED_FLAG, 63), "bigint unsigned");
-        assert_eq!(mysql_column_type_name(ColumnType::MYSQL_TYPE_BLOB, f, utf8), "text");
-        assert_eq!(mysql_column_type_name(ColumnType::MYSQL_TYPE_STRING, ColumnFlags::ENUM_FLAG, utf8), "enum");
+        assert_eq!(
+            j(
+                MyValue::Bytes(b"-7".to_vec()),
+                ColumnType::MYSQL_TYPE_TINY,
+                63
+            ),
+            serde_json::json!(-7)
+        );
+        assert_eq!(
+            j(
+                MyValue::Bytes(b"18446744073709551615".to_vec()),
+                ColumnType::MYSQL_TYPE_LONGLONG,
+                63
+            ),
+            serde_json::json!(u64::MAX)
+        );
+        assert_eq!(
+            j(
+                MyValue::Bytes(b"12345.678900".to_vec()),
+                ColumnType::MYSQL_TYPE_NEWDECIMAL,
+                63
+            ),
+            serde_json::json!("12345.678900")
+        );
+        assert_eq!(
+            j(
+                MyValue::Bytes(b"3.5".to_vec()),
+                ColumnType::MYSQL_TYPE_DOUBLE,
+                63
+            ),
+            serde_json::json!(3.5)
+        );
+        assert_eq!(
+            j(
+                MyValue::Bytes(b"2025-01-03 10:00:00.123".to_vec()),
+                ColumnType::MYSQL_TYPE_DATETIME,
+                63
+            ),
+            serde_json::json!("2025-01-03T10:00:00.123")
+        );
+        assert_eq!(
+            j(
+                MyValue::Date(2025, 1, 3, 10, 0, 0, 123000),
+                ColumnType::MYSQL_TYPE_DATETIME,
+                63
+            ),
+            serde_json::json!("2025-01-03T10:00:00.123000")
+        );
+        assert_eq!(
+            j(
+                MyValue::Date(2025, 1, 3, 0, 0, 0, 0),
+                ColumnType::MYSQL_TYPE_DATE,
+                63
+            ),
+            serde_json::json!("2025-01-03")
+        );
+        assert_eq!(
+            j(
+                MyValue::Time(true, 1, 2, 3, 4, 0),
+                ColumnType::MYSQL_TYPE_TIME,
+                63
+            ),
+            serde_json::json!("-26:03:04")
+        );
+        assert_eq!(
+            j(
+                MyValue::Bytes(vec![0xde, 0xad, 0xbe, 0xef]),
+                ColumnType::MYSQL_TYPE_VAR_STRING,
+                63
+            ),
+            serde_json::json!("0xdeadbeef")
+        );
+        assert_eq!(
+            j(
+                MyValue::Bytes(vec![0b1010_0101]),
+                ColumnType::MYSQL_TYPE_BIT,
+                63
+            ),
+            serde_json::json!(165)
+        );
+        assert_eq!(
+            j(
+                MyValue::Bytes("héllo".as_bytes().to_vec()),
+                ColumnType::MYSQL_TYPE_BLOB,
+                utf8
+            ),
+            serde_json::json!("héllo")
+        );
+        assert_eq!(
+            j(
+                MyValue::Bytes(vec![0xff, 0xfe]),
+                ColumnType::MYSQL_TYPE_VAR_STRING,
+                utf8
+            ),
+            serde_json::json!("0xfffe")
+        );
+        assert_eq!(
+            j(MyValue::NULL, ColumnType::MYSQL_TYPE_VAR_STRING, utf8),
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            j(MyValue::UInt(7), ColumnType::MYSQL_TYPE_LONGLONG, 63),
+            serde_json::json!(7)
+        );
+        assert_eq!(
+            mysql_column_type_name(
+                ColumnType::MYSQL_TYPE_LONGLONG,
+                ColumnFlags::UNSIGNED_FLAG,
+                63
+            ),
+            "bigint unsigned"
+        );
+        assert_eq!(
+            mysql_column_type_name(ColumnType::MYSQL_TYPE_BLOB, f, utf8),
+            "text"
+        );
+        assert_eq!(
+            mysql_column_type_name(ColumnType::MYSQL_TYPE_STRING, ColumnFlags::ENUM_FLAG, utf8),
+            "enum"
+        );
     }
 
     #[test]
     fn numbered_placeholders_are_rewritten() {
         let p = vec![serde_json::json!(1), serde_json::json!("x")];
-        let (sql, bound) = bind_mysql_placeholders("SELECT ?2, ?1, '?3', `$1` FROM t WHERE a = $1 -- ?9", &p).unwrap();
+        let (sql, bound) =
+            bind_mysql_placeholders("SELECT ?2, ?1, '?3', `$1` FROM t WHERE a = $1 -- ?9", &p)
+                .unwrap();
         assert_eq!(sql, "SELECT ?, ?, '?3', `$1` FROM t WHERE a = ? -- ?9");
-        assert_eq!(bound, vec![serde_json::json!("x"), serde_json::json!(1), serde_json::json!(1)]);
+        assert_eq!(
+            bound,
+            vec![
+                serde_json::json!("x"),
+                serde_json::json!(1),
+                serde_json::json!(1)
+            ]
+        );
         let (sql, bound) = bind_mysql_placeholders("SELECT ? , ?", &p).unwrap();
         assert_eq!((sql.as_str(), bound.len()), ("SELECT ? , ?", 2));
         assert!(bind_mysql_placeholders("SELECT ?, ?1", &p).is_err());
@@ -1164,22 +1468,47 @@ mod tests {
             "GRANT SELECT, SHOW VIEW ON `appdb`.* TO `dbmcp_ro`@`%`".to_string(),
         ]);
         assert!(ro.write_privileges.is_empty());
-        assert!(ro.has_show_view && !ro.has_process && !ro.can_read_routine_definitions && !ro.has_performance_schema);
+        assert!(
+            ro.has_show_view
+                && !ro.has_process
+                && !ro.can_read_routine_definitions
+                && !ro.has_performance_schema
+        );
         let diag = summarize_grants(&[
             "GRANT PROCESS ON *.* TO `d`@`%`".to_string(),
             "GRANT SHOW_ROUTINE ON *.* TO `d`@`%`".to_string(),
             "GRANT SELECT ON `performance_schema`.* TO `d`@`%`".to_string(),
         ]);
-        assert!(diag.write_privileges.is_empty() && diag.has_process && diag.can_read_routine_definitions && diag.has_performance_schema);
-        let rw = summarize_grants(&["GRANT SELECT, INSERT, UPDATE, DELETE ON `appdb`.* TO `rw`@`%`".to_string()]);
-        assert_eq!(rw.write_privileges, vec!["INSERT ON APPDB.*", "UPDATE ON APPDB.*", "DELETE ON APPDB.*"]);
+        assert!(
+            diag.write_privileges.is_empty()
+                && diag.has_process
+                && diag.can_read_routine_definitions
+                && diag.has_performance_schema
+        );
+        let rw = summarize_grants(&[
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON `appdb`.* TO `rw`@`%`".to_string(),
+        ]);
+        assert_eq!(
+            rw.write_privileges,
+            vec![
+                "INSERT ON APPDB.*",
+                "UPDATE ON APPDB.*",
+                "DELETE ON APPDB.*"
+            ]
+        );
         assert!(summarize_grants(&["GRANT `app_reader`@`%` TO `u`@`%`".to_string()]).role_grants);
     }
 
     #[test]
     fn session_setup_statement() {
-        assert_eq!(build_mysql_session_setup(true, 1500), "SET SESSION transaction_read_only = 1, SESSION max_execution_time = 1500");
-        assert_eq!(build_mysql_session_setup(false, 10), "SET SESSION transaction_read_only = 0, SESSION max_execution_time = 10");
+        assert_eq!(
+            build_mysql_session_setup(true, 1500),
+            "SET SESSION transaction_read_only = 1, SESSION max_execution_time = 1500"
+        );
+        assert_eq!(
+            build_mysql_session_setup(false, 10),
+            "SET SESSION transaction_read_only = 0, SESSION max_execution_time = 10"
+        );
     }
 
     // ---- live integration tests (skipped unless DB_MCP_MYSQL_TEST_DSN* point at the fixture) ----
@@ -1188,28 +1517,52 @@ mod tests {
         match std::env::var(var) {
             Ok(v) if !v.trim().is_empty() => Some(v),
             _ => {
-                eprintln!("skipped: {var} not set (run `eval \"$(bash scripts/live-db-up.sh mysql)\"`)");
+                eprintln!(
+                    "skipped: {var} not set (run `eval \"$(bash scripts/live-db-up.sh mysql)\"`)"
+                );
                 None
             }
         }
     }
 
     fn query(sql: &str, params: Vec<serde_json::Value>) -> AuthorizedQuery {
-        AuthorizedQuery::new_read("req_live", "m", CallerIdentity::local_agent("t"), sql, params, &ExecutionLimits::default())
+        AuthorizedQuery::new_read(
+            "req_live",
+            "m",
+            CallerIdentity::local_agent("t"),
+            sql,
+            params,
+            &ExecutionLimits::default(),
+        )
     }
 
     #[tokio::test]
     async fn live_select_types_params_and_truncation() {
-        let Some(dsn) = env_dsn("DB_MCP_MYSQL_TEST_DSN") else { return };
+        let Some(dsn) = env_dsn("DB_MCP_MYSQL_TEST_DSN") else {
+            return;
+        };
         let live = LiveMySql::new("m", &dsn, true).unwrap();
-        let r = live.execute(&query("SELECT * FROM type_samples WHERE id = ?1", vec![serde_json::json!(1)]), true, 5_000).await.unwrap();
+        let r = live
+            .execute(
+                &query(
+                    "SELECT * FROM type_samples WHERE id = ?1",
+                    vec![serde_json::json!(1)],
+                ),
+                true,
+                5_000,
+            )
+            .await
+            .unwrap();
         let row = &r.rows[0];
         let col = |n: &str| r.columns.iter().position(|c| c.name == n).unwrap();
         assert_eq!(row[col("i_tiny")], serde_json::json!(-7));
         assert_eq!(row[col("i_big_u")], serde_json::json!(u64::MAX));
         assert_eq!(row[col("d_dec")], serde_json::json!("12345.678900"));
         assert_eq!(row[col("f_double")], serde_json::json!(3.5));
-        assert_eq!(row[col("dt")], serde_json::json!("2025-01-03T10:00:00.123000"));
+        assert_eq!(
+            row[col("dt")],
+            serde_json::json!("2025-01-03T10:00:00.123000")
+        );
         assert_eq!(row[col("d")], serde_json::json!("2025-01-03"));
         assert_eq!(row[col("t")], serde_json::json!("13:14:15"));
         assert_eq!(row[col("y")], serde_json::json!(2025));
@@ -1225,24 +1578,49 @@ mod tests {
         let r = live.execute(&q, true, 5_000).await.unwrap();
         assert!(r.truncated && r.rows.len() == 5, "{r:?}");
         // The pool connection is reusable after a truncated stream.
-        let r = live.execute(&query("SELECT COUNT(*) AS c FROM numbers", vec![]), true, 5_000).await.unwrap();
+        let r = live
+            .execute(
+                &query("SELECT COUNT(*) AS c FROM numbers", vec![]),
+                true,
+                5_000,
+            )
+            .await
+            .unwrap();
         assert_eq!(r.rows[0][0], serde_json::json!(1000));
     }
 
     #[tokio::test]
     async fn live_read_only_session_refuses_writes_even_for_a_writer() {
-        let Some(dsn) = env_dsn("DB_MCP_MYSQL_TEST_DSN_RW") else { return };
+        let Some(dsn) = env_dsn("DB_MCP_MYSQL_TEST_DSN_RW") else {
+            return;
+        };
         let live = LiveMySql::new("m", &dsn, true).unwrap();
         let e = live
-            .execute(&query("INSERT INTO event_log_nopk (event_time, message) VALUES (NOW(), 'x')", vec![]), true, 5_000)
+            .execute(
+                &query(
+                    "INSERT INTO event_log_nopk (event_time, message) VALUES (NOW(), 'x')",
+                    vec![],
+                ),
+                true,
+                5_000,
+            )
             .await
             .unwrap_err();
         assert_eq!(e.code(), CODE_SERVER_READ_ONLY, "{e}");
-        let Some(ro) = env_dsn("DB_MCP_MYSQL_TEST_DSN") else { return };
+        let Some(ro) = env_dsn("DB_MCP_MYSQL_TEST_DSN") else {
+            return;
+        };
         // A read-only login is refused by the server's privilege system even without READ ONLY.
         let live = LiveMySql::new("m", &ro, false).unwrap();
         let e = live
-            .execute(&query("INSERT INTO event_log_nopk (event_time, message) VALUES (NOW(), 'x')", vec![]), false, 5_000)
+            .execute(
+                &query(
+                    "INSERT INTO event_log_nopk (event_time, message) VALUES (NOW(), 'x')",
+                    vec![],
+                ),
+                false,
+                5_000,
+            )
             .await
             .unwrap_err();
         assert_eq!(e.code(), CODE_DATABASE_PERMISSION_DENIED, "{e}");
@@ -1250,11 +1628,16 @@ mod tests {
 
     #[tokio::test]
     async fn live_timeout_and_cancel() {
-        let Some(dsn) = env_dsn("DB_MCP_MYSQL_TEST_DSN") else { return };
+        let Some(dsn) = env_dsn("DB_MCP_MYSQL_TEST_DSN") else {
+            return;
+        };
         let live = std::sync::Arc::new(LiveMySql::new("m", &dsn, true).unwrap());
         let slow = "SELECT SUM(a.n + b.n + c.n) FROM numbers a, numbers b, numbers c";
         let started = Instant::now();
-        let e = live.execute(&query(slow, vec![]), true, 800).await.unwrap_err();
+        let e = live
+            .execute(&query(slow, vec![]), true, 800)
+            .await
+            .unwrap_err();
         assert_eq!(e.code(), "EXECUTION_TIMEOUT", "{e}");
         assert!(started.elapsed() < Duration::from_secs(5));
 
@@ -1279,9 +1662,15 @@ mod tests {
 
     #[tokio::test]
     async fn live_check_connection_reports_permissions() {
-        let Some(dsn) = env_dsn("DB_MCP_MYSQL_TEST_DSN") else { return };
+        let Some(dsn) = env_dsn("DB_MCP_MYSQL_TEST_DSN") else {
+            return;
+        };
         let report = LiveMySql::new("m", &dsn, true).unwrap().check().await;
-        let pw = parse_mysql_dsn("m", &dsn).unwrap().password.expose_secret().to_string();
+        let pw = parse_mysql_dsn("m", &dsn)
+            .unwrap()
+            .password
+            .expose_secret()
+            .to_string();
         assert!(!report.to_string().contains(&pw));
         assert_eq!(report["can_connect"], serde_json::json!(true));
         assert_eq!(report["select_1"], serde_json::json!(true));
@@ -1296,4 +1685,3 @@ mod tests {
         }
     }
 }
-

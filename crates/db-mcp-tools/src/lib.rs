@@ -12,11 +12,11 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-pub use db_mcp_core::{NamedToolParamSpec, NamedToolParamType, NamedToolSpec};
 use db_mcp_core::{
     AuthorizedQuery, CallerIdentity, DatabaseAdapter, DatabaseEngine, DbMcpError, DbMcpResult,
     ExecutionId, ExecutionLimits, QueryResult, SqlStatementClass,
 };
+pub use db_mcp_core::{NamedToolParamSpec, NamedToolParamType, NamedToolSpec};
 use db_mcp_sql::{hash_sql, normalize_sql, parse_and_analyze_sql};
 use serde::{Deserialize, Serialize};
 
@@ -24,8 +24,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 enum NamedToolsConfigEnvelope {
-    Wrapped { tools: Vec<NamedToolSpec> },
-    MapWrapped { tools: BTreeMap<String, NamedToolSpec> },
+    Wrapped {
+        tools: Vec<NamedToolSpec>,
+    },
+    MapWrapped {
+        tools: BTreeMap<String, NamedToolSpec>,
+    },
     List(Vec<NamedToolSpec>),
 }
 
@@ -80,10 +84,9 @@ impl NamedToolInvocation {
     ) -> DbMcpResult<Self> {
         let map = match json_args {
             serde_json::Value::Null => BTreeMap::new(),
-            serde_json::Value::Object(obj) => obj
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
+            serde_json::Value::Object(obj) => {
+                obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+            }
             _ => {
                 return Err(DbMcpError::InvalidArgument(
                     "Named tool arguments must be a JSON object".to_string(),
@@ -467,7 +470,11 @@ fn placeholder_positions(sql: &str) -> (std::collections::BTreeSet<usize>, usize
                     end += 1;
                 }
                 if end > start {
-                    if let Ok(n) = chars[start..end].iter().collect::<String>().parse::<usize>() {
+                    if let Ok(n) = chars[start..end]
+                        .iter()
+                        .collect::<String>()
+                        .parse::<usize>()
+                    {
                         numbered.insert(n);
                     }
                     i = end;

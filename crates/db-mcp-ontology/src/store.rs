@@ -92,7 +92,9 @@ pub struct OntologyStore {
 
 impl std::fmt::Debug for OntologyStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OntologyStore").field("path", &self.path).finish()
+        f.debug_struct("OntologyStore")
+            .field("path", &self.path)
+            .finish()
     }
 }
 
@@ -124,7 +126,8 @@ impl OntologyStore {
     fn init(conn: Connection, path: Option<String>) -> DbMcpResult<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| storage_err("busy_timeout", e))?;
-        conn.execute_batch(SCHEMA).map_err(|e| storage_err("schema", e))?;
+        conn.execute_batch(SCHEMA)
+            .map_err(|e| storage_err("schema", e))?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             path,
@@ -208,7 +211,11 @@ impl OntologyStore {
         if !from.can_transition_to(to) {
             return Err(DbMcpError::PolicyDenied {
                 code: "ONTOLOGY_INVALID_TRANSITION".to_string(),
-                message: format!("Definition '{def_id}' v{version} cannot move from {} to {}", from.as_str(), to.as_str()),
+                message: format!(
+                    "Definition '{def_id}' v{version} cannot move from {} to {}",
+                    from.as_str(),
+                    to.as_str()
+                ),
                 next_action: None,
             });
         }
@@ -228,7 +235,8 @@ impl OntologyStore {
         transitions: &[(String, u32, DefinitionStatus, DefinitionStatus)],
         revision: &OntologyRevision,
     ) -> DbMcpResult<()> {
-        let revision_seq = i64::try_from(revision.seq).map_err(|e| storage_err("revision seq", e))?;
+        let revision_seq =
+            i64::try_from(revision.seq).map_err(|e| storage_err("revision seq", e))?;
         let rev_json = encode(revision)?;
         self.with_conn(|conn| {
             let tx = conn
@@ -274,7 +282,13 @@ impl OntologyStore {
         })
     }
 
-    pub fn get_version(&self, tenant: &str, connection: &str, def_id: &str, version: u32) -> DbMcpResult<Option<Definition>> {
+    pub fn get_version(
+        &self,
+        tenant: &str,
+        connection: &str,
+        def_id: &str,
+        version: u32,
+    ) -> DbMcpResult<Option<Definition>> {
         self.with_conn(|conn| {
             let json: Option<String> = conn
                 .query_row(
@@ -289,14 +303,24 @@ impl OntologyStore {
     }
 
     /// All versions of one definition, oldest first.
-    pub fn versions(&self, tenant: &str, connection: &str, def_id: &str) -> DbMcpResult<Vec<Definition>> {
+    pub fn versions(
+        &self,
+        tenant: &str,
+        connection: &str,
+        def_id: &str,
+    ) -> DbMcpResult<Vec<Definition>> {
         self.query_defs(
             "SELECT definition_json FROM ontology_definitions WHERE tenant_id=?1 AND connection=?2 AND def_id=?3 ORDER BY version",
             params![tenant, connection, def_id],
         )
     }
 
-    pub fn latest(&self, tenant: &str, connection: &str, def_id: &str) -> DbMcpResult<Option<Definition>> {
+    pub fn latest(
+        &self,
+        tenant: &str,
+        connection: &str,
+        def_id: &str,
+    ) -> DbMcpResult<Option<Definition>> {
         Ok(self.versions(tenant, connection, def_id)?.pop())
     }
 
@@ -318,7 +342,12 @@ impl OntologyStore {
     }
 
     /// Versions currently in `status` (any version, not only latest).
-    pub fn by_status(&self, tenant: &str, connection: &str, status: DefinitionStatus) -> DbMcpResult<Vec<Definition>> {
+    pub fn by_status(
+        &self,
+        tenant: &str,
+        connection: &str,
+        status: DefinitionStatus,
+    ) -> DbMcpResult<Vec<Definition>> {
         self.query_defs(
             "SELECT definition_json FROM ontology_definitions WHERE tenant_id=?1 AND connection=?2 AND status=?3 ORDER BY def_id, version",
             params![tenant, connection, status.as_str()],
@@ -392,7 +421,12 @@ impl OntologyStore {
         })
     }
 
-    pub fn certifications(&self, tenant: &str, connection: &str, def_id: &str) -> DbMcpResult<Vec<Certification>> {
+    pub fn certifications(
+        &self,
+        tenant: &str,
+        connection: &str,
+        def_id: &str,
+    ) -> DbMcpResult<Vec<Certification>> {
         self.with_conn(|conn| {
             let mut stmt = conn
                 .prepare("SELECT cert_json FROM ontology_certifications WHERE tenant_id=?1 AND connection=?2 AND def_id=?3 ORDER BY created_at, version")
@@ -404,7 +438,11 @@ impl OntologyStore {
         })
     }
 
-    pub fn latest_revision(&self, tenant: &str, connection: &str) -> DbMcpResult<Option<OntologyRevision>> {
+    pub fn latest_revision(
+        &self,
+        tenant: &str,
+        connection: &str,
+    ) -> DbMcpResult<Option<OntologyRevision>> {
         self.with_conn(|conn| {
             let json: Option<String> = conn
                 .query_row(
@@ -465,7 +503,11 @@ impl OntologyStore {
     }
 
     /// Count of latest-version definitions by `(kind, status)`.
-    pub fn stats(&self, tenant: &str, connection: &str) -> DbMcpResult<BTreeMap<String, BTreeMap<String, u64>>> {
+    pub fn stats(
+        &self,
+        tenant: &str,
+        connection: &str,
+    ) -> DbMcpResult<BTreeMap<String, BTreeMap<String, u64>>> {
         let mut out: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
         for def in self.latest_all(tenant, connection)? {
             *out.entry(def.kind.as_str().to_string())
@@ -489,7 +531,11 @@ impl OntologyStore {
         })
     }
 
-    pub fn kinds_present(&self, tenant: &str, connection: &str) -> DbMcpResult<Vec<DefinitionKind>> {
+    pub fn kinds_present(
+        &self,
+        tenant: &str,
+        connection: &str,
+    ) -> DbMcpResult<Vec<DefinitionKind>> {
         let mut kinds: Vec<DefinitionKind> = self
             .latest_all(tenant, connection)?
             .into_iter()
@@ -513,7 +559,11 @@ fn transition_in_tx(
     if !from.can_transition_to(to) {
         return Err(DbMcpError::PolicyDenied {
             code: "ONTOLOGY_INVALID_TRANSITION".to_string(),
-            message: format!("Definition '{def_id}' v{version} cannot move from {} to {}", from.as_str(), to.as_str()),
+            message: format!(
+                "Definition '{def_id}' v{version} cannot move from {} to {}",
+                from.as_str(),
+                to.as_str()
+            ),
             next_action: None,
         });
     }
@@ -522,7 +572,15 @@ fn transition_in_tx(
         .execute(
             "UPDATE ontology_definitions SET status=?1, updated_at=?2
              WHERE tenant_id=?3 AND connection=?4 AND def_id=?5 AND version=?6 AND status=?7",
-            params![to.as_str(), now.to_rfc3339(), tenant, connection, def_id, version, from.as_str()],
+            params![
+                to.as_str(),
+                now.to_rfc3339(),
+                tenant,
+                connection,
+                def_id,
+                version,
+                from.as_str()
+            ],
         )
         .map_err(|e| storage_err("transition", e))?;
     if affected != 1 {

@@ -7,7 +7,9 @@
 
 use std::collections::BTreeMap;
 
-use db_mcp_core::{CatalogObject, CatalogObjectType, ColumnSpec, DbMcpResult, ForeignKeySpec, IndexSpec};
+use db_mcp_core::{
+    CatalogObject, CatalogObjectType, ColumnSpec, DbMcpResult, ForeignKeySpec, IndexSpec,
+};
 use serde_json::Value;
 
 use crate::{FetchedRows, SqlServerAdapter};
@@ -44,12 +46,15 @@ pub const FOREIGN_KEYS_SQL: &str = "SELECT /* db-mcp:internal */ fk.parent_objec
     JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id \
     ORDER BY fk.parent_object_id, fk.name, fkc.constraint_column_id";
 
-pub const MODULES_SQL: &str = "SELECT /* db-mcp:internal */ m.object_id, m.definition FROM sys.sql_modules m";
+pub const MODULES_SQL: &str =
+    "SELECT /* db-mcp:internal */ m.object_id, m.definition FROM sys.sql_modules m";
 
-pub const ROWCOUNT_SQL: &str = "SELECT /* db-mcp:internal */ p.object_id, SUM(p.rows) AS row_count FROM sys.partitions p \
+pub const ROWCOUNT_SQL: &str =
+    "SELECT /* db-mcp:internal */ p.object_id, SUM(p.rows) AS row_count FROM sys.partitions p \
     WHERE p.index_id IN (0, 1) GROUP BY p.object_id";
 
-pub const SIZE_SQL: &str = "SELECT /* db-mcp:internal */ ps.object_id, SUM(ps.used_page_count) * 8192 AS used_bytes \
+pub const SIZE_SQL: &str =
+    "SELECT /* db-mcp:internal */ ps.object_id, SUM(ps.used_page_count) * 8192 AS used_bytes \
     FROM sys.dm_db_partition_stats ps GROUP BY ps.object_id";
 
 fn int(v: &Value) -> i64 {
@@ -145,17 +150,32 @@ pub fn build_catalog(rows: &CatalogRows) -> Vec<CatalogObject> {
     let modules: BTreeMap<i64, String> = rows
         .modules
         .as_ref()
-        .map(|m| m.rows.iter().filter_map(|r| opt_text(&r[1]).map(|d| (int(&r[0]), d))).collect())
+        .map(|m| {
+            m.rows
+                .iter()
+                .filter_map(|r| opt_text(&r[1]).map(|d| (int(&r[0]), d)))
+                .collect()
+        })
         .unwrap_or_default();
     let counts: BTreeMap<i64, u64> = rows
         .row_counts
         .as_ref()
-        .map(|m| m.rows.iter().map(|r| (int(&r[0]), int(&r[1]).max(0) as u64)).collect())
+        .map(|m| {
+            m.rows
+                .iter()
+                .map(|r| (int(&r[0]), int(&r[1]).max(0) as u64))
+                .collect()
+        })
         .unwrap_or_default();
     let sizes: BTreeMap<i64, u64> = rows
         .sizes
         .as_ref()
-        .map(|m| m.rows.iter().map(|r| (int(&r[0]), int(&r[1]).max(0) as u64)).collect())
+        .map(|m| {
+            m.rows
+                .iter()
+                .map(|r| (int(&r[0]), int(&r[1]).max(0) as u64))
+                .collect()
+        })
         .unwrap_or_default();
 
     let mut names: BTreeMap<i64, (String, String)> = BTreeMap::new();
@@ -165,7 +185,9 @@ pub fn build_catalog(rows: &CatalogRows) -> Vec<CatalogObject> {
         let schema = text(&r[1]);
         let name = text(&r[2]);
         names.insert(id, (schema.clone(), name.clone()));
-        let Some(ty) = object_type(text(&r[3]).trim()) else { continue };
+        let Some(ty) = object_type(text(&r[3]).trim()) else {
+            continue;
+        };
         objects.insert(
             id,
             CatalogObject {
@@ -173,8 +195,16 @@ pub fn build_catalog(rows: &CatalogRows) -> Vec<CatalogObject> {
                 name,
                 object_type: ty,
                 comment: opt_text(&r[4]),
-                estimated_rows: if ty == CatalogObjectType::Table { counts.get(&id).copied() } else { None },
-                size_bytes: if ty == CatalogObjectType::Table { sizes.get(&id).copied() } else { None },
+                estimated_rows: if ty == CatalogObjectType::Table {
+                    counts.get(&id).copied()
+                } else {
+                    None
+                },
+                size_bytes: if ty == CatalogObjectType::Table {
+                    sizes.get(&id).copied()
+                } else {
+                    None
+                },
                 columns: Vec::new(),
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
@@ -202,7 +232,9 @@ pub fn build_catalog(rows: &CatalogRows) -> Vec<CatalogObject> {
     let mut idx: BTreeMap<(i64, i64), (IndexSpec, bool)> = BTreeMap::new();
     for r in &rows.indexes.rows {
         let id = int(&r[0]);
-        let Some(obj) = objects.get(&id) else { continue };
+        let Some(obj) = objects.get(&id) else {
+            continue;
+        };
         let key = (id, int(&r[2]));
         let entry = idx.entry(key).or_insert_with(|| {
             (
@@ -233,19 +265,35 @@ pub fn build_catalog(rows: &CatalogRows) -> Vec<CatalogObject> {
                 }
             }
             let unique = if spec.unique { "UNIQUE " } else { "" };
-            let kind = spec.index_type.clone().unwrap_or_default().to_ascii_uppercase();
-            let kind = if kind.contains("NONCLUSTERED") { "NONCLUSTERED " } else if kind.contains("CLUSTERED") { "CLUSTERED " } else { "" };
+            let kind = spec
+                .index_type
+                .clone()
+                .unwrap_or_default()
+                .to_ascii_uppercase();
+            let kind = if kind.contains("NONCLUSTERED") {
+                "NONCLUSTERED "
+            } else if kind.contains("CLUSTERED") {
+                "CLUSTERED "
+            } else {
+                ""
+            };
             if !spec.primary {
                 spec.definition = Some(format!(
                     "CREATE {unique}{kind}INDEX {} ON {} ({}){};",
                     spec.name,
                     spec.table_name,
                     spec.columns.join(", "),
-                    spec.predicate.as_ref().map(|p| format!(" WHERE {p}")).unwrap_or_default()
+                    spec.predicate
+                        .as_ref()
+                        .map(|p| format!(" WHERE {p}"))
+                        .unwrap_or_default()
                 ));
             }
             if disabled {
-                spec.index_type = Some(format!("{} (disabled)", spec.index_type.clone().unwrap_or_default()));
+                spec.index_type = Some(format!(
+                    "{} (disabled)",
+                    spec.index_type.clone().unwrap_or_default()
+                ));
             }
             obj.indexes.push(spec);
         }
@@ -263,14 +311,16 @@ pub fn build_catalog(rows: &CatalogRows) -> Vec<CatalogObject> {
             let a = text(v).replace('_', " ");
             (!a.is_empty() && a != "NO ACTION").then_some(a)
         };
-        let fk = fks.entry((id, name.clone())).or_insert_with(|| ForeignKeySpec {
-            name: Some(name.clone()),
-            columns: Vec::new(),
-            referenced_table: format!("{}.{}", text(&r[4]), text(&r[5])),
-            referenced_columns: Vec::new(),
-            on_delete: action(&r[7]),
-            on_update: action(&r[8]),
-        });
+        let fk = fks
+            .entry((id, name.clone()))
+            .or_insert_with(|| ForeignKeySpec {
+                name: Some(name.clone()),
+                columns: Vec::new(),
+                referenced_table: format!("{}.{}", text(&r[4]), text(&r[5])),
+                referenced_columns: Vec::new(),
+                on_delete: action(&r[7]),
+                on_update: action(&r[8]),
+            });
         fk.columns.push(text(&r[3]));
         fk.referenced_columns.push(text(&r[6]));
     }
@@ -285,7 +335,9 @@ pub fn build_catalog(rows: &CatalogRows) -> Vec<CatalogObject> {
 
 /// Load the catalog of the current database. Optional sources (module definitions, sizes)
 /// degrade to warnings instead of failing.
-pub async fn load_catalog(adapter: &SqlServerAdapter) -> DbMcpResult<(Vec<CatalogObject>, Vec<String>)> {
+pub async fn load_catalog(
+    adapter: &SqlServerAdapter,
+) -> DbMcpResult<(Vec<CatalogObject>, Vec<String>)> {
     let cap = 200_000;
     let mut warnings = Vec::new();
     let mut rows = CatalogRows {
@@ -298,7 +350,11 @@ pub async fn load_catalog(adapter: &SqlServerAdapter) -> DbMcpResult<(Vec<Catalo
     rows.modules = adapter.query_rows(MODULES_SQL, cap).await.ok();
     rows.row_counts = adapter.query_rows(ROWCOUNT_SQL, cap).await.ok();
     let info = adapter.cached_server_info();
-    if info.as_ref().map(|i| i.can_view_database_state()).unwrap_or(false) {
+    if info
+        .as_ref()
+        .map(|i| i.can_view_database_state())
+        .unwrap_or(false)
+    {
         rows.sizes = adapter.query_rows(SIZE_SQL, cap).await.ok();
     }
     let objects = build_catalog(&rows);
@@ -315,7 +371,9 @@ pub async fn load_catalog(adapter: &SqlServerAdapter) -> DbMcpResult<(Vec<Catalo
         .filter(|o| o.object_type == CatalogObjectType::View && o.definition.is_none())
         .count();
     if views_without_def > 0 {
-        warnings.push(format!("{views_without_def} view definition(s) are not visible to this login"));
+        warnings.push(format!(
+            "{views_without_def} view definition(s) are not visible to this login"
+        ));
     }
     Ok((objects, warnings))
 }
@@ -326,7 +384,10 @@ mod tests {
     use serde_json::json;
 
     fn set(rows: Vec<Vec<Value>>) -> FetchedRows {
-        FetchedRows { rows, ..FetchedRows::default() }
+        FetchedRows {
+            rows,
+            ..FetchedRows::default()
+        }
     }
 
     #[test]
@@ -346,28 +407,157 @@ mod tests {
     fn maps_rows_to_catalog_objects() {
         let rows = CatalogRows {
             objects: set(vec![
-                vec![json!(1), json!("dbo"), json!("users"), json!("U"), json!("Customer accounts"), json!(0)],
-                vec![json!(2), json!("dbo"), json!("orders"), json!("U"), Value::Null, json!(0)],
-                vec![json!(3), json!("dbo"), json!("active_user_orders"), json!("V"), Value::Null, json!(0)],
-                vec![json!(4), json!("dbo"), json!("checkout_order"), json!("P"), Value::Null, json!(0)],
-                vec![json!(5), json!("dbo"), json!("trg_orders_audit"), json!("TR"), Value::Null, json!(2)],
+                vec![
+                    json!(1),
+                    json!("dbo"),
+                    json!("users"),
+                    json!("U"),
+                    json!("Customer accounts"),
+                    json!(0),
+                ],
+                vec![
+                    json!(2),
+                    json!("dbo"),
+                    json!("orders"),
+                    json!("U"),
+                    Value::Null,
+                    json!(0),
+                ],
+                vec![
+                    json!(3),
+                    json!("dbo"),
+                    json!("active_user_orders"),
+                    json!("V"),
+                    Value::Null,
+                    json!(0),
+                ],
+                vec![
+                    json!(4),
+                    json!("dbo"),
+                    json!("checkout_order"),
+                    json!("P"),
+                    Value::Null,
+                    json!(0),
+                ],
+                vec![
+                    json!(5),
+                    json!("dbo"),
+                    json!("trg_orders_audit"),
+                    json!("TR"),
+                    Value::Null,
+                    json!(2),
+                ],
             ]),
             columns: set(vec![
-                vec![json!(1), json!(1), json!("id"), json!("int"), json!(4), json!(10), json!(0), json!(false), Value::Null, Value::Null],
-                vec![json!(1), json!(2), json!("email"), json!("nvarchar"), json!(510), json!(0), json!(0), json!(false), Value::Null, json!("login")],
-                vec![json!(2), json!(1), json!("id"), json!("int"), json!(4), json!(10), json!(0), json!(false), Value::Null, Value::Null],
-                vec![json!(2), json!(2), json!("user_id"), json!("int"), json!(4), json!(10), json!(0), json!(true), json!("((0))"), Value::Null],
+                vec![
+                    json!(1),
+                    json!(1),
+                    json!("id"),
+                    json!("int"),
+                    json!(4),
+                    json!(10),
+                    json!(0),
+                    json!(false),
+                    Value::Null,
+                    Value::Null,
+                ],
+                vec![
+                    json!(1),
+                    json!(2),
+                    json!("email"),
+                    json!("nvarchar"),
+                    json!(510),
+                    json!(0),
+                    json!(0),
+                    json!(false),
+                    Value::Null,
+                    json!("login"),
+                ],
+                vec![
+                    json!(2),
+                    json!(1),
+                    json!("id"),
+                    json!("int"),
+                    json!(4),
+                    json!(10),
+                    json!(0),
+                    json!(false),
+                    Value::Null,
+                    Value::Null,
+                ],
+                vec![
+                    json!(2),
+                    json!(2),
+                    json!("user_id"),
+                    json!("int"),
+                    json!(4),
+                    json!(10),
+                    json!(0),
+                    json!(true),
+                    json!("((0))"),
+                    Value::Null,
+                ],
             ]),
             indexes: set(vec![
-                vec![json!(1), json!("pk_users"), json!(1), json!("CLUSTERED"), json!(true), json!(true), Value::Null, json!(1), json!(false), json!("id"), json!(false)],
-                vec![json!(2), json!("ix_orders_user"), json!(2), json!("NONCLUSTERED"), json!(false), json!(false), Value::Null, json!(1), json!(false), json!("user_id"), json!(false)],
-                vec![json!(2), json!("ix_orders_user"), json!(2), json!("NONCLUSTERED"), json!(false), json!(false), Value::Null, json!(0), json!(true), json!("id"), json!(false)],
+                vec![
+                    json!(1),
+                    json!("pk_users"),
+                    json!(1),
+                    json!("CLUSTERED"),
+                    json!(true),
+                    json!(true),
+                    Value::Null,
+                    json!(1),
+                    json!(false),
+                    json!("id"),
+                    json!(false),
+                ],
+                vec![
+                    json!(2),
+                    json!("ix_orders_user"),
+                    json!(2),
+                    json!("NONCLUSTERED"),
+                    json!(false),
+                    json!(false),
+                    Value::Null,
+                    json!(1),
+                    json!(false),
+                    json!("user_id"),
+                    json!(false),
+                ],
+                vec![
+                    json!(2),
+                    json!("ix_orders_user"),
+                    json!(2),
+                    json!("NONCLUSTERED"),
+                    json!(false),
+                    json!(false),
+                    Value::Null,
+                    json!(0),
+                    json!(true),
+                    json!("id"),
+                    json!(false),
+                ],
             ]),
             foreign_keys: set(vec![vec![
-                json!(2), json!("fk_orders_users"), json!(1), json!("user_id"), json!("dbo"), json!("users"), json!("id"), json!("CASCADE"), json!("NO_ACTION"),
+                json!(2),
+                json!("fk_orders_users"),
+                json!(1),
+                json!("user_id"),
+                json!("dbo"),
+                json!("users"),
+                json!("id"),
+                json!("CASCADE"),
+                json!("NO_ACTION"),
             ]]),
-            modules: Some(set(vec![vec![json!(4), json!("CREATE PROCEDURE dbo.checkout_order AS SELECT 1")]])),
-            row_counts: Some(set(vec![vec![json!(1), json!(3)], vec![json!(3), json!(99)]])),
+            modules: Some(set(vec![vec![
+                json!(4),
+                json!("CREATE PROCEDURE dbo.checkout_order AS SELECT 1"),
+            ]])),
+            row_counts: Some(set(vec![
+                vec![json!(1), json!(3)],
+                vec![json!(3), json!(99)],
+            ])),
             sizes: None,
         };
         let objs = build_catalog(&rows);
@@ -380,14 +570,29 @@ mod tests {
         let orders = objs.iter().find(|o| o.name == "orders").unwrap();
         assert_eq!(orders.columns[1].default_value.as_deref(), Some("0"));
         assert_eq!(orders.indexes[0].columns, vec!["user_id"]);
-        assert_eq!(orders.indexes[0].definition.as_deref(), Some("CREATE NONCLUSTERED INDEX ix_orders_user ON dbo.orders (user_id);"));
+        assert_eq!(
+            orders.indexes[0].definition.as_deref(),
+            Some("CREATE NONCLUSTERED INDEX ix_orders_user ON dbo.orders (user_id);")
+        );
         assert_eq!(orders.foreign_keys[0].referenced_table, "dbo.users");
         assert_eq!(orders.foreign_keys[0].on_delete.as_deref(), Some("CASCADE"));
         assert_eq!(orders.foreign_keys[0].on_update, None);
-        let view = objs.iter().find(|o| o.name == "active_user_orders").unwrap();
+        let view = objs
+            .iter()
+            .find(|o| o.name == "active_user_orders")
+            .unwrap();
         assert_eq!(view.estimated_rows, None);
-        let proc_ = objs.iter().find(|o| o.object_type == CatalogObjectType::Procedure).unwrap();
-        assert!(proc_.definition.as_deref().unwrap().starts_with("CREATE PROCEDURE"));
-        assert!(objs.iter().any(|o| o.object_type == CatalogObjectType::Trigger));
+        let proc_ = objs
+            .iter()
+            .find(|o| o.object_type == CatalogObjectType::Procedure)
+            .unwrap();
+        assert!(proc_
+            .definition
+            .as_deref()
+            .unwrap()
+            .starts_with("CREATE PROCEDURE"));
+        assert!(objs
+            .iter()
+            .any(|o| o.object_type == CatalogObjectType::Trigger));
     }
 }

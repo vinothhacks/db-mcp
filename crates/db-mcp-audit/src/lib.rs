@@ -301,27 +301,22 @@ impl InMemoryAuditStore {
     }
 
     pub fn all_events(&self) -> Vec<AuditEvent> {
-        self.events
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or_default()
+        self.events.read().map(|g| g.clone()).unwrap_or_default()
     }
 
     pub fn record(&self, event: AuditEvent) -> DbMcpResult<()> {
         let sanitized = sanitize_audit_event(event);
-        let mut guard = self
-            .events
-            .write()
-            .map_err(|e| DbMcpError::StorageError(format!("InMemoryAuditStore lock poisoned: {e}")))?;
+        let mut guard = self.events.write().map_err(|e| {
+            DbMcpError::StorageError(format!("InMemoryAuditStore lock poisoned: {e}"))
+        })?;
         guard.push(sanitized);
         Ok(())
     }
 
     pub fn list_events(&self, filter: &AuditFilter) -> DbMcpResult<Vec<AuditEvent>> {
-        let guard = self
-            .events
-            .read()
-            .map_err(|e| DbMcpError::StorageError(format!("InMemoryAuditStore lock poisoned: {e}")))?;
+        let guard = self.events.read().map_err(|e| {
+            DbMcpError::StorageError(format!("InMemoryAuditStore lock poisoned: {e}"))
+        })?;
         Ok(filter.apply(&guard))
     }
 
@@ -488,11 +483,13 @@ impl JsonlAuditStore {
         let mut chunk: u64 = 64 * 1024;
         loop {
             let start = len.saturating_sub(chunk);
-            file.seek(SeekFrom::Start(start))
-                .map_err(|e| DbMcpError::StorageError(format!("Failed to seek JSONL audit file: {e}")))?;
+            file.seek(SeekFrom::Start(start)).map_err(|e| {
+                DbMcpError::StorageError(format!("Failed to seek JSONL audit file: {e}"))
+            })?;
             let mut buf = Vec::with_capacity((len - start) as usize);
-            file.read_to_end(&mut buf)
-                .map_err(|e| DbMcpError::StorageError(format!("Failed to read JSONL audit file: {e}")))?;
+            file.read_to_end(&mut buf).map_err(|e| {
+                DbMcpError::StorageError(format!("Failed to read JSONL audit file: {e}"))
+            })?;
             let text = String::from_utf8_lossy(&buf);
             let trimmed = text.trim_end();
             if trimmed.is_empty() {
@@ -551,8 +548,9 @@ impl JsonlAuditStore {
             chain_hash,
             event: sanitized,
         };
-        let mut line = serde_json::to_string(&record)
-            .map_err(|e| DbMcpError::StorageError(format!("Failed to serialize audit event: {e}")))?;
+        let mut line = serde_json::to_string(&record).map_err(|e| {
+            DbMcpError::StorageError(format!("Failed to serialize audit event: {e}"))
+        })?;
         line.push('\n');
 
         let mut file = OpenOptions::new()
@@ -664,9 +662,10 @@ impl SqliteAuditStore {
                 path_buf.display()
             ))
         })?;
-        conn.busy_timeout(std::time::Duration::from_secs(10)).map_err(|e| {
-            DbMcpError::StorageError(format!("Failed to set SQLite audit busy_timeout: {e}"))
-        })?;
+        conn.busy_timeout(std::time::Duration::from_secs(10))
+            .map_err(|e| {
+                DbMcpError::StorageError(format!("Failed to set SQLite audit busy_timeout: {e}"))
+            })?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
             db_path: Some(path_buf),
@@ -858,9 +857,7 @@ impl SqliteAuditStore {
 
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|e| {
-                DbMcpError::StorageError(format!("Failed to query audit_events: {e}"))
-            })?;
+            .map_err(|e| DbMcpError::StorageError(format!("Failed to query audit_events: {e}")))?;
 
         let mut events = Vec::new();
         for row_res in rows {
@@ -884,13 +881,9 @@ impl SqliteAuditStore {
             .map_err(|e| DbMcpError::StorageError(format!("SQLite audit lock poisoned: {e}")))?;
 
         let mut stmt = guard
-            .prepare(
-                "SELECT payload_json FROM audit_events WHERE request_id = ?1 ORDER BY seq ASC",
-            )
+            .prepare("SELECT payload_json FROM audit_events WHERE request_id = ?1 ORDER BY seq ASC")
             .map_err(|e| {
-                DbMcpError::StorageError(format!(
-                    "Failed to prepare get_by_request_id query: {e}"
-                ))
+                DbMcpError::StorageError(format!("Failed to prepare get_by_request_id query: {e}"))
             })?;
 
         let rows = stmt
@@ -955,8 +948,8 @@ impl SqliteAuditStore {
         let mut total_events = 0usize;
 
         for row_res in rows {
-            let (event_id, col_sql, col_decision, prev_hash, chain_hash, payload_json) =
-                row_res.map_err(|e| {
+            let (event_id, col_sql, col_decision, prev_hash, chain_hash, payload_json) = row_res
+                .map_err(|e| {
                     DbMcpError::StorageError(format!("Failed to read audit_events chain row: {e}"))
                 })?;
             total_events += 1;

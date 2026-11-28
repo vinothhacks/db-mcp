@@ -88,8 +88,10 @@ impl DefinitionStatus {
         use DefinitionStatus::*;
         matches!(
             (self, next),
-            (Discovered, Proposed | InReview | Certified | Rejected | Stale)
-                | (Proposed, InReview | Certified | Rejected | Stale)
+            (
+                Discovered,
+                Proposed | InReview | Certified | Rejected | Stale
+            ) | (Proposed, InReview | Certified | Rejected | Stale)
                 | (InReview, Certified | Rejected | Stale)
                 | (Certified, Published | Rejected | Stale | Deprecated)
                 | (Published, Stale | Deprecated)
@@ -479,9 +481,9 @@ impl OntologyRevision {
     }
 
     pub fn contains(&self, def: &Definition) -> bool {
-        self.def_refs
-            .iter()
-            .any(|r| r.def_id == def.def_id && r.version == def.version && r.content_hash == def.content_hash)
+        self.def_refs.iter().any(|r| {
+            r.def_id == def.def_id && r.version == def.version && r.content_hash == def.content_hash
+        })
     }
 }
 

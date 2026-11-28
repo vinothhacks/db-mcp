@@ -256,7 +256,9 @@ pub fn extract_routine_body(definition_sql: &str) -> String {
     }
 
     let upper = trimmed.to_ascii_uppercase();
-    if upper.starts_with("CREATE ") || upper.starts_with("CREATE\t") || upper.starts_with("CREATE\n")
+    if upper.starts_with("CREATE ")
+        || upper.starts_with("CREATE\t")
+        || upper.starts_with("CREATE\n")
     {
         // 2. Check for single-quoted body: AS '...'
         let as_quote_re =
@@ -314,8 +316,7 @@ fn base_name(ident: &str) -> &str {
 
 fn is_sql_builtin_or_keyword(name: &str) -> bool {
     let base = base_name(&clean_identifier(name)).to_ascii_lowercase();
-    SQL_BUILTIN_FUNCTIONS.contains(&base.as_str())
-        || NON_TABLE_IDENTIFIERS.contains(&base.as_str())
+    SQL_BUILTIN_FUNCTIONS.contains(&base.as_str()) || NON_TABLE_IDENTIFIERS.contains(&base.as_str())
 }
 
 fn is_non_table_word(name: &str) -> bool {
@@ -401,10 +402,9 @@ fn extract_cte_and_alias_maps(body_sql: &str) -> (BTreeSet<String>, BTreeMap<Str
     let mut cte_names = BTreeSet::new();
     let mut alias_map = BTreeMap::new();
 
-    let cte_re = Regex::new(
-        r"(?is)\b(?:WITH(?:\s+RECURSIVE)?|,)\s+([A-Za-z_][A-Za-z0-9_]*)\s+(?:AS\s*\()",
-    )
-    .expect("valid CTE regex");
+    let cte_re =
+        Regex::new(r"(?is)\b(?:WITH(?:\s+RECURSIVE)?|,)\s+([A-Za-z_][A-Za-z0-9_]*)\s+(?:AS\s*\()")
+            .expect("valid CTE regex");
     for caps in cte_re.captures_iter(body_sql) {
         if let Some(m) = caps.get(1) {
             cte_names.insert(clean_identifier(m.as_str()).to_ascii_lowercase());
@@ -468,10 +468,9 @@ fn extract_read_targets_from_fragment(fragment: &str) -> Vec<String> {
     let mut reads = Vec::new();
 
     // Match JOIN <table> (excluding JOIN LATERAL (subquery) or JOIN func(...))
-    let join_re = Regex::new(
-        r#"(?is)\bJOIN\s+(?:LATERAL\s+)?([A-Za-z_"\[`][A-Za-z0-9_."\]`]*)(\s*\()?"#,
-    )
-    .expect("valid JOIN regex");
+    let join_re =
+        Regex::new(r#"(?is)\bJOIN\s+(?:LATERAL\s+)?([A-Za-z_"\[`][A-Za-z0-9_."\]`]*)(\s*\()?"#)
+            .expect("valid JOIN regex");
     for caps in join_re.captures_iter(fragment) {
         if caps.get(2).is_none() {
             if let Some(m) = caps.get(1) {
@@ -481,10 +480,8 @@ fn extract_read_targets_from_fragment(fragment: &str) -> Vec<String> {
     }
 
     // Match USING <table> in MERGE/DELETE statements (not USING (col) join constraint)
-    let using_re = Regex::new(
-        r#"(?is)\bUSING\s+([A-Za-z_"\[`][A-Za-z0-9_."\]`]*)(\s*\()?"#,
-    )
-    .expect("valid USING regex");
+    let using_re = Regex::new(r#"(?is)\bUSING\s+([A-Za-z_"\[`][A-Za-z0-9_."\]`]*)(\s*\()?"#)
+        .expect("valid USING regex");
     for caps in using_re.captures_iter(fragment) {
         if caps.get(2).is_none() {
             if let Some(m) = caps.get(1) {
@@ -498,16 +495,14 @@ fn extract_read_targets_from_fragment(fragment: &str) -> Vec<String> {
     // - IS [NOT] DISTINCT FROM <expr>
     // - EXTRACT(... FROM <expr>), TRIM(... FROM <expr>), SUBSTRING(... FROM <expr>), OVERLAY(... FROM <expr>)
     // - FROM <func>(...)
-    let from_re = Regex::new(
-        r#"(?is)\bFROM\s+(?:ONLY\s+)?([A-Za-z_"\[`][A-Za-z0-9_."\]`]*)(\s*\()?"#,
-    )
-    .expect("valid FROM regex");
-    let special_from_fn_re = Regex::new(
-        r"(?is)\b(?:EXTRACT|TRIM|BTRIM|LTRIM|RTRIM|SUBSTRING|OVERLAY)\s*\([^)]*$",
-    )
-    .expect("valid special FROM fn regex");
-    let delete_prefix_re =
-        Regex::new(r"(?is)\bDELETE(?:\s+[A-Za-z_][A-Za-z0-9_]*)?\s*$").expect("valid DELETE prefix regex");
+    let from_re =
+        Regex::new(r#"(?is)\bFROM\s+(?:ONLY\s+)?([A-Za-z_"\[`][A-Za-z0-9_."\]`]*)(\s*\()?"#)
+            .expect("valid FROM regex");
+    let special_from_fn_re =
+        Regex::new(r"(?is)\b(?:EXTRACT|TRIM|BTRIM|LTRIM|RTRIM|SUBSTRING|OVERLAY)\s*\([^)]*$")
+            .expect("valid special FROM fn regex");
+    let delete_prefix_re = Regex::new(r"(?is)\bDELETE(?:\s+[A-Za-z_][A-Za-z0-9_]*)?\s*$")
+        .expect("valid DELETE prefix regex");
     let distinct_prefix_re =
         Regex::new(r"(?is)\bDISTINCT\s*$").expect("valid DISTINCT prefix regex");
 
@@ -547,9 +542,8 @@ fn normalize_procedural_statement_for_ast(stmt: &str) -> String {
     }
 
     // Convert PL/pgSQL `v_var := (SELECT ...)` or `SET v_var = (SELECT ...)` into inner query if applicable
-    let assign_re =
-        Regex::new(r"(?is)^(?:SET\s+)?[A-Za-z_][A-Za-z0-9_.]*\s*:?=\s*\((.+)\)\s*$")
-            .expect("valid assignment subquery regex");
+    let assign_re = Regex::new(r"(?is)^(?:SET\s+)?[A-Za-z_][A-Za-z0-9_.]*\s*:?=\s*\((.+)\)\s*$")
+        .expect("valid assignment subquery regex");
     if let Some(caps) = assign_re.captures(s) {
         if let Some(inner) = caps.get(1) {
             return inner.as_str().trim().to_string();
@@ -557,10 +551,9 @@ fn normalize_procedural_statement_for_ast(stmt: &str) -> String {
     }
 
     // Convert `FOR rec IN SELECT ... LOOP` into `SELECT ...`
-    let for_in_re = Regex::new(
-        r"(?is)^FOR\s+[A-Za-z_][A-Za-z0-9_]*\s+IN\s+(SELECT\b.+?)(?:\bLOOP\b\s*(.*))?$",
-    )
-    .expect("valid FOR IN SELECT regex");
+    let for_in_re =
+        Regex::new(r"(?is)^FOR\s+[A-Za-z_][A-Za-z0-9_]*\s+IN\s+(SELECT\b.+?)(?:\bLOOP\b\s*(.*))?$")
+            .expect("valid FOR IN SELECT regex");
     if let Some(caps) = for_in_re.captures(s) {
         if let Some(sel) = caps.get(1) {
             return sel.as_str().trim().to_string();
@@ -652,10 +645,8 @@ pub fn analyze_routine_definition(
     };
 
     // 1. Detect explicit `CALL <routine>(...)`
-    let call_re = Regex::new(
-        r#"(?is)\bCALL\s+([A-Za-z_"\[`][A-Za-z0-9_."\]`]*)\s*(?:\(|;|$|\s)"#,
-    )
-    .expect("valid CALL regex");
+    let call_re = Regex::new(r#"(?is)\bCALL\s+([A-Za-z_"\[`][A-Za-z0-9_."\]`]*)\s*(?:\(|;|$|\s)"#)
+        .expect("valid CALL regex");
     for caps in call_re.captures_iter(call_body) {
         if let Some(m) = caps.get(1) {
             record_call(m.as_str(), "CALL", false);
@@ -663,10 +654,8 @@ pub fn analyze_routine_definition(
     }
 
     // 2. Detect PL/pgSQL `PERFORM <routine>(...)`
-    let perform_call_re = Regex::new(
-        r#"(?is)\bPERFORM\s+([A-Za-z_"\[`][A-Za-z0-9_."\]`]*)\s*\("#,
-    )
-    .expect("valid PERFORM regex");
+    let perform_call_re = Regex::new(r#"(?is)\bPERFORM\s+([A-Za-z_"\[`][A-Za-z0-9_."\]`]*)\s*\("#)
+        .expect("valid PERFORM regex");
     for caps in perform_call_re.captures_iter(call_body) {
         if let Some(m) = caps.get(1) {
             record_call(m.as_str(), "PERFORM", false);
@@ -692,14 +681,11 @@ pub fn analyze_routine_definition(
     }
 
     // 4. Detect `<routine>(...)` expressions matching `known_routines`
-    let fn_expr_re = Regex::new(
-        r#"(?is)([A-Za-z_"\[`][A-Za-z0-9_."\]`]*)\s*\("#,
-    )
-    .expect("valid FUNCTION_EXPR regex");
-    let skip_fn_prefix_re = Regex::new(
-        r"(?is)\b(?:CALL|PERFORM|EXEC|EXECUTE|INTO|TABLE|UPDATE|REFERENCES)\s+$",
-    )
-    .expect("valid skip fn prefix regex");
+    let fn_expr_re = Regex::new(r#"(?is)([A-Za-z_"\[`][A-Za-z0-9_."\]`]*)\s*\("#)
+        .expect("valid FUNCTION_EXPR regex");
+    let skip_fn_prefix_re =
+        Regex::new(r"(?is)\b(?:CALL|PERFORM|EXEC|EXECUTE|INTO|TABLE|UPDATE|REFERENCES)\s+$")
+            .expect("valid skip fn prefix regex");
 
     for caps in fn_expr_re.captures_iter(call_body) {
         let full_match = caps.get(0).unwrap();
@@ -739,8 +725,8 @@ pub fn analyze_routine_definition(
             for st in &analysis.statements {
                 // Note: In PL/pgSQL, `SELECT col INTO v_var FROM tbl` has `statement_kind == "SELECT"`
                 // even though `sqlparser` flags `SELECT INTO` as `SqlStatementClass::Write`.
-                let is_select_stmt = st.statement_kind == "SELECT"
-                    || st.statement_class == SqlStatementClass::Read;
+                let is_select_stmt =
+                    st.statement_kind == "SELECT" || st.statement_class == SqlStatementClass::Read;
 
                 for tbl in &st.referenced_tables {
                     if let Some(resolved) = resolve_table_candidate(

@@ -98,7 +98,9 @@ pub fn read_secret_file(path: &str) -> DbMcpResult<SecretString> {
             e.kind()
         ))
     })?;
-    Ok(SecretString::new(raw.trim_end_matches(['\r', '\n']).to_string()))
+    Ok(SecretString::new(
+        raw.trim_end_matches(['\r', '\n']).to_string(),
+    ))
 }
 
 /// Trait implemented by credential providers.
@@ -274,7 +276,8 @@ pub fn redact_sensitive_text(input: &str) -> String {
 
     // 1. Redact URL/DSN userinfo passwords: scheme://user:password@host (including SQL-tokenized spacing)
     let url_userinfo_re =
-        Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*\s*:\s*/\s*/\s*[^/\s:@]+)\s*:\s*([^@\s/'\x22]+)\s*@").unwrap();
+        Regex::new(r"(?i)\b([a-z][a-z0-9+.-]*\s*:\s*/\s*/\s*[^/\s:@]+)\s*:\s*([^@\s/'\x22]+)\s*@")
+            .unwrap();
     let step1 = url_userinfo_re
         .replace_all(input, format!("$1:{REDACTED_PLACEHOLDER}@"))
         .into_owned();

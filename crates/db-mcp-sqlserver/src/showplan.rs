@@ -42,18 +42,30 @@ impl MissingIndexHint {
 
     /// Advisory T-SQL for the hint.
     pub fn suggested_ddl(&self) -> String {
-        let keys: Vec<String> = self.equality.iter().chain(self.inequality.iter()).cloned().collect();
+        let keys: Vec<String> = self
+            .equality
+            .iter()
+            .chain(self.inequality.iter())
+            .cloned()
+            .collect();
         let name = format!(
             "ix_{}_{}",
             self.table,
-            keys.iter().map(|k| k.replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "_")).collect::<Vec<_>>().join("_")
+            keys.iter()
+                .map(|k| k.replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "_"))
+                .collect::<Vec<_>>()
+                .join("_")
         );
         let include = if self.include.is_empty() {
             String::new()
         } else {
             format!(" INCLUDE ({})", self.include.join(", "))
         };
-        format!("CREATE NONCLUSTERED INDEX {name} ON {} ({}){include};", self.qualified_table(), keys.join(", "))
+        format!(
+            "CREATE NONCLUSTERED INDEX {name} ON {} ({}){include};",
+            self.qualified_table(),
+            keys.join(", ")
+        )
     }
 }
 
@@ -92,8 +104,12 @@ impl Node {
         }
         out.push_str(&format!(
             "  (rows={}, cost={})\n",
-            self.estimate_rows.map(|r| format!("{r:.1}")).unwrap_or_else(|| "?".into()),
-            self.estimated_cost.map(|c| format!("{c:.6}")).unwrap_or_else(|| "?".into())
+            self.estimate_rows
+                .map(|r| format!("{r:.1}"))
+                .unwrap_or_else(|| "?".into()),
+            self.estimated_cost
+                .map(|c| format!("{c:.6}"))
+                .unwrap_or_else(|| "?".into())
         ));
         for c in &self.children {
             c.render(depth + 1, out);
@@ -102,7 +118,10 @@ impl Node {
 }
 
 fn unbracket(s: &str) -> String {
-    s.trim().trim_start_matches('[').trim_end_matches(']').to_string()
+    s.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string()
 }
 
 fn attr(e: &BytesStart, name: &str) -> Option<String> {
@@ -134,9 +153,9 @@ pub fn parse_showplan_xml(xml: &str) -> DbMcpResult<ParsedShowplan> {
     let mut statement_roots_start = 0usize;
 
     loop {
-        let ev = reader
-            .read_event()
-            .map_err(|e| DbMcpError::AdapterError(format!("could not parse SQL Server showplan XML: {e}")))?;
+        let ev = reader.read_event().map_err(|e| {
+            DbMcpError::AdapterError(format!("could not parse SQL Server showplan XML: {e}"))
+        })?;
         let (e, is_empty) = match &ev {
             Event::Start(e) => (Some(e.clone()), false),
             Event::Empty(e) => (Some(e.clone()), true),
@@ -195,9 +214,15 @@ pub fn parse_showplan_xml(xml: &str) -> DbMcpResult<ParsedShowplan> {
                 if let Some(top) = stack.last_mut() {
                     if top.object.is_none() {
                         if let Some(table) = attr(&e, "Table") {
-                            let schema = attr(&e, "Schema").map(|s| unbracket(&s)).unwrap_or_default();
+                            let schema = attr(&e, "Schema")
+                                .map(|s| unbracket(&s))
+                                .unwrap_or_default();
                             let table = unbracket(&table);
-                            top.object = Some(if schema.is_empty() { table } else { format!("{schema}.{table}") });
+                            top.object = Some(if schema.is_empty() {
+                                table
+                            } else {
+                                format!("{schema}.{table}")
+                            });
                             top.index = attr(&e, "Index").map(|i| unbracket(&i));
                         }
                     }
@@ -218,11 +243,16 @@ pub fn parse_showplan_xml(xml: &str) -> DbMcpResult<ParsedShowplan> {
                 }
             }
             b"MissingIndexGroup" => {
-                current_hint = Some(MissingIndexHint { impact: attr_f64(&e, "Impact").unwrap_or(0.0), ..Default::default() });
+                current_hint = Some(MissingIndexHint {
+                    impact: attr_f64(&e, "Impact").unwrap_or(0.0),
+                    ..Default::default()
+                });
             }
             b"MissingIndex" => {
                 if let Some(h) = current_hint.as_mut() {
-                    h.schema = attr(&e, "Schema").map(|s| unbracket(&s)).unwrap_or_default();
+                    h.schema = attr(&e, "Schema")
+                        .map(|s| unbracket(&s))
+                        .unwrap_or_default();
                     h.table = attr(&e, "Table").map(|s| unbracket(&s)).unwrap_or_default();
                 }
             }
@@ -239,14 +269,19 @@ pub fn parse_showplan_xml(xml: &str) -> DbMcpResult<ParsedShowplan> {
                 }
             }
             other if in_warnings > 0 => {
-                out.warnings.push(format!("plan warning: {}", String::from_utf8_lossy(other)));
+                out.warnings
+                    .push(format!("plan warning: {}", String::from_utf8_lossy(other)));
             }
             _ => {}
         }
     }
 
     let plan_roots: Vec<Node> = roots.split_off(statement_roots_start.min(roots.len()));
-    let plan_roots = if plan_roots.is_empty() { roots } else { plan_roots };
+    let plan_roots = if plan_roots.is_empty() {
+        roots
+    } else {
+        plan_roots
+    };
     fn walk(n: &Node, scans: &mut Vec<String>, seeks: &mut Vec<String>) {
         if let Some(obj) = &n.object {
             let op = n.physical_op.as_str();
@@ -297,7 +332,9 @@ pub fn parse_showplan_xml(xml: &str) -> DbMcpResult<ParsedShowplan> {
         })).collect::<Vec<_>>(),
     });
     if plan_roots.is_empty() {
-        return Err(DbMcpError::AdapterError("SQL Server showplan contained no operators".to_string()));
+        return Err(DbMcpError::AdapterError(
+            "SQL Server showplan contained no operators".to_string(),
+        ));
     }
     Ok(out)
 }
@@ -350,9 +387,14 @@ mod tests {
         assert_eq!(h.include, vec!["total_cents"]);
         assert_eq!(h.suggested_ddl(), "CREATE NONCLUSTERED INDEX ix_orders_status ON dbo.orders (status) INCLUDE (total_cents);");
         assert_eq!(p.structured["operators"][0]["physical_op"], "Nested Loops");
-        assert_eq!(p.structured["operators"][0]["children"][1]["object"], "dbo.users");
+        assert_eq!(
+            p.structured["operators"][0]["children"][1]["object"],
+            "dbo.users"
+        );
         assert!(p.text_tree.starts_with("Nested Loops"), "{}", p.text_tree);
-        assert!(p.text_tree.contains("\n  Clustered Index Scan on dbo.orders (pk_orders)"));
+        assert!(p
+            .text_tree
+            .contains("\n  Clustered Index Scan on dbo.orders (pk_orders)"));
         assert!(p.warnings.iter().any(|w| w.contains("missing-index")));
         assert!(!p.warnings.iter().any(|w| w.contains("NoJoinPredicate")));
     }

@@ -60,7 +60,12 @@ impl JsonRpcResponse {
         }
     }
 
-    pub fn err(id: Option<Value>, code: i32, message: impl Into<String>, data: Option<Value>) -> Self {
+    pub fn err(
+        id: Option<Value>,
+        code: i32,
+        message: impl Into<String>,
+        data: Option<Value>,
+    ) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
             id: id.unwrap_or(Value::Null),
