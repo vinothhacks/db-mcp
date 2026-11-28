@@ -43,3 +43,4 @@ uuid.workspace = true
 url.workspace = true
 dashmap.workspace = true
 regex.workspace = true
+subtle = "2.6"
