@@ -15,7 +15,7 @@
     "db-mcp": "./npm/bin/db-mcp.js"
   },
   "scripts": {
-    "build": "cargo build --release -p db-mcp-server",
+    "build": "cargo build --locked --release -p db-mcp-server",
     "start": "node ./npm/bin/db-mcp.js serve --transport stdio",
     "serve:stdio": "node ./npm/bin/db-mcp.js serve --transport stdio",
     "serve:http": "node ./npm/bin/db-mcp.js serve --transport http",

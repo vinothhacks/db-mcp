@@ -16,10 +16,10 @@ services:
       - --config
       - /etc/db-mcp/db-mcp.toml
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
-      DB_MCP_AUTH_TOKEN: ${DB_MCP_AUTH_TOKEN:-dev-agent-token}
-      DB_MCP_ADMIN_TOKEN: ${DB_MCP_ADMIN_TOKEN:-dev-admin-token}
+      DB_MCP_AUTH_TOKEN: ${DB_MCP_AUTH_TOKEN:?set DB_MCP_AUTH_TOKEN}
+      DB_MCP_ADMIN_TOKEN: ${DB_MCP_ADMIN_TOKEN:?set DB_MCP_ADMIN_TOKEN}
       RUST_LOG: ${RUST_LOG:-info}
     volumes:
       - ./config/db-mcp.example.toml:/etc/db-mcp/db-mcp.toml:ro

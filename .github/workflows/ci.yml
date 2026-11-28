@@ -14,18 +14,38 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  dependency-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - name: Audit the committed Cargo.lock
+        run: |
+          cargo install --locked --version 0.23.0 cargo-audit
+          cargo audit --file Cargo.lock
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
       - name: Check formatting (advisory)
@@ -47,11 +67,13 @@ jobs:
       - name: Per-feature verification suites
         shell: bash
         run: |
-          set -euo pipefail
-          for file in npm/test/features/*.test.js; do
+          set -uo pipefail
+          failed=0
+          for file in npm/test/features/{01..16}-*.test.js; do
             printf '== %s\n' "$file"
-            node "$file"
+            node "$file" || failed=1
           done
+          exit "$failed"
       - name: npm pack dry run
         run: npm pack --dry-run
 
@@ -60,14 +82,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
       - name: Build release binary
-        run: cargo build --release -p db-mcp-server
+        run: cargo build --locked --release -p db-mcp-server
       - name: Start mysql:8.0, seed the fixture, create read-only logins
         shell: bash
         run: |
@@ -75,7 +101,7 @@ jobs:
           sed -n "s/^export [A-Z_]*='\(.*\)'$/\1/p" "$RUNNER_TEMP/mysql-env.sh" | while IFS= read -r dsn; do echo "::add-mask::$dsn"; pw="${dsn#*://*:}"; echo "::add-mask::${pw%%@*}"; done
           sed -e 's/^export //' -e "s/'//g" "$RUNNER_TEMP/mysql-env.sh" >> "$GITHUB_ENV"
       - name: Gated Rust live tests (db-mcp-mysql)
-        run: cargo test --release -p db-mcp-mysql
+        run: cargo test --locked --release -p db-mcp-mysql
       - name: Suite 17 (every tool on the live server)
         run: node npm/test/features/17-mysql-live.test.js
       - name: Remove the container
@@ -87,27 +113,52 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
       - name: Build release binary
-        run: cargo build --release -p db-mcp-server
+        run: cargo build --locked --release -p db-mcp-server
       - name: Start SQL Server 2022, seed fixture, create read-only logins
         shell: bash
         run: |
           bash scripts/live-db-up.sh mssql > "$RUNNER_TEMP/mssql.env"
           # Export the DSNs to later steps without echoing them.
           sed -n "s/^export \([A-Z_]*\)='\(.*\)'$/\1=\2/p" "$RUNNER_TEMP/mssql.env" | while IFS= read -r line; do
-            echo "::add-mask::${line#*=}"
+            dsn="${line#*=}"
+            echo "::add-mask::$dsn"
+            pw="${dsn#*://*:}"
+            echo "::add-mask::${pw%%@*}"
             echo "$line" >> "$GITHUB_ENV"
           done
       - name: Gated Rust integration tests (DB_MCP_MSSQL_TEST_DSN)
-        run: cargo test --release -p db-mcp-sqlserver --test live
+        run: cargo test --locked --release -p db-mcp-sqlserver --test live
       - name: Feature suite 18 (every tool on a live SQL Server)
         run: node npm/test/features/18-sqlserver-live.test.js
       - name: Remove container
         if: always()
         run: bash scripts/live-db-up.sh mssql --down
+
+  release-gate:
+    name: release-gate
+    needs: [dependency-audit, test, mysql-live, live-sqlserver]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    env:
+      AUDIT: ${{ needs.dependency-audit.result }}
+      TEST: ${{ needs.test.result }}
+      MYSQL: ${{ needs.mysql-live.result }}
+      SQL_SERVER: ${{ needs.live-sqlserver.result }}
+    steps:
+      - name: Require all verification jobs to pass
+        shell: bash
+        run: |
+          printf 'audit=%s platform suites=%s mysql=%s sqlserver=%s\n' "$AUDIT" "$TEST" "$MYSQL" "$SQL_SERVER"
+          [[ "$AUDIT" == success && "$TEST" == success && "$MYSQL" == success && "$SQL_SERVER" == success ]]

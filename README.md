@@ -19,7 +19,7 @@ It combines, in one binary:
 Engines:
 - **SQLite**: native.
 - **MySQL 8**: live server over plain TCP (`mysql_async`). A read-only login (`GRANT SELECT, SHOW VIEW`) is enough; every session runs `READ ONLY`.
-- **Microsoft SQL Server** (2016+ for Query Store, any version detected at connect): live server over TDS with optional encryption (`tiberius` + rustls), named instances, SQL logins. A `db_datareader` login is enough; every statement runs inside `BEGIN TRAN ... ROLLBACK`.
+- **Microsoft SQL Server** (2016+ for Query Store, version detected at connect): live server over TDS with TLS and certificate validation by default, named instances, and SQL logins. A `db_datareader` login is enough. Queries run inside `BEGIN TRAN ... ROLLBACK`.
 - **PostgreSQL**: deterministic embedded simulation (no wire-protocol client yet). MySQL can also be simulated with `backend = "simulated"`, which the bundled example config uses. Simulated responses always carry a warning, so an agent never mistakes them for production data. See `research/findings/capability-matrix.md`.
 
 A live connection that cannot be reached fails with `CONNECTION_UNAVAILABLE`. It never falls back to the simulation.
@@ -39,6 +39,7 @@ Download the archive for your platform and its matching `.sha256` file from the 
 [GitHub release](https://github.com/vinothhacks/db-mcp/releases). Compare the archive digest
 using `sha256sum`, `shasum -a 256`, or PowerShell’s `Get-FileHash -Algorithm SHA256`
 before extracting. Use the bundled example configuration to confirm local configuration parsing.
+For the Academy first-use check, follow the [Windows x64 SQLite guide](docs/ACADEMY-FIRST-USE.md).
 
 ### Option B: cargo
 
@@ -60,7 +61,9 @@ Run `npm test` from a source checkout for the broader end-to-end checks.
 ### Option C: Docker (self-hosted HTTP)
 
 ```bash
-docker compose up --build            # db-mcp on :8080 with the bundled example config
+export DB_MCP_AUTH_TOKEN="$(openssl rand -hex 32)"
+export DB_MCP_ADMIN_TOKEN="$(openssl rand -hex 32)"
+docker compose up --build            # db-mcp on 127.0.0.1:8080 with the bundled example config
 curl -s http://127.0.0.1:8080/health
 ```
 
@@ -68,7 +71,7 @@ curl -s http://127.0.0.1:8080/health
 
 ```bash
 git clone https://github.com/vinothhacks/db-mcp && cd db-mcp
-npm run build                        # cargo build --release -p db-mcp-server
+npm run build                        # cargo build --locked --release -p db-mcp-server
 npm test                             # stdio + HTTP + CLI approval end-to-end
 npm run verify:features              # exercises all 24 tools and prints a feature matrix
 ```
@@ -256,7 +259,7 @@ tests/             contract, integration and adversarial-security suite indexes 
 ## Development
 
 ```bash
-cargo test --workspace            # unit + contract + adversarial security + runtime integration
+cargo test --locked --workspace   # unit + contract + adversarial security + runtime integration
 npm test                          # Node E2E over the npx launcher
 npm run verify:features           # feature matrix (used by CI)
 ```
