@@ -8,8 +8,8 @@ use db_mcp_core::{
     ToolProfile,
 };
 use db_mcp_policy::ConnectionPolicyConfig;
-use db_mcp_tools::NamedToolRegistry;
 use db_mcp_secrets::{CompositeSecretProvider, SecretProvider, SecretString, StaticSecretProvider};
+use db_mcp_tools::NamedToolRegistry;
 use serde::{Deserialize, Deserializer, Serialize};
 
 fn default_server_name() -> String {
@@ -111,7 +111,9 @@ where
 {
     let opt = Option::<String>::deserialize(deserializer)?;
     match opt {
-        Some(s) => parse_mode_str(&s).map(Some).map_err(serde::de::Error::custom),
+        Some(s) => parse_mode_str(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
         None => Ok(None),
     }
 }
@@ -410,7 +412,8 @@ fn validate_bind(bind: &str) -> DbMcpResult<()> {
         ))
     };
     let (host, port) = bind.trim().rsplit_once(':').ok_or_else(bad)?;
-    if host.trim().is_empty() || host.contains(char::is_whitespace) || port.parse::<u16>().is_err() {
+    if host.trim().is_empty() || host.contains(char::is_whitespace) || port.parse::<u16>().is_err()
+    {
         return Err(bad());
     }
     Ok(())
@@ -817,7 +820,9 @@ impl ServerConfig {
             }
         }
         if self.ontology.tenant_id.trim().is_empty() {
-            return Err(DbMcpError::ConfigurationError("ontology.tenant_id must not be empty".to_string()));
+            return Err(DbMcpError::ConfigurationError(
+                "ontology.tenant_id must not be empty".to_string(),
+            ));
         }
         if self.ontology.certification_ttl_days < 1 || self.ontology.certification_ttl_days > 3650 {
             return Err(DbMcpError::ConfigurationError(
@@ -876,7 +881,10 @@ mod tests {
     fn missing_env_dsn_fails_naming_variable() {
         let cfg = BASE.replace("sqlite://:memory:", "env:DB_MCP_TEST_UNSET_DSN_VAR");
         let e = ServerConfig::from_toml_str(&cfg).unwrap_err().to_string();
-        assert!(e.contains("DB_MCP_TEST_UNSET_DSN_VAR") && e.contains("'c1'"), "{e}");
+        assert!(
+            e.contains("DB_MCP_TEST_UNSET_DSN_VAR") && e.contains("'c1'"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -915,37 +923,53 @@ mod tests {
     #[test]
     fn backend_defaults_and_validation() {
         let my = |extra: &str| {
-            format!("server_name = \"t\"
+            format!(
+                "server_name = \"t\"
 [[connections]]
 id = \"m\"
 engine = \"MySql\"
 dsn = \"mysql://u:p@127.0.0.1:1/db\"
-{extra}")
+{extra}"
+            )
         };
         let cfg = ServerConfig::from_toml_str(&my("")).unwrap();
         assert_eq!(cfg.connections[0].effective_backend().unwrap(), "live");
         let cfg = ServerConfig::from_toml_str(&my("backend = \"Simulated\"
-")).unwrap();
+"))
+        .unwrap();
         assert_eq!(cfg.connections[0].effective_backend().unwrap(), "simulated");
         let e = ServerConfig::from_toml_str(&my("backend = \"maybe\"
-")).unwrap_err().to_string();
+"))
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("backend 'maybe'"), "{e}");
-        let pg = BASE.replace("Sqlite", "Postgres").replace("sqlite://:memory:", "postgres://h/db");
+        let pg = BASE
+            .replace("Sqlite", "Postgres")
+            .replace("sqlite://:memory:", "postgres://h/db");
         let cfg = ServerConfig::from_toml_str(&pg).unwrap();
         assert_eq!(cfg.connections[0].effective_backend().unwrap(), "simulated");
-        assert!(ServerConfig::from_toml_str(&format!("{pg}backend = \"live\"
-")).is_err());
+        assert!(ServerConfig::from_toml_str(&format!(
+            "{pg}backend = \"live\"
+"
+        ))
+        .is_err());
         assert!(err("backend = \"simulated\"
-").contains("SQLite"));
+")
+        .contains("SQLite"));
         let demo = ServerConfig::default_demo();
-        let mysql = demo.connections.iter().find(|c| c.engine == DatabaseEngine::MySql).unwrap();
+        let mysql = demo
+            .connections
+            .iter()
+            .find(|c| c.engine == DatabaseEngine::MySql)
+            .unwrap();
         assert_eq!(mysql.effective_backend().unwrap(), "simulated");
     }
 
     #[test]
     fn backend_and_sqlserver_engine_validation() {
         assert!(err("backend = \"emulated\"
-").contains("backend must be"));
+")
+        .contains("backend must be"));
         let ss = "server_name = \"t\"
 [[connections]]
 id = \"ms\"
@@ -954,13 +978,23 @@ dsn = \"sqlserver://ro:p%40ss@127.0.0.1:1?instance=X\"
 ";
         let cfg = ServerConfig::from_toml_str(ss).unwrap();
         assert_eq!(cfg.connections[0].engine, DatabaseEngine::SqlServer);
-        let e = ServerConfig::from_toml_str(&format!("{ss}backend = \"simulated\"
-")).unwrap_err().to_string();
+        let e = ServerConfig::from_toml_str(&format!(
+            "{ss}backend = \"simulated\"
+"
+        ))
+        .unwrap_err()
+        .to_string();
         assert!(e.contains("no simulated backend"), "{e}");
-        let ms = ss.replace("sqlserver\"
-dsn", "mssql\"
-dsn");
-        assert_eq!(ServerConfig::from_toml_str(&ms).unwrap().connections[0].engine, DatabaseEngine::SqlServer);
+        let ms = ss.replace(
+            "sqlserver\"
+dsn",
+            "mssql\"
+dsn",
+        );
+        assert_eq!(
+            ServerConfig::from_toml_str(&ms).unwrap().connections[0].engine,
+            DatabaseEngine::SqlServer
+        );
     }
 
     #[test]

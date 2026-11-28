@@ -18,6 +18,7 @@ const path = require("node:path");
 const http = require("node:http");
 const readline = require("node:readline");
 const { spawn, spawnSync } = require("node:child_process");
+const { randomUUID } = require("node:crypto");
 
 const REPO = path.resolve(__dirname, "..", "..", "..");
 const { makeIsolatedConfig } = require(path.join(REPO, "scripts", "make-isolated-config.js"));
@@ -775,17 +776,18 @@ async function main() {
       assert.ok(!srv.stderr.join("").includes("tok-user"));
     } finally { await srv.stop(); }
   });
-  await check("http: empty-string token env var fails closed (401 even for 'Bearer ' - header value trimming saves it)", async () => {
-    const port = 19600 + Math.floor(Math.random() * 300);
-    const { configPath } = makeIsolatedConfig({ dir: path.join(TMP, "http-empty"), transform: (t) => t.replace('bind = "127.0.0.1:8080"', `bind = "127.0.0.1:${port}"`) });
-    const srv = await startHttp({ config: configPath, port, env: { DB_MCP_AUTH_TOKEN: "", DB_MCP_ADMIN_TOKEN: "" } });
-    try {
-      const r = await postJson(port, "/mcp", { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "list_connections", arguments: {} } }, { authorization: "Bearer " });
-      const a = await postJson(port, "/admin/approve", { change_id: "chg_none", approver: "x" }, { authorization: "Bearer " });
-      assert.equal(r.status, 401, `"Authorization: Bearer " (empty) accepted on /mcp with empty token env`);
-      assert.equal(a.status, 401, `empty bearer accepted on /admin/approve`);
-    } finally { await srv.stop(); }
-  }); // resolve_optional_token yields Some("") for an env var set to ""; no bearer can equal "" because HTTP strips the trailing space, so the server locks out (fail closed)
+  await check("http: an empty configured agent or admin token prevents startup", () => {
+    const { configPath } = makeIsolatedConfig({ dir: path.join(TMP, "http-empty") });
+    const env = { DB_MCP_AUTH_TOKEN: randomUUID(), DB_MCP_ADMIN_TOKEN: randomUUID() };
+    for (const tokenVariable of Object.keys(env)) {
+      const r = runBin(["serve", "--transport", "http", "--bind", "127.0.0.1:0", "--config", configPath], {
+        env: { ...env, [tokenVariable]: "" },
+        timeout: 5000,
+      });
+      assert.equal(r.status, 1, `expected startup to fail with empty ${tokenVariable}`);
+      assert.match(r.stderr, /HTTP token must be non-empty/);
+    }
+  });
 
   // -------------------------------------------------------------------------------------------
   console.log(`\nF13 summary: pass=${stats.pass} fail=${stats.fail} xfail(known-bug)=${stats.xfail} xpass=${stats.xpass}`);

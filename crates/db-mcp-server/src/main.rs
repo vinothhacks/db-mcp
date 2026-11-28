@@ -1,6 +1,7 @@
 //! DB-MCP server binary entrypoint supporting stdio, Streamable HTTP, and out-of-band admin approvals.
 
 use std::collections::VecDeque;
+use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,7 +19,8 @@ use db_mcp_mcp::{JsonRpcRequest, McpProtocolHandler, ServerConfig};
 use db_mcp_secrets::{CompositeSecretProvider, SecretProvider, StaticSecretProvider};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use subtle::ConstantTimeEq;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -202,15 +204,26 @@ pub struct AdminOntologyPublishPayload {
 }
 
 fn denied_json(err: &db_mcp_core::DbMcpError) -> serde_json::Value {
-    serde_json::to_value(err.to_denied_response(None, None)).unwrap_or_else(|_| json!({"status": "denied"}))
+    serde_json::to_value(err.to_denied_response(None, None))
+        .unwrap_or_else(|_| json!({"status": "denied"}))
 }
 
 /// Open the ontology store for the admin CLI; review requires a persistent store.
-fn cli_ontology_service(cfg: &ServerConfig, connection: &str) -> anyhow::Result<db_mcp_ontology::OntologyService> {
+fn cli_ontology_service(
+    cfg: &ServerConfig,
+    connection: &str,
+) -> anyhow::Result<db_mcp_ontology::OntologyService> {
     if !cfg.connections.iter().any(|c| c.id == connection) {
         anyhow::bail!("Unknown connection '{connection}' in configuration");
     }
-    if cfg.ontology.storage_path.as_deref().map(str::trim).unwrap_or("").is_empty() {
+    if cfg
+        .ontology
+        .storage_path
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
         anyhow::bail!(
             "ontology.storage_path is not set: the server keeps the ontology in memory, so an out-of-band review would have no effect. Configure a persistent [ontology] storage_path."
         );
@@ -232,12 +245,15 @@ fn resolve_optional_token(raw: Option<&str>) -> anyhow::Result<Option<String>> {
     let secrets = CompositeSecretProvider::with_static_and_env(StaticSecretProvider::new());
     // Fail closed: a configured token reference that cannot be resolved must never
     // silently disable authentication.
-    let sec = secrets.resolve_dsn(token_ref).map_err(|e| {
-        anyhow::anyhow!(
-            "HTTP token reference '{token_ref}' could not be resolved ({e}); set the variable or remove the setting"
-        )
+    let sec = secrets.resolve_dsn(token_ref).map_err(|_| {
+        anyhow::anyhow!("HTTP token reference could not be resolved; check the configured secret")
     })?;
-    Ok(Some(sec.expose_secret().to_string()))
+    let token = sec.expose_secret();
+    anyhow::ensure!(
+        !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_graphic()),
+        "HTTP token must be non-empty and contain only visible ASCII characters"
+    );
+    Ok(Some(token.to_owned()))
 }
 
 fn check_bearer(headers: &HeaderMap, expected: Option<&str>) -> bool {
@@ -247,11 +263,11 @@ fn check_bearer(headers: &HeaderMap, expected: Option<&str>) -> bool {
     let Some(header_val) = headers.get("authorization").and_then(|v| v.to_str().ok()) else {
         return false;
     };
-    header_val
-        .strip_prefix("Bearer ")
-        .or_else(|| header_val.strip_prefix("bearer "))
-        .map(|tok| tok.trim() == exp)
-        .unwrap_or(false)
+    let Some((scheme, token)) = header_val.split_once(' ') else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("Bearer")
+        && bool::from(token.trim().as_bytes().ct_eq(exp.as_bytes()))
 }
 
 /// Guard for `/admin/*` endpoints: they fail closed when no admin token is configured.
@@ -273,7 +289,9 @@ fn admin_guard(
     if !check_bearer(headers, expected) {
         return Some((
             StatusCode::UNAUTHORIZED,
-            Json(json!({ "status": "denied", "code": "UNAUTHORIZED", "message": "Invalid admin token" })),
+            Json(
+                json!({ "status": "denied", "code": "UNAUTHORIZED", "message": "Invalid admin token" }),
+            ),
         ));
     }
     None
@@ -348,7 +366,10 @@ pub fn build_http_router(state: HttpAppState) -> Router {
         .route("/metrics", get(handle_metrics))
         .route("/admin/approve", post(handle_admin_approve))
         .route("/admin/ontology/review", post(handle_admin_ontology_review))
-        .route("/admin/ontology/publish", post(handle_admin_ontology_publish))
+        .route(
+            "/admin/ontology/publish",
+            post(handle_admin_ontology_publish),
+        )
         .with_state(Arc::new(state))
 }
 
@@ -359,20 +380,16 @@ async fn handle_health(State(state): State<Arc<HttpAppState>>) -> impl IntoRespo
         "server_name": cfg.server_name,
         "server_version": cfg.server_version,
         "connections": cfg.connections.len(),
-        "tools": state.handler.list_tools().len()
+        "tools": state.handler.tool_count()
     }))
 }
 
 async fn handle_metrics(State(state): State<Arc<HttpAppState>>) -> impl IntoResponse {
-    let audit_count = state
-        .handler
-        .audit_events()
-        .map(|e| e.len())
-        .unwrap_or(0);
+    let audit_count = state.handler.audit_events().map(|e| e.len()).unwrap_or(0);
     Json(json!({
         "status": "ok",
         "audit_events_total": audit_count,
-        "registered_tools": state.handler.list_tools().len(),
+        "registered_tools": state.handler.tool_count(),
         "configured_connections": state.handler.config().connections.len()
     }))
 }
@@ -415,14 +432,21 @@ async fn handle_admin_approve(
     if let Some(rejection) = admin_guard(&headers, state.expected_admin_token.as_deref()) {
         return rejection;
     }
-    let approver = CallerIdentity::new(&payload.approver, &payload.role, vec!["*".to_string()], "http-admin");
+    let approver = CallerIdentity::new(
+        &payload.approver,
+        &payload.role,
+        vec!["*".to_string()],
+        "http-admin",
+    );
     match state
         .handler
         .approve_change(&payload.change_id, &approver, payload.comment)
     {
         Ok(proposal) => (
             StatusCode::OK,
-            Json(json!({ "status": "ok", "proposal": proposal, "warnings": state.handler.approval_warnings() })),
+            Json(
+                json!({ "status": "ok", "proposal": proposal, "warnings": state.handler.approval_warnings() }),
+            ),
         ),
         Err(err) => {
             let denied = err.to_denied_response(None, None);
@@ -445,10 +469,17 @@ async fn handle_admin_ontology_review(
     let Some(action) = db_mcp_ontology::ReviewAction::parse(&payload.action) else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"status": "denied", "code": "INVALID_ARGUMENT", "message": "action must be approve, reject or deprecate"})),
+            Json(
+                json!({"status": "denied", "code": "INVALID_ARGUMENT", "message": "action must be approve, reject or deprecate"}),
+            ),
         );
     };
-    let reviewer = CallerIdentity::new(&payload.reviewer, &payload.role, vec!["*".to_string()], "http-admin");
+    let reviewer = CallerIdentity::new(
+        &payload.reviewer,
+        &payload.role,
+        vec!["*".to_string()],
+        "http-admin",
+    );
     match state.handler.review_ontology(
         &reviewer,
         &payload.connection,
@@ -473,9 +504,21 @@ async fn handle_admin_ontology_publish(
     if let Some(rejection) = admin_guard(&headers, state.expected_admin_token.as_deref()) {
         return rejection;
     }
-    let reviewer = CallerIdentity::new(&payload.reviewer, &payload.role, vec!["*".to_string()], "http-admin");
-    match state.handler.publish_ontology(&reviewer, &payload.connection).await {
-        Ok(revision) => (StatusCode::OK, Json(json!({"status": "ok", "revision": revision}))),
+    let reviewer = CallerIdentity::new(
+        &payload.reviewer,
+        &payload.role,
+        vec!["*".to_string()],
+        "http-admin",
+    );
+    match state
+        .handler
+        .publish_ontology(&reviewer, &payload.connection)
+        .await
+    {
+        Ok(revision) => (
+            StatusCode::OK,
+            Json(json!({"status": "ok", "revision": revision})),
+        ),
         Err(err) => (StatusCode::BAD_REQUEST, Json(denied_json(&err))),
     }
 }
@@ -493,7 +536,13 @@ fn verify_audit_stores(cfg: &ServerConfig) -> (bool, Vec<Value>) {
         all_ok &= ok;
         results.push(json!({ "store": store, "path": path, "chain_valid": ok, "error": err }));
     };
-    if let Some(p) = cfg.audit.jsonl_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+    if let Some(p) = cfg
+        .audit
+        .jsonl_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
         let v = if std::path::Path::new(p).exists() {
             db_mcp_audit::JsonlAuditStore::new(p).and_then(|st| st.verify_chain())
         } else {
@@ -501,7 +550,13 @@ fn verify_audit_stores(cfg: &ServerConfig) -> (bool, Vec<Value>) {
         };
         push("jsonl", p, v);
     }
-    if let Some(p) = cfg.audit.sqlite_path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+    if let Some(p) = cfg
+        .audit
+        .sqlite_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
         let v = if std::path::Path::new(p).exists() {
             db_mcp_audit::SqliteAuditStore::open(p).and_then(|st| st.verify_chain())
         } else {
@@ -529,12 +584,18 @@ fn base_check_report(conn: &db_mcp_mcp::ConnectionConfig, backend: &str) -> Valu
     })
 }
 
-async fn check_sqlserver_connection(conn: &db_mcp_mcp::ConnectionConfig, mut report: Value) -> (Value, bool) {
-    let secrets = db_mcp_secrets::CompositeSecretProvider::with_static_and_env(db_mcp_secrets::StaticSecretProvider::new());
-    let adapter = match conn
-        .resolve_dsn(&secrets)
-        .and_then(|dsn| db_mcp_sqlserver::SqlServerAdapter::new(db_mcp_sqlserver::SqlServerConfig::new(&conn.id, dsn)))
-    {
+async fn check_sqlserver_connection(
+    conn: &db_mcp_mcp::ConnectionConfig,
+    mut report: Value,
+) -> (Value, bool) {
+    let secrets = db_mcp_secrets::CompositeSecretProvider::with_static_and_env(
+        db_mcp_secrets::StaticSecretProvider::new(),
+    );
+    let adapter = match conn.resolve_dsn(&secrets).and_then(|dsn| {
+        db_mcp_sqlserver::SqlServerAdapter::new(db_mcp_sqlserver::SqlServerConfig::new(
+            &conn.id, dsn,
+        ))
+    }) {
         Ok(a) => a,
         Err(e) => {
             report["warnings"] = json!([db_mcp_secrets::redact_sensitive_text(&e.to_string())]);
@@ -555,9 +616,32 @@ async fn check_sqlserver_connection(conn: &db_mcp_mcp::ConnectionConfig, mut rep
     report["warnings"] = json!(c.warnings);
     if let Some(code) = &c.error_code {
         report["error_code"] = json!(code);
-        report["next_action"] = json!("check host, port, instance, login and password (env:/file: DSN reference), then retry");
+        report["next_action"] = json!(
+            "check host, port, instance, login and password (env:/file: DSN reference), then retry"
+        );
     }
     (report, c.can_connect && c.select_1)
+}
+
+const MAX_STDIO_LINE_BYTES: usize = 2 * 1024 * 1024;
+
+async fn read_stdio_line(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    line: &mut Vec<u8>,
+) -> io::Result<usize> {
+    // A cancelled read may already have appended bytes. Include them in the limit.
+    let remaining = MAX_STDIO_LINE_BYTES.saturating_sub(line.len());
+    let read = reader
+        .take((remaining + 1) as u64)
+        .read_until(b'\n', line)
+        .await?;
+    if line.len() > MAX_STDIO_LINE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stdio request exceeds the 2 MiB line limit",
+        ));
+    }
+    Ok(read)
 }
 
 async fn run_stdio_loop(handler: McpProtocolHandler, caller: CallerIdentity) -> anyhow::Result<()> {
@@ -572,7 +656,7 @@ async fn run_stdio_loop(handler: McpProtocolHandler, caller: CallerIdentity) -> 
             Some(line) => line,
             None => {
                 if !eof {
-                    eof = reader.read_until(b'\n', &mut incoming).await? == 0;
+                    eof = read_stdio_line(&mut reader, &mut incoming).await? == 0;
                 }
                 if incoming.is_empty() {
                     break;
@@ -607,7 +691,7 @@ async fn run_stdio_loop(handler: McpProtocolHandler, caller: CallerIdentity) -> 
                     write_stdio_response(&mut stdout, result).await?;
                     break;
                 }
-                read = reader.read_until(b'\n', &mut incoming), if !eof && pending.len() < 64 => {
+                read = read_stdio_line(&mut reader, &mut incoming), if !eof && pending.len() < 64 => {
                     eof = read? == 0;
                     if incoming.is_empty() {
                         continue;
@@ -626,9 +710,16 @@ async fn run_stdio_loop(handler: McpProtocolHandler, caller: CallerIdentity) -> 
     Ok(())
 }
 
-fn stdio_cancellation(incoming: &[u8], active_line: &str, active_request_id: &str) -> Option<Value> {
+fn stdio_cancellation(
+    incoming: &[u8],
+    active_line: &str,
+    active_request_id: &str,
+) -> Option<Value> {
     let mut request: Value = serde_json::from_slice(incoming).ok()?;
-    if !matches!(request.get("method")?.as_str()?, "cancel" | "notifications/cancelled") {
+    if !matches!(
+        request.get("method")?.as_str()?,
+        "cancel" | "notifications/cancelled"
+    ) {
         return None;
     }
     let active: Value = serde_json::from_str(active_line).ok()?;
@@ -636,8 +727,12 @@ fn stdio_cancellation(incoming: &[u8], active_line: &str, active_request_id: &st
         return None;
     }
     let params = request.get_mut("params")?.as_object_mut()?;
-    let target = params.get("requestId").or_else(|| params.get("request_id"))?;
-    let id = active.get("id").filter(|id| id.is_number() || id.is_string())?;
+    let target = params
+        .get("requestId")
+        .or_else(|| params.get("request_id"))?;
+    let id = active
+        .get("id")
+        .filter(|id| id.is_number() || id.is_string())?;
     // The explicit cancel method historically accepted a string ID.
     if target != id && !(id.is_number() && target.as_str() == Some(id.to_string().as_str())) {
         return None;
@@ -700,7 +795,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         Commands::CheckConnection { config, connection } => {
             let parsed = ServerConfig::from_file(&config)?;
             let (all_ok, results) = check_connections(&parsed, connection.as_deref()).await?;
-            let out = if results.len() == 1 { results[0].clone() } else { Value::Array(results) };
+            let out = if results.len() == 1 {
+                results[0].clone()
+            } else {
+                Value::Array(results)
+            };
             println!("{}", serde_json::to_string_pretty(&out)?);
             if !all_ok {
                 std::process::exit(3);
@@ -709,7 +808,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         }
         Commands::Selftest => {
             let mut config = ServerConfig::default_demo();
-            config.connections.retain(|connection| connection.id == "local-sqlite");
+            config
+                .connections
+                .retain(|connection| connection.id == "local-sqlite");
             config.named_tools.clear();
             let handler = McpProtocolHandler::from_config(config)?;
             let result = handler
@@ -719,7 +820,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     &CallerIdentity::local_agent("selftest"),
                 )
                 .await;
-            anyhow::ensure!(result["status"].as_str() == Some("ok"), "SQLite selftest failed: {result}");
+            anyhow::ensure!(
+                result["status"].as_str() == Some("ok"),
+                "SQLite selftest failed: {result}"
+            );
             println!("DB MCP selftest passed (in-memory SQLite query).");
             Ok(())
         }
@@ -783,7 +887,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             }
             let caller = CallerIdentity::new(approver, role, vec!["*".to_string()], "cli");
             let outcome = changes.approve_change(&change_id, &caller, comment);
-            let conn = outcome.as_ref().map(|p| p.connection.clone()).unwrap_or_else(|_| "server".to_string());
+            let conn = outcome
+                .as_ref()
+                .map(|p| p.connection.clone())
+                .unwrap_or_else(|_| "server".to_string());
             audit_admin_action(
                 &cfg,
                 &caller,
@@ -819,7 +926,10 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
             let admin_token_ref = cfg.http.admin_token.clone();
             let (audit_ok, audit_results) = verify_audit_stores(&cfg);
             if !audit_ok {
-                eprintln!("[db-mcp] WARNING: audit chain integrity check FAILED (possible tampering): {}", Value::Array(audit_results));
+                eprintln!(
+                    "[db-mcp] WARNING: audit chain integrity check FAILED (possible tampering): {}",
+                    Value::Array(audit_results)
+                );
             }
             let handler = McpProtocolHandler::from_config(cfg)?;
             for w in handler.approval_warnings() {
@@ -828,13 +938,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
             match transport.trim().to_ascii_lowercase().as_str() {
                 "stdio" => {
-                    let caller = CallerIdentity::new(principal, role, vec!["*".to_string()], "stdio");
+                    let caller =
+                        CallerIdentity::new(principal, role, vec!["*".to_string()], "stdio");
                     run_stdio_loop(handler, caller).await
                 }
                 "http" => {
                     let expected_auth_token = resolve_optional_token(auth_token_ref.as_deref())?;
                     let expected_admin_token = resolve_optional_token(admin_token_ref.as_deref())?;
-                    let addresses: Vec<SocketAddr> = tokio::net::lookup_host(&bind_addr).await?.collect();
+                    let addresses: Vec<SocketAddr> =
+                        tokio::net::lookup_host(&bind_addr).await?.collect();
                     if expected_auth_token.is_none() {
                         anyhow::ensure!(
                             addresses.iter().all(|addr| addr.ip().is_loopback()),
@@ -844,7 +956,12 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     }
                     let state = HttpAppState {
                         handler,
-                        default_caller: CallerIdentity::new(principal, role, vec!["*".to_string()], "http"),
+                        default_caller: CallerIdentity::new(
+                            principal,
+                            role,
+                            vec!["*".to_string()],
+                            "http",
+                        ),
                         expected_auth_token,
                         expected_admin_token,
                     };
@@ -853,7 +970,9 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                     axum::serve(listener, app).await?;
                     Ok(())
                 }
-                other => anyhow::bail!("Unsupported transport '{other}' (expected 'stdio' or 'http')"),
+                other => {
+                    anyhow::bail!("Unsupported transport '{other}' (expected 'stdio' or 'http')")
+                }
             }
         }
     }
@@ -862,14 +981,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 /// Run the read-only connection smoke test. Live MySQL and SQL Server connections are checked by the adapter
 /// itself (grants, version, read-only session); every other connection goes through the governed
 /// runtime as an admin caller (`SELECT 1` + catalog count). Never prints DSNs or passwords.
-async fn check_connections(cfg: &ServerConfig, only: Option<&str>) -> anyhow::Result<(bool, Vec<Value>)> {
+async fn check_connections(
+    cfg: &ServerConfig,
+    only: Option<&str>,
+) -> anyhow::Result<(bool, Vec<Value>)> {
     let selected: Vec<&db_mcp_mcp::ConnectionConfig> = cfg
         .connections
         .iter()
         .filter(|c| only.map(|id| c.id == id).unwrap_or(true))
         .collect();
     if selected.is_empty() {
-        anyhow::bail!("Unknown connection '{}' in configuration", only.unwrap_or_default());
+        anyhow::bail!(
+            "Unknown connection '{}' in configuration",
+            only.unwrap_or_default()
+        );
     }
     let mut results = Vec::new();
     let mut all_ok = true;
@@ -877,8 +1002,12 @@ async fn check_connections(cfg: &ServerConfig, only: Option<&str>) -> anyhow::Re
     for conn in selected {
         let backend = conn.effective_backend()?;
         let result = if conn.engine == db_mcp_core::DatabaseEngine::SqlServer {
-            check_sqlserver_connection(conn, base_check_report(conn, backend)).await.0
-        } else if conn.engine == db_mcp_core::DatabaseEngine::MySql && backend == db_mcp_mcp::config::BACKEND_LIVE {
+            check_sqlserver_connection(conn, base_check_report(conn, backend))
+                .await
+                .0
+        } else if conn.engine == db_mcp_core::DatabaseEngine::MySql
+            && backend == db_mcp_mcp::config::BACKEND_LIVE
+        {
             check_mysql_live(conn).await
         } else {
             if runtime.is_none() {
@@ -886,7 +1015,10 @@ async fn check_connections(cfg: &ServerConfig, only: Option<&str>) -> anyhow::Re
             }
             check_via_runtime(runtime.as_ref().expect("runtime"), conn, backend).await
         };
-        all_ok &= result.get("can_connect").and_then(Value::as_bool).unwrap_or(false);
+        all_ok &= result
+            .get("can_connect")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         results.push(result);
     }
     Ok((all_ok, results))
@@ -921,7 +1053,11 @@ async fn check_mysql_live(conn: &db_mcp_mcp::ConnectionConfig) -> Value {
     }
 }
 
-async fn check_via_runtime(runtime: &db_mcp_mcp::DbMcpRuntime, conn: &db_mcp_mcp::ConnectionConfig, backend: &str) -> Value {
+async fn check_via_runtime(
+    runtime: &db_mcp_mcp::DbMcpRuntime,
+    conn: &db_mcp_mcp::ConnectionConfig,
+    backend: &str,
+) -> Value {
     let admin = CallerIdentity::new("check-connection", "admin", vec!["*".to_string()], "cli");
     let mut warnings = Vec::new();
     if backend == db_mcp_mcp::config::BACKEND_SIMULATED {
@@ -932,19 +1068,33 @@ async fn check_via_runtime(runtime: &db_mcp_mcp::DbMcpRuntime, conn: &db_mcp_mcp
         ));
     }
     let select = runtime
-        .call_tool("execute_query", json!({"connection": conn.id, "sql": "SELECT 1 AS one"}), &admin)
+        .call_tool(
+            "execute_query",
+            json!({"connection": conn.id, "sql": "SELECT 1 AS one"}),
+            &admin,
+        )
         .await;
     let select_1 = select.get("status").and_then(Value::as_str) == Some("ok");
     if !select_1 {
         warnings.push(format!(
             "SELECT 1 failed: {}",
-            select.get("message").and_then(Value::as_str).unwrap_or("unknown error")
+            select
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
         ));
     }
     let search = runtime
-        .call_tool("search_objects", json!({"connection": conn.id, "detail_level": "names", "limit": 1}), &admin)
+        .call_tool(
+            "search_objects",
+            json!({"connection": conn.id, "detail_level": "names", "limit": 1}),
+            &admin,
+        )
         .await;
-    let object_count = search.pointer("/data/total_count").cloned().unwrap_or(Value::Null);
+    let object_count = search
+        .pointer("/data/total_count")
+        .cloned()
+        .unwrap_or(Value::Null);
     json!({
         "connection": conn.id,
         "engine": conn.engine.as_str(),
@@ -962,16 +1112,26 @@ async fn check_via_runtime(runtime: &db_mcp_mcp::DbMcpRuntime, conn: &db_mcp_mcp
 async fn run_ontology_command(command: OntologyCommand) -> anyhow::Result<()> {
     use db_mcp_ontology::{DefinitionKind, DefinitionStatus, ReviewAction};
     match command {
-        OntologyCommand::List { connection, status, kind, config } => {
+        OntologyCommand::List {
+            connection,
+            status,
+            kind,
+            config,
+        } => {
             let cfg = load_server_config(Some(&config))?;
             let svc = cli_ontology_service(&cfg, &connection)?;
             let status = status
                 .as_deref()
-                .map(|s| DefinitionStatus::parse(s).ok_or_else(|| anyhow::anyhow!("unknown status '{s}'")))
+                .map(|s| {
+                    DefinitionStatus::parse(s)
+                        .ok_or_else(|| anyhow::anyhow!("unknown status '{s}'"))
+                })
                 .transpose()?;
             let kind = kind
                 .as_deref()
-                .map(|k| DefinitionKind::parse(k).ok_or_else(|| anyhow::anyhow!("unknown kind '{k}'")))
+                .map(|k| {
+                    DefinitionKind::parse(k).ok_or_else(|| anyhow::anyhow!("unknown kind '{k}'"))
+                })
                 .transpose()?;
             let rows: Vec<serde_json::Value> = svc
                 .store
@@ -992,24 +1152,48 @@ async fn run_ontology_command(command: OntologyCommand) -> anyhow::Result<()> {
                     })
                 })
                 .collect();
-            println!("{}", serde_json::to_string_pretty(&json!({"status": "ok", "count": rows.len(), "definitions": rows}))?);
-            Ok(())
-        }
-        OntologyCommand::Show { connection, def_id, config } => {
-            let cfg = load_server_config(Some(&config))?;
-            let svc = cli_ontology_service(&cfg, &connection)?;
-            let versions = svc.store.versions(&cfg.ontology.tenant_id, &connection, &def_id)?;
-            if versions.is_empty() {
-                anyhow::bail!("Definition '{def_id}' not found on '{connection}'");
-            }
-            let certifications = svc.store.certifications(&cfg.ontology.tenant_id, &connection, &def_id)?;
             println!(
                 "{}",
-                serde_json::to_string_pretty(&json!({"status": "ok", "versions": versions, "certifications": certifications}))?
+                serde_json::to_string_pretty(
+                    &json!({"status": "ok", "count": rows.len(), "definitions": rows})
+                )?
             );
             Ok(())
         }
-        OntologyCommand::Review { connection, def_id, version, action, reviewer, role, reason, config } => {
+        OntologyCommand::Show {
+            connection,
+            def_id,
+            config,
+        } => {
+            let cfg = load_server_config(Some(&config))?;
+            let svc = cli_ontology_service(&cfg, &connection)?;
+            let versions = svc
+                .store
+                .versions(&cfg.ontology.tenant_id, &connection, &def_id)?;
+            if versions.is_empty() {
+                anyhow::bail!("Definition '{def_id}' not found on '{connection}'");
+            }
+            let certifications =
+                svc.store
+                    .certifications(&cfg.ontology.tenant_id, &connection, &def_id)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &json!({"status": "ok", "versions": versions, "certifications": certifications})
+                )?
+            );
+            Ok(())
+        }
+        OntologyCommand::Review {
+            connection,
+            def_id,
+            version,
+            action,
+            reviewer,
+            role,
+            reason,
+            config,
+        } => {
             let cfg = load_server_config(Some(&config))?;
             let svc = cli_ontology_service(&cfg, &connection)?;
             let action = ReviewAction::parse(&action)
@@ -1037,7 +1221,12 @@ async fn run_ontology_command(command: OntologyCommand) -> anyhow::Result<()> {
             );
             Ok(())
         }
-        OntologyCommand::Publish { connection, reviewer, role, config } => {
+        OntologyCommand::Publish {
+            connection,
+            reviewer,
+            role,
+            config,
+        } => {
             let cfg = load_server_config(Some(&config))?;
             let svc = cli_ontology_service(&cfg, &connection)?;
             let caller = CallerIdentity::new(reviewer, role, vec!["*".to_string()], "cli");
@@ -1051,22 +1240,36 @@ async fn run_ontology_command(command: OntologyCommand) -> anyhow::Result<()> {
                 outcome.as_ref().map(|_| ()),
             );
             let revision = outcome?;
-            println!("{}", serde_json::to_string_pretty(&json!({"status": "ok", "revision": revision}))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({"status": "ok", "revision": revision}))?
+            );
             Ok(())
         }
-        OntologyCommand::Eval { connection, cases, config } => {
+        OntologyCommand::Eval {
+            connection,
+            cases,
+            config,
+        } => {
             let cfg = load_server_config(Some(&config))?;
-            let raw = std::fs::read_to_string(&cases)
-                .map_err(|e| anyhow::anyhow!("cannot read golden cases {}: {e}", cases.display()))?;
+            let raw = std::fs::read_to_string(&cases).map_err(|e| {
+                anyhow::anyhow!("cannot read golden cases {}: {e}", cases.display())
+            })?;
             let cases: Vec<db_mcp_ontology::GoldenCase> = serde_json::from_str(&raw)?;
             let runtime = db_mcp_mcp::DbMcpRuntime::from_config(cfg)?;
-            let evaluator = CallerIdentity::new("ontology-eval", "admin", vec!["*".to_string()], "cli");
+            let evaluator =
+                CallerIdentity::new("ontology-eval", "admin", vec!["*".to_string()], "cli");
             let mut plans = Vec::new();
             for case in &cases {
-                plans.push(runtime.plan_question(&evaluator, &connection, &case.question, None).await?);
+                plans.push(
+                    runtime
+                        .plan_question(&evaluator, &connection, &case.question, None)
+                        .await?,
+                );
             }
             let mut iter = plans.into_iter();
-            let report = db_mcp_ontology::evaluate(&cases, |_| iter.next().expect("one plan per case"));
+            let report =
+                db_mcp_ontology::evaluate(&cases, |_| iter.next().expect("one plan per case"));
             println!("{}", serde_json::to_string_pretty(&report)?);
             if !report.all_gates_passed() {
                 anyhow::bail!("golden evaluation gates failed");
@@ -1082,10 +1285,31 @@ mod tests {
 
     #[test]
     fn cli_parses_verify_config_and_default_serve() {
-        let cli = Cli::parse_from(["db-mcp-server", "verify-config", "--config", "config/db-mcp.example.toml"]);
-        assert!(matches!(cli.command, Some(Commands::VerifyConfig { live: false, .. })));
-        let cli = Cli::parse_from(["db-mcp-server", "check-connection", "--config", "c.toml", "--connection", "m"]);
-        assert!(matches!(cli.command, Some(Commands::CheckConnection { connection: Some(_), .. })));
+        let cli = Cli::parse_from([
+            "db-mcp-server",
+            "verify-config",
+            "--config",
+            "config/db-mcp.example.toml",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::VerifyConfig { live: false, .. })
+        ));
+        let cli = Cli::parse_from([
+            "db-mcp-server",
+            "check-connection",
+            "--config",
+            "c.toml",
+            "--connection",
+            "m",
+        ]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::CheckConnection {
+                connection: Some(_),
+                ..
+            })
+        ));
 
         let default_cli = Cli::parse_from(["db-mcp-server"]);
         assert!(default_cli.command.is_none());
@@ -1112,5 +1336,36 @@ mod tests {
             .approve_change(&change_id, &admin, Some("LGTM".to_string()))
             .unwrap();
         assert_eq!(approved.change_id, change_id);
+    }
+
+    #[tokio::test]
+    async fn stdio_line_limit_counts_bytes_from_an_interrupted_read() {
+        let mut line = vec![b' '; MAX_STDIO_LINE_BYTES - 1];
+        let mut reader = b"\nnext\n".as_slice();
+        assert_eq!(read_stdio_line(&mut reader, &mut line).await.unwrap(), 1);
+        assert_eq!(line.len(), MAX_STDIO_LINE_BYTES);
+        line.clear();
+        read_stdio_line(&mut reader, &mut line).await.unwrap();
+        assert_eq!(line, b"next\n");
+
+        line.resize(MAX_STDIO_LINE_BYTES, b' ');
+        let err = read_stdio_line(&mut b" ".as_slice(), &mut line)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn invalid_resolved_http_tokens_are_rejected() {
+        let path = std::env::temp_dir().join(format!("db-mcp-token-{}", uuid::Uuid::new_v4()));
+        let reference = format!("file:{}", path.display());
+        for value in ["", "  \r\n", "a\nb", "a b"] {
+            std::fs::write(&path, value).unwrap();
+            let resolved = resolve_optional_token(Some(&reference));
+            std::fs::remove_file(&path).unwrap();
+            assert!(resolved.is_err());
+        }
+        let err = resolve_optional_token(Some(&reference)).unwrap_err();
+        assert!(!err.to_string().contains(path.to_str().unwrap()));
     }
 }

@@ -130,7 +130,9 @@ impl SqlServerDsn {
 
         let (host_part, port) = if let Some(stripped) = authority.strip_prefix('[') {
             // IPv6 literal: [::1]:1433
-            let end = stripped.find(']').ok_or_else(|| bad("unterminated IPv6 host"))?;
+            let end = stripped
+                .find(']')
+                .ok_or_else(|| bad("unterminated IPv6 host"))?;
             let host = &stripped[..end];
             let tail = &stripped[end + 1..];
             let port = match tail.strip_prefix(':') {
@@ -242,10 +244,13 @@ impl SqlServerDsn {
 
     /// Credential-free description, e.g. `ro_user@10.0.0.5:33333 (instance V2DEMO, database <login default>)`.
     pub fn display_target(&self) -> String {
-        let port = self
-            .port
-            .map(|p| format!(":{p}"))
-            .unwrap_or_else(|| if self.instance.is_some() { String::new() } else { ":1433".to_string() });
+        let port = self.port.map(|p| format!(":{p}")).unwrap_or_else(|| {
+            if self.instance.is_some() {
+                String::new()
+            } else {
+                ":1433".to_string()
+            }
+        });
         let mut out = format!("{}@{}{}", self.user, self.host, port);
         let mut extras = Vec::new();
         if let Some(i) = &self.instance {
@@ -272,7 +277,9 @@ pub fn scrub_secret(text: &str, secret: &str) -> String {
         return text.to_string();
     }
     let mut out = text.replace(secret, "***");
-    let encoded: String = percent_encoding::utf8_percent_encode(secret, percent_encoding::NON_ALPHANUMERIC).to_string();
+    let encoded: String =
+        percent_encoding::utf8_percent_encode(secret, percent_encoding::NON_ALPHANUMERIC)
+            .to_string();
     if encoded != secret {
         out = out.replace(&encoded, "***");
     }
@@ -285,7 +292,10 @@ mod tests {
 
     #[test]
     fn parses_named_instance_with_port_and_encoded_password() {
-        let d = SqlServerDsn::parse("sqlserver://ro_user:P%40ss%29w%24rd@10.0.0.5:33333?instance=V2DEMO").unwrap();
+        let d = SqlServerDsn::parse(
+            "sqlserver://ro_user:P%40ss%29w%24rd@10.0.0.5:33333?instance=V2DEMO",
+        )
+        .unwrap();
         assert_eq!(d.user, "ro_user");
         assert_eq!(d.password(), "P@ss)w$rd");
         assert_eq!(d.host, "10.0.0.5");
@@ -295,7 +305,12 @@ mod tests {
         assert_eq!(d.encryption, SqlServerEncryption::Required);
         assert!(!d.trust_server_certificate);
         let shown = d.display_target();
-        assert!(!shown.contains("P@ss") && shown.contains("instance V2DEMO") && shown.contains(":33333"), "{shown}");
+        assert!(
+            !shown.contains("P@ss")
+                && shown.contains("instance V2DEMO")
+                && shown.contains(":33333"),
+            "{shown}"
+        );
         assert!(!format!("{d:?}").contains("P@ss"));
     }
 
@@ -310,7 +325,8 @@ mod tests {
         assert_eq!(d.encryption, SqlServerEncryption::Required);
         assert!(!d.trust_server_certificate);
         assert_eq!(d.connect_timeout_secs, 5);
-        let d = SqlServerDsn::parse("sqlserver://u:p@h:1433?database=Sales&Encrypt=Strict").unwrap();
+        let d =
+            SqlServerDsn::parse("sqlserver://u:p@h:1433?database=Sales&Encrypt=Strict").unwrap();
         assert_eq!(d.database.as_deref(), Some("Sales"));
         assert_eq!(d.encryption, SqlServerEncryption::Strict);
     }

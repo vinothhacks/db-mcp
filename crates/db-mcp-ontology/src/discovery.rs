@@ -50,7 +50,12 @@ pub fn singular(phrase: &str) -> String {
         let w = last.clone();
         *last = if w.len() > 4 && w.ends_with("ies") {
             format!("{}y", &w[..w.len() - 3])
-        } else if w.len() > 4 && (w.ends_with("sses") || w.ends_with("ches") || w.ends_with("shes") || w.ends_with("xes")) {
+        } else if w.len() > 4
+            && (w.ends_with("sses")
+                || w.ends_with("ches")
+                || w.ends_with("shes")
+                || w.ends_with("xes"))
+        {
             w[..w.len() - 2].to_string()
         } else if w.len() > 3 && w.ends_with('s') && !w.ends_with("ss") && !w.ends_with("us") {
             w[..w.len() - 1].to_string()
@@ -63,16 +68,20 @@ pub fn singular(phrase: &str) -> String {
 
 fn is_numeric_type(data_type: &str) -> bool {
     let t = data_type.to_ascii_lowercase();
-    ["int", "real", "numeric", "decimal", "float", "double", "money", "number", "bigint", "smallint"]
-        .iter()
-        .any(|k| t.contains(k))
+    [
+        "int", "real", "numeric", "decimal", "float", "double", "money", "number", "bigint",
+        "smallint",
+    ]
+    .iter()
+    .any(|k| t.contains(k))
 }
 
 fn type_family(data_type: &str) -> &'static str {
     let t = data_type.to_ascii_lowercase();
     if is_numeric_type(&t) {
         "number"
-    } else if t.contains("char") || t.contains("text") || t.contains("string") || t.contains("uuid") {
+    } else if t.contains("char") || t.contains("text") || t.contains("string") || t.contains("uuid")
+    {
         "text"
     } else if t.contains("date") || t.contains("time") {
         "temporal"
@@ -158,40 +167,65 @@ fn col_dep(table: &str, col: &ColumnSpec) -> ColumnDependency {
 }
 
 /// Resolve a referenced table name (possibly unqualified) to a catalog table's qualified name.
-fn resolve_table<'a>(tables: &[&'a CatalogObject], raw: &str, preferred_schema: &str) -> Option<&'a CatalogObject> {
+fn resolve_table<'a>(
+    tables: &[&'a CatalogObject],
+    raw: &str,
+    preferred_schema: &str,
+) -> Option<&'a CatalogObject> {
     let raw_l = raw.trim_matches('"').to_ascii_lowercase();
     tables
         .iter()
         .find(|t| t.qualified_name().eq_ignore_ascii_case(&raw_l))
         .or_else(|| {
+            tables.iter().find(|t| {
+                t.schema.eq_ignore_ascii_case(preferred_schema)
+                    && t.name.eq_ignore_ascii_case(&base_table_name(&raw_l))
+            })
+        })
+        .or_else(|| {
             tables
                 .iter()
-                .find(|t| t.schema.eq_ignore_ascii_case(preferred_schema) && t.name.eq_ignore_ascii_case(&base_table_name(&raw_l)))
+                .find(|t| t.name.eq_ignore_ascii_case(&base_table_name(&raw_l)))
         })
-        .or_else(|| tables.iter().find(|t| t.name.eq_ignore_ascii_case(&base_table_name(&raw_l))))
         .copied()
 }
 
 /// Build candidate definitions from catalog objects that already passed the restricted filter.
-pub fn discover(objects: &[CatalogObject], scope: &DiscoveryScope) -> (Vec<Definition>, DiscoveryReport) {
+pub fn discover(
+    objects: &[CatalogObject],
+    scope: &DiscoveryScope,
+) -> (Vec<Definition>, DiscoveryReport) {
     let mut report = DiscoveryReport::default();
     let tables: Vec<&CatalogObject> = objects
         .iter()
-        .filter(|o| matches!(o.object_type, CatalogObjectType::Table | CatalogObjectType::View | CatalogObjectType::MaterializedView))
+        .filter(|o| {
+            matches!(
+                o.object_type,
+                CatalogObjectType::Table
+                    | CatalogObjectType::View
+                    | CatalogObjectType::MaterializedView
+            )
+        })
         .collect();
     let measure_re = measure_regex();
     let mut out: Vec<Definition> = Vec::new();
 
     // Routine touchpoints as evidence (never as definitions on their own).
     let mut routine_evidence: BTreeMap<String, Vec<Evidence>> = BTreeMap::new();
-    if objects
-        .iter()
-        .any(|o| matches!(o.object_type, CatalogObjectType::Function | CatalogObjectType::Procedure))
-    {
-        match build_procedure_call_graph(objects, scope.engine, &scope.connection, None, "both", 5) {
+    if objects.iter().any(|o| {
+        matches!(
+            o.object_type,
+            CatalogObjectType::Function | CatalogObjectType::Procedure
+        )
+    }) {
+        match build_procedure_call_graph(objects, scope.engine, &scope.connection, None, "both", 5)
+        {
             Ok(graph) => {
                 for node in graph.nodes {
-                    for (tables_touched, mode) in [(&node.tables_read, "reads"), (&node.tables_written, "writes")] {
+                    for (tables_touched, mode) in [
+                        (&node.tables_read, "reads"),
+                        (&node.tables_written, "writes"),
+                    ] {
                         for t in tables_touched {
                             routine_evidence.entry(base_table_name(t)).or_default().push(Evidence {
                                 source_kind: "routine".to_string(),
@@ -202,7 +236,9 @@ pub fn discover(objects: &[CatalogObject], scope: &DiscoveryScope) -> (Vec<Defin
                     }
                 }
             }
-            Err(e) => report.warnings.push(format!("routine analysis skipped: {e}")),
+            Err(e) => report
+                .warnings
+                .push(format!("routine analysis skipped: {e}")),
         }
     }
 
@@ -214,7 +250,10 @@ pub fn discover(objects: &[CatalogObject], scope: &DiscoveryScope) -> (Vec<Defin
         let mut evidence = vec![Evidence {
             source_kind: table.object_type.as_str().to_string(),
             reference: qualified.clone(),
-            detail: table.comment.as_ref().map(|c| format!("catalog comment (untrusted): {c}")),
+            detail: table
+                .comment
+                .as_ref()
+                .map(|c| format!("catalog comment (untrusted): {c}")),
         }];
         if let Some(extra) = routine_evidence.get(&base_table_name(&table.name)) {
             evidence.extend(extra.iter().cloned());
@@ -229,8 +268,14 @@ pub fn discover(objects: &[CatalogObject], scope: &DiscoveryScope) -> (Vec<Defin
             single.clone(),
             vec![table.name.clone(), human.clone()],
             table.comment.clone(),
-            DefinitionBody::Entity { table: qualified.clone() },
-            vec![ColumnDependency { table: qualified.clone(), column: None, data_type: None }],
+            DefinitionBody::Entity {
+                table: qualified.clone(),
+            },
+            vec![ColumnDependency {
+                table: qualified.clone(),
+                column: None,
+                data_type: None,
+            }],
             evidence,
             EvidenceStrength::Declared,
             DefinitionFlags::default(),
@@ -241,8 +286,14 @@ pub fn discover(objects: &[CatalogObject], scope: &DiscoveryScope) -> (Vec<Defin
             scope,
             format!("metric:{}.count", qualified.to_ascii_lowercase()),
             format!("{single} count"),
-            vec![format!("number of {human}"), format!("count of {human}"), format!("{human} count")],
-            Some(format!("COUNT(*) over {qualified}; grain: one row per {single}")),
+            vec![
+                format!("number of {human}"),
+                format!("count of {human}"),
+                format!("{human} count"),
+            ],
+            Some(format!(
+                "COUNT(*) over {qualified}; grain: one row per {single}"
+            )),
             DefinitionBody::Metric {
                 base_table: qualified.clone(),
                 aggregation: Aggregation::Count,
@@ -251,8 +302,16 @@ pub fn discover(objects: &[CatalogObject], scope: &DiscoveryScope) -> (Vec<Defin
                 unit: Some("rows".to_string()),
                 grain: Some(single.clone()),
             },
-            vec![ColumnDependency { table: qualified.clone(), column: None, data_type: None }],
-            vec![Evidence { source_kind: "catalog".to_string(), reference: qualified.clone(), detail: None }],
+            vec![ColumnDependency {
+                table: qualified.clone(),
+                column: None,
+                data_type: None,
+            }],
+            vec![Evidence {
+                source_kind: "catalog".to_string(),
+                reference: qualified.clone(),
+                detail: None,
+            }],
             EvidenceStrength::Declared,
             DefinitionFlags::default(),
         ));
@@ -269,14 +328,22 @@ pub fn discover(objects: &[CatalogObject], scope: &DiscoveryScope) -> (Vec<Defin
             // Attribute
             out.push(candidate(
                 scope,
-                format!("attribute:{}.{}", qualified.to_ascii_lowercase(), col.name.to_ascii_lowercase()),
+                format!(
+                    "attribute:{}.{}",
+                    qualified.to_ascii_lowercase(),
+                    col.name.to_ascii_lowercase()
+                ),
                 format!("{single} {col_human}"),
                 vec![col_human.clone(), format!("{}.{}", table.name, col.name)],
                 col.comment.clone(),
                 DefinitionBody::Attribute {
                     table: qualified.clone(),
                     column: col.name.clone(),
-                    unit: if col.name.to_ascii_lowercase().ends_with("_cents") { Some("cents".to_string()) } else { None },
+                    unit: if col.name.to_ascii_lowercase().ends_with("_cents") {
+                        Some("cents".to_string())
+                    } else {
+                        None
+                    },
                 },
                 vec![col_dep(&qualified, col)],
                 vec![Evidence {
@@ -285,7 +352,10 @@ pub fn discover(objects: &[CatalogObject], scope: &DiscoveryScope) -> (Vec<Defin
                     detail: Some(format!("type {}, nullable {}", col.data_type, col.nullable)),
                 }],
                 EvidenceStrength::Declared,
-                DefinitionFlags { sensitive, ..Default::default() },
+                DefinitionFlags {
+                    sensitive,
+                    ..Default::default()
+                },
             ));
 
             // Measure (SUM) candidates
@@ -302,18 +372,33 @@ pub fn discover(objects: &[CatalogObject], scope: &DiscoveryScope) -> (Vec<Defin
                     scope,
                     format!("metric:{}.{}.sum", qualified.to_ascii_lowercase(), lname),
                     format!("{single} {col_human}"),
-                    vec![format!("total {col_human}"), format!("sum of {col_human}"), col_human.clone()],
-                    Some(format!("SUM({}) over {qualified}; grain: {single}", col.name)),
+                    vec![
+                        format!("total {col_human}"),
+                        format!("sum of {col_human}"),
+                        col_human.clone(),
+                    ],
+                    Some(format!(
+                        "SUM({}) over {qualified}; grain: {single}",
+                        col.name
+                    )),
                     DefinitionBody::Metric {
                         base_table: qualified.clone(),
                         aggregation: Aggregation::Sum,
                         column: Some(col.name.clone()),
                         default_filters: Vec::new(),
-                        unit: if lname.ends_with("_cents") { Some("cents".to_string()) } else { None },
+                        unit: if lname.ends_with("_cents") {
+                            Some("cents".to_string())
+                        } else {
+                            None
+                        },
                         grain: Some(single.clone()),
                     },
                     vec![col_dep(&qualified, col)],
-                    vec![Evidence { source_kind: "column".to_string(), reference: format!("{qualified}.{}", col.name), detail: Some("numeric measure name pattern".to_string()) }],
+                    vec![Evidence {
+                        source_kind: "column".to_string(),
+                        reference: format!("{qualified}.{}", col.name),
+                        detail: Some("numeric measure name pattern".to_string()),
+                    }],
                     EvidenceStrength::Naming,
                     DefinitionFlags::default(),
                 ));
@@ -323,26 +408,49 @@ pub fn discover(objects: &[CatalogObject], scope: &DiscoveryScope) -> (Vec<Defin
         // Declared FK relationships
         for fk in &table.foreign_keys {
             let Some(target) = resolve_table(&tables, &fk.referenced_table, &table.schema) else {
-                report.warnings.push(format!("FK on {qualified} references unknown or hidden table {}", fk.referenced_table));
+                report.warnings.push(format!(
+                    "FK on {qualified} references unknown or hidden table {}",
+                    fk.referenced_table
+                ));
                 continue;
             };
             let to_q = target.qualified_name();
             let to_cols: Vec<String> = if fk.referenced_columns.is_empty() {
-                target.columns.iter().filter(|c| c.is_primary_key).map(|c| c.name.clone()).collect()
+                target
+                    .columns
+                    .iter()
+                    .filter(|c| c.is_primary_key)
+                    .map(|c| c.name.clone())
+                    .collect()
             } else {
                 fk.referenced_columns.clone()
             };
             if to_cols.len() != fk.columns.len() || to_cols.is_empty() {
-                report.warnings.push(format!("FK on {qualified} -> {to_q} has unresolved column pairs"));
+                report.warnings.push(format!(
+                    "FK on {qualified} -> {to_q} has unresolved column pairs"
+                ));
                 continue;
             }
-            let pairs: Vec<(String, String)> = fk.columns.iter().cloned().zip(to_cols.iter().cloned()).collect();
+            let pairs: Vec<(String, String)> = fk
+                .columns
+                .iter()
+                .cloned()
+                .zip(to_cols.iter().cloned())
+                .collect();
             let mut deps: Vec<ColumnDependency> = Vec::new();
             for (fc, tc) in &pairs {
-                if let Some(c) = table.columns.iter().find(|c| c.name.eq_ignore_ascii_case(fc)) {
+                if let Some(c) = table
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(fc))
+                {
                     deps.push(col_dep(&qualified, c));
                 }
-                if let Some(c) = target.columns.iter().find(|c| c.name.eq_ignore_ascii_case(tc)) {
+                if let Some(c) = target
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(tc))
+                {
                     deps.push(col_dep(&to_q, c));
                 }
             }
@@ -357,7 +465,10 @@ pub fn discover(objects: &[CatalogObject], scope: &DiscoveryScope) -> (Vec<Defin
                     to_q.to_ascii_lowercase()
                 ),
                 format!("{from_h} belongs to {to_h}"),
-                vec![format!("{to_h} {}", humanize(&table.name)), format!("{from_h} {to_h}")],
+                vec![
+                    format!("{to_h} {}", humanize(&table.name)),
+                    format!("{from_h} {to_h}"),
+                ],
                 None,
                 DefinitionBody::Relationship {
                     from_table: qualified.clone(),
@@ -370,7 +481,9 @@ pub fn discover(objects: &[CatalogObject], scope: &DiscoveryScope) -> (Vec<Defin
                 vec![Evidence {
                     source_kind: "foreign_key".to_string(),
                     reference: fk.name.clone().unwrap_or_else(|| format!("{qualified}.fk")),
-                    detail: Some("declared constraint: proves structure, not business meaning".to_string()),
+                    detail: Some(
+                        "declared constraint: proves structure, not business meaning".to_string(),
+                    ),
                 }],
                 EvidenceStrength::Declared,
                 DefinitionFlags::default(),
@@ -381,7 +494,11 @@ pub fn discover(objects: &[CatalogObject], scope: &DiscoveryScope) -> (Vec<Defin
         if scope.include_inferred_joins && !is_view {
             for col in &table.columns {
                 let lname = col.name.to_ascii_lowercase();
-                if col.is_primary_key || fk_columns.contains(&lname) || !lname.ends_with("_id") || lname.len() <= 3 {
+                if col.is_primary_key
+                    || fk_columns.contains(&lname)
+                    || !lname.ends_with("_id")
+                    || lname.len() <= 3
+                {
                     continue;
                 }
                 let stem = &lname[..lname.len() - 3];
@@ -389,7 +506,10 @@ pub fn discover(objects: &[CatalogObject], scope: &DiscoveryScope) -> (Vec<Defin
                     .iter()
                     .filter(|t| {
                         let n = t.name.to_ascii_lowercase();
-                        (n == stem || n == format!("{stem}s") || n == format!("{stem}es") || singular(&n) == stem)
+                        (n == stem
+                            || n == format!("{stem}s")
+                            || n == format!("{stem}es")
+                            || singular(&n) == stem)
                             && matches!(t.object_type, CatalogObjectType::Table)
                             && t.qualified_name() != qualified
                     })
@@ -398,7 +518,8 @@ pub fn discover(objects: &[CatalogObject], scope: &DiscoveryScope) -> (Vec<Defin
                     continue;
                 }
                 let target = matches[0];
-                let pks: Vec<&ColumnSpec> = target.columns.iter().filter(|c| c.is_primary_key).collect();
+                let pks: Vec<&ColumnSpec> =
+                    target.columns.iter().filter(|c| c.is_primary_key).collect();
                 if pks.len() != 1 || !types_compatible(&col.data_type, &pks[0].data_type) {
                     continue;
                 }
@@ -443,7 +564,10 @@ pub fn discover(objects: &[CatalogObject], scope: &DiscoveryScope) -> (Vec<Defin
 
     report.candidates = out.len();
     for d in &out {
-        *report.by_kind.entry(d.kind.as_str().to_string()).or_default() += 1;
+        *report
+            .by_kind
+            .entry(d.kind.as_str().to_string())
+            .or_default() += 1;
     }
     (out, report)
 }

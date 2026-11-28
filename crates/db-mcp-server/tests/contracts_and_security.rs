@@ -73,8 +73,7 @@ async fn contract_suite_exercises_all_24_tools_and_matches_contract_schema() {
     // Verify canonical contract definition file exists and lists the required envelope fields
     let contracts_path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../research/contracts/tool-contracts.json");
-    let contracts_raw =
-        std::fs::read_to_string(&contracts_path).expect("read tool-contracts.json");
+    let contracts_raw = std::fs::read_to_string(&contracts_path).expect("read tool-contracts.json");
     let contracts_doc: Value =
         serde_json::from_str(&contracts_raw).expect("parse tool-contracts.json");
     assert_eq!(contracts_doc["envelopes"]["success"]["status_value"], "ok");
@@ -91,7 +90,9 @@ async fn contract_suite_exercises_all_24_tools_and_matches_contract_schema() {
     assert_eq!(tools.len(), 24, "All 24 MCP tools must be registered");
 
     // 1. list_connections
-    let r_list = runtime.call_tool("list_connections", json!({}), &agent).await;
+    let r_list = runtime
+        .call_tool("list_connections", json!({}), &agent)
+        .await;
     assert_success_envelope(&r_list, Some("server"));
     assert_eq!(r_list["data"].as_array().unwrap().len(), 3);
 
@@ -132,7 +133,10 @@ async fn contract_suite_exercises_all_24_tools_and_matches_contract_schema() {
     assert_success_envelope(&r_trace, Some("prod-postgres"));
     assert_eq!(r_trace["data"]["table_name"], "public.users");
     assert_eq!(
-        r_trace["data"]["inbound_foreign_keys"].as_array().unwrap().len(),
+        r_trace["data"]["inbound_foreign_keys"]
+            .as_array()
+            .unwrap()
+            .len(),
         1
     );
     assert_eq!(
@@ -141,15 +145,23 @@ async fn contract_suite_exercises_all_24_tools_and_matches_contract_schema() {
     );
     let dep_objs = r_trace["data"]["dependent_objects"].as_array().unwrap();
     assert!(
-        dep_objs.iter().any(|d| d["name"] == "active_user_orders" && d["object_type"] == "view"),
+        dep_objs
+            .iter()
+            .any(|d| d["name"] == "active_user_orders" && d["object_type"] == "view"),
         "Expected active_user_orders view in dependent_objects: {dep_objs:?}"
     );
     assert!(
-        dep_objs.iter().any(|d| d["name"] == "checkout_order" && d["object_type"] == "procedure"),
+        dep_objs
+            .iter()
+            .any(|d| d["name"] == "checkout_order" && d["object_type"] == "procedure"),
         "Expected checkout_order procedure in dependent_objects: {dep_objs:?}"
     );
     let hops = r_trace["data"]["join_path"]["hops"].as_array().unwrap();
-    assert_eq!(hops.len(), 2, "Expected 2-hop join path users -> orders -> order_items");
+    assert_eq!(
+        hops.len(),
+        2,
+        "Expected 2-hop join path users -> orders -> order_items"
+    );
     assert_eq!(hops[0]["from_table"], "public.users");
     assert_eq!(hops[0]["to_table"], "public.orders");
     assert_eq!(hops[1]["from_table"], "public.orders");
@@ -178,12 +190,12 @@ async fn contract_suite_exercises_all_24_tools_and_matches_contract_schema() {
         )
         .await;
     assert_success_envelope(&r_callgraph, Some("prod-postgres"));
-    assert_eq!(r_callgraph["data"]["root_procedure"], "public.checkout_order");
+    assert_eq!(
+        r_callgraph["data"]["root_procedure"],
+        "public.checkout_order"
+    );
     let cg_nodes = r_callgraph["data"]["nodes"].as_array().unwrap();
-    let node_names: Vec<&str> = cg_nodes
-        .iter()
-        .filter_map(|n| n["name"].as_str())
-        .collect();
+    let node_names: Vec<&str> = cg_nodes.iter().filter_map(|n| n["name"].as_str()).collect();
     assert!(node_names.contains(&"checkout_order"));
     assert!(node_names.contains(&"reserve_inventory"));
     assert!(node_names.contains(&"record_order_audit"));
@@ -202,7 +214,10 @@ async fn contract_suite_exercises_all_24_tools_and_matches_contract_schema() {
         .unwrap()
         .iter()
         .any(|t| t == "public.orders"));
-    assert!(!r_callgraph["data"]["call_chains"].as_array().unwrap().is_empty());
+    assert!(!r_callgraph["data"]["call_chains"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     assert!(r_callgraph["data"]["mermaid_diagram"]
         .as_str()
         .unwrap()
@@ -251,7 +266,11 @@ async fn contract_suite_exercises_all_24_tools_and_matches_contract_schema() {
 
     // 7. database_health
     let r_health = runtime
-        .call_tool("database_health", json!({ "connection": "prod-postgres" }), &agent)
+        .call_tool(
+            "database_health",
+            json!({ "connection": "prod-postgres" }),
+            &agent,
+        )
         .await;
     assert_success_envelope(&r_health, Some("prod-postgres"));
 
@@ -280,7 +299,11 @@ async fn contract_suite_exercises_all_24_tools_and_matches_contract_schema() {
 
     // 10. capture_schema (before change)
     let r_cap1 = runtime
-        .call_tool("capture_schema", json!({ "connection": "local-sqlite" }), &agent)
+        .call_tool(
+            "capture_schema",
+            json!({ "connection": "local-sqlite" }),
+            &agent,
+        )
         .await;
     assert_success_envelope(&r_cap1, Some("local-sqlite"));
     let snap_before = r_cap1["data"].clone();
@@ -308,7 +331,11 @@ async fn contract_suite_exercises_all_24_tools_and_matches_contract_schema() {
 
     // Out-of-band approval by admin
     runtime
-        .approve_change(&change_id, &admin, Some("Approved in contract test".to_string()))
+        .approve_change(
+            &change_id,
+            &admin,
+            Some("Approved in contract test".to_string()),
+        )
         .expect("admin approve_change");
 
     // 13. apply_change
@@ -320,7 +347,11 @@ async fn contract_suite_exercises_all_24_tools_and_matches_contract_schema() {
 
     // 14. diff_schema
     let r_cap2 = runtime
-        .call_tool("capture_schema", json!({ "connection": "local-sqlite" }), &agent)
+        .call_tool(
+            "capture_schema",
+            json!({ "connection": "local-sqlite" }),
+            &agent,
+        )
         .await;
     let snap_after = r_cap2["data"].clone();
     let r_diff = runtime
@@ -418,7 +449,9 @@ async fn adversarial_security_and_governance_suite() {
         )
         .await;
     let change_id = prop["data"]["change_id"].as_str().unwrap().to_string();
-    let self_err = handler.approve_change(&change_id, &agent, None).unwrap_err();
+    let self_err = handler
+        .approve_change(&change_id, &agent, None)
+        .unwrap_err();
     assert_eq!(self_err.code(), "SELF_APPROVAL_FORBIDDEN");
 
     // 5. Approval replay attack -> first apply succeeds, second fails with APPROVAL_ALREADY_CONSUMED
@@ -446,7 +479,10 @@ async fn adversarial_security_and_governance_suite() {
             &agent,
         )
         .await;
-    let drift_id = drift_prop["data"]["change_id"].as_str().unwrap().to_string();
+    let drift_id = drift_prop["data"]["change_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     handler.approve_change(&drift_id, &admin, None).unwrap();
 
     // Mutate schema on local-sqlite before applying the approved change

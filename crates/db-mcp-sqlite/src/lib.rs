@@ -20,8 +20,8 @@ use db_mcp_catalog::{
 use db_mcp_core::{
     AuthorizedQuery, CatalogDetailLevel, CatalogObject, CatalogObjectType, CatalogRequest,
     CatalogResponse, ColumnMetadata, ColumnSpec, DatabaseAdapter, DatabaseCapabilities,
-    DatabaseEngine, DbMcpError, DbMcpResult, ExplainFormat, ExplainPlan, ExplainRequest,
-    ExecutionId, ForeignKeySpec, IndexSpec, QueryResult, SchemaDiff, SchemaDiffProvider,
+    DatabaseEngine, DbMcpError, DbMcpResult, ExecutionId, ExplainFormat, ExplainPlan,
+    ExplainRequest, ForeignKeySpec, IndexSpec, QueryResult, SchemaDiff, SchemaDiffProvider,
     SchemaSnapshot, TransactionalDdlProvider,
 };
 use db_mcp_secrets::redact_sensitive_text;
@@ -124,7 +124,10 @@ impl std::fmt::Debug for SqliteAdapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqliteAdapter")
             .field("connection_id", &self.config.connection_id)
-            .field("database_path", &redact_sensitive_text(&self.config.database_path))
+            .field(
+                "database_path",
+                &redact_sensitive_text(&self.config.database_path),
+            )
             .field("read_only", &self.config.read_only)
             .finish()
     }
@@ -208,10 +211,9 @@ impl SqliteAdapter {
     pub fn execute_batch(&self, sql: &str) -> DbMcpResult<()> {
         let (rewritten, has_routines) =
             rewrite_sqlite_sql_for_routines(sql, &self.config.default_schema);
-        let guard = self
-            .conn
-            .lock()
-            .map_err(|_| DbMcpError::InternalError("SQLite connection mutex poisoned".to_string()))?;
+        let guard = self.conn.lock().map_err(|_| {
+            DbMcpError::InternalError("SQLite connection mutex poisoned".to_string())
+        })?;
         if has_routines {
             ensure_sqlite_routines_table(&guard)?;
         }
@@ -226,7 +228,8 @@ impl SqliteAdapter {
     /// Pre-register an `ExecutionId` for cancellation tracking before or during execution.
     pub fn register_execution(&self, execution_id: ExecutionId) -> Arc<InterruptHandle> {
         let handle = Arc::clone(&self.interrupt_handle);
-        self.active_executions.insert(execution_id, Arc::clone(&handle));
+        self.active_executions
+            .insert(execution_id, Arc::clone(&handle));
         handle
     }
 
@@ -463,7 +466,10 @@ fn find_sqlite_routine_ddl_end(sql: &str, after_open_paren: usize) -> usize {
 
     let dollar_re = Regex::new(r"\$([A-Za-z0-9_]*)\$").unwrap();
     let rest = &sql[i..];
-    if let Some(m) = dollar_re.find(rest).filter(|m| dollar_quote_in_header(&rest[..m.start()])) {
+    if let Some(m) = dollar_re
+        .find(rest)
+        .filter(|m| dollar_quote_in_header(&rest[..m.start()]))
+    {
         let tag = m.as_str();
         let after_open_tag = i + m.end();
         if let Some(close_rel) = sql[after_open_tag..].find(tag) {
@@ -622,7 +628,10 @@ fn rewrite_sqlite_sql_for_routines(sql: &str, default_schema: &str) -> (String, 
             .filter(|p| !p.is_empty())
             .collect();
         let (schema, routine_name) = if parts.len() >= 2 {
-            (parts[parts.len() - 2].clone(), parts[parts.len() - 1].clone())
+            (
+                parts[parts.len() - 2].clone(),
+                parts[parts.len() - 1].clone(),
+            )
         } else if parts.len() == 1 {
             (default_schema.to_string(), parts[0].clone())
         } else {
@@ -713,7 +722,8 @@ fn introspect_sqlite_catalog(
                     Vec::new()
                 };
                 let estimated_rows = if is_table {
-                    let count_sql = format!("SELECT COUNT(*) FROM {}", quote_sqlite_ident(&row.name));
+                    let count_sql =
+                        format!("SELECT COUNT(*) FROM {}", quote_sqlite_ident(&row.name));
                     conn.query_row(&count_sql, [], |r| r.get::<_, i64>(0))
                         .ok()
                         .map(|n| n.max(0) as u64)
@@ -888,13 +898,12 @@ fn introspect_sqlite_routines_table(
             } else {
                 r_schema
             };
-            let object_type = if r_type.eq_ignore_ascii_case("function")
-                || r_type.eq_ignore_ascii_case("f")
-            {
-                CatalogObjectType::Function
-            } else {
-                CatalogObjectType::Procedure
-            };
+            let object_type =
+                if r_type.eq_ignore_ascii_case("function") || r_type.eq_ignore_ascii_case("f") {
+                    CatalogObjectType::Function
+                } else {
+                    CatalogObjectType::Procedure
+                };
             objects.push(CatalogObject {
                 schema,
                 name: r_name,
@@ -920,7 +929,9 @@ fn introspect_table_columns(conn: &Connection, table_name: &str) -> DbMcpResult<
         .query_map([], |row| {
             let cid: i64 = row.get(0)?;
             let name: String = row.get(1)?;
-            let data_type: String = row.get::<_, Option<String>>(2)?.unwrap_or_else(|| "ANY".to_string());
+            let data_type: String = row
+                .get::<_, Option<String>>(2)?
+                .unwrap_or_else(|| "ANY".to_string());
             let notnull: i64 = row.get(3)?;
             let default_value: Option<String> = row.get(4)?;
             let pk: i64 = row.get(5)?;
@@ -1014,7 +1025,10 @@ fn introspect_table_foreign_keys(
     conn: &Connection,
     table_name: &str,
 ) -> DbMcpResult<Vec<ForeignKeySpec>> {
-    let pragma_sql = format!("PRAGMA foreign_key_list({})", quote_sqlite_ident(table_name));
+    let pragma_sql = format!(
+        "PRAGMA foreign_key_list({})",
+        quote_sqlite_ident(table_name)
+    );
     let mut stmt = conn.prepare(&pragma_sql).map_err(map_rusqlite_error)?;
 
     #[derive(Clone)]
@@ -1090,8 +1104,7 @@ pub fn parse_sqlite_explain_detail(
         // "SEARCH users USING INTEGER PRIMARY KEY (rowid=?)"
         if let Some(pos) = tokens.iter().position(|t| t.eq_ignore_ascii_case("INDEX")) {
             if let Some(idx_name) = tokens.get(pos + 1) {
-                let clean =
-                    idx_name.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']');
+                let clean = idx_name.trim_matches(|c| c == '"' || c == '`' || c == '[' || c == ']');
                 if !clean.is_empty() && !index_scans.contains(&clean.to_string()) {
                     index_scans.push(clean.to_string());
                 }
@@ -1187,7 +1200,8 @@ impl DatabaseAdapter for SqliteAdapter {
                 let _ = guard.execute_batch("PRAGMA query_only = ON;");
             }
 
-            let exec_outcome = execute_sqlite_query_inner(&guard, &request, &default_schema, started);
+            let exec_outcome =
+                execute_sqlite_query_inner(&guard, &request, &default_schema, started);
 
             if effective_read_only && !adapter_read_only {
                 let _ = guard.execute_batch("PRAGMA query_only = OFF;");
@@ -1351,7 +1365,8 @@ impl DatabaseAdapter for SqliteAdapter {
     }
 
     async fn cancel(&self, execution: ExecutionId) -> DbMcpResult<bool> {
-        self.cancelled_executions.insert(execution.clone(), Utc::now());
+        self.cancelled_executions
+            .insert(execution.clone(), Utc::now());
         if let Some((_, handle)) = self.active_executions.remove(&execution) {
             handle.interrupt();
             return Ok(true);
@@ -1472,7 +1487,6 @@ fn collect_sqlite_rows(
     let col_count = stmt.column_count();
     let mut columns: Vec<ColumnMetadata> = stmt
         .column_names()
-        .into_iter()
         .map(|name| ColumnMetadata::new(name, "ANY"))
         .collect();
 
@@ -1488,19 +1502,17 @@ fn collect_sqlite_rows(
     while let Some(row) = rows.next().map_err(map_rusqlite_error)? {
         if rows_out.len() >= max_rows {
             truncated = true;
-            warnings.push(format!(
-                "Result truncated at max_rows={max_rows}"
-            ));
+            warnings.push(format!("Result truncated at max_rows={max_rows}"));
             break;
         }
 
         let mut row_vals = Vec::with_capacity(col_count);
         let mut row_bytes = 0usize;
-        for i in 0..col_count {
+        for (i, column) in columns.iter_mut().enumerate() {
             let val_ref = row.get_ref(i).map_err(map_rusqlite_error)?;
             let (json_val, inferred_type, val_bytes) = sqlite_value_ref_to_json(val_ref);
-            if columns[i].data_type == "ANY" && inferred_type != "NULL" {
-                columns[i].data_type = inferred_type.to_string();
+            if column.data_type == "ANY" && inferred_type != "NULL" {
+                column.data_type = inferred_type.to_string();
             }
             row_bytes += val_bytes;
             row_vals.push(json_val);
@@ -1508,9 +1520,7 @@ fn collect_sqlite_rows(
 
         if max_bytes > 0 && bytes_used + row_bytes > max_bytes && !rows_out.is_empty() {
             truncated = true;
-            warnings.push(format!(
-                "Result truncated at max_bytes={max_bytes} budget"
-            ));
+            warnings.push(format!("Result truncated at max_bytes={max_bytes} budget"));
             break;
         }
 
@@ -1662,7 +1672,10 @@ impl TransactionalDdlProvider for SqliteAdapter {
         true
     }
 
-    async fn execute_transactional_ddl(&self, request: AuthorizedQuery) -> DbMcpResult<QueryResult> {
+    async fn execute_transactional_ddl(
+        &self,
+        request: AuthorizedQuery,
+    ) -> DbMcpResult<QueryResult> {
         if self.config.read_only || request.read_only {
             return Err(DbMcpError::PolicyDenied {
                 code: "READONLY_VIOLATION".to_string(),
@@ -1737,7 +1750,9 @@ impl TransactionalDdlProvider for SqliteAdapter {
             })
         })
         .await
-        .map_err(|e| DbMcpError::InternalError(format!("SQLite transactional DDL join error: {e}")))?
+        .map_err(|e| {
+            DbMcpError::InternalError(format!("SQLite transactional DDL join error: {e}"))
+        })?
     }
 }
 
@@ -1778,8 +1793,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlite_progressive_discovery_and_describe() {
-        let adapter =
-            SqliteAdapter::open_memory_with_seed("sqlite-sample", SAMPLE_SEED).unwrap();
+        let adapter = SqliteAdapter::open_memory_with_seed("sqlite-sample", SAMPLE_SEED).unwrap();
 
         // 1. Names detail level
         let names_req = CatalogRequest {
@@ -1815,8 +1829,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlite_parameter_binding_row_truncation_and_readonly() {
-        let adapter =
-            SqliteAdapter::open_memory_with_seed("sqlite-sample", SAMPLE_SEED).unwrap();
+        let adapter = SqliteAdapter::open_memory_with_seed("sqlite-sample", SAMPLE_SEED).unwrap();
         let limits = ExecutionLimits {
             timeout_ms: 5_000,
             max_rows: 1,
@@ -1855,8 +1868,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlite_multi_statement_batch_executes_every_statement() {
-        let adapter =
-            SqliteAdapter::open_memory_with_seed("sqlite-sample", SAMPLE_SEED).unwrap();
+        let adapter = SqliteAdapter::open_memory_with_seed("sqlite-sample", SAMPLE_SEED).unwrap();
         let limits = ExecutionLimits {
             allow_multi_statement: true,
             ..ExecutionLimits::default()
@@ -1886,7 +1898,14 @@ mod tests {
         assert_eq!(result.columns[0].name, "b");
         assert_eq!(result.rows[0][0], serde_json::json!(4));
         assert_eq!(result.rows_affected, Some(1));
-        assert!(result.warnings.iter().any(|w| w.contains("Executed 3 statements")), "{:?}", result.warnings);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("Executed 3 statements")),
+            "{:?}",
+            result.warnings
+        );
 
         // Parameters cannot be bound across a batch: rejected before any statement runs.
         let err = adapter
@@ -1908,10 +1927,17 @@ mod tests {
             ))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("Statement 2 of the batch failed"), "{err}");
+        assert!(
+            err.to_string().contains("Statement 2 of the batch failed"),
+            "{err}"
+        );
 
         let count = adapter
-            .execute(write("req_count", "SELECT count(*) FROM users WHERE id IN (10, 11)", vec![]))
+            .execute(write(
+                "req_count",
+                "SELECT count(*) FROM users WHERE id IN (10, 11)",
+                vec![],
+            ))
             .await
             .unwrap();
         assert_eq!(count.rows[0][0], serde_json::json!(1));
@@ -1919,8 +1945,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlite_explain_query_plan_extraction() {
-        let adapter =
-            SqliteAdapter::open_memory_with_seed("sqlite-sample", SAMPLE_SEED).unwrap();
+        let adapter = SqliteAdapter::open_memory_with_seed("sqlite-sample", SAMPLE_SEED).unwrap();
 
         // Indexed lookup
         let idx_plan = adapter
@@ -1959,8 +1984,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlite_cancellation_and_transactional_ddl_diff() {
-        let adapter =
-            SqliteAdapter::open_memory_with_seed("sqlite-sample", SAMPLE_SEED).unwrap();
+        let adapter = SqliteAdapter::open_memory_with_seed("sqlite-sample", SAMPLE_SEED).unwrap();
 
         let snap_before = adapter.capture_schema("sqlite-sample", None).await.unwrap();
 
@@ -1985,7 +2009,10 @@ mod tests {
         assert_eq!(ddl_res.returned_rows, 1);
 
         let snap_after = adapter.capture_schema("sqlite-sample", None).await.unwrap();
-        let diff = adapter.diff_schema(&snap_before, &snap_after).await.unwrap();
+        let diff = adapter
+            .diff_schema(&snap_before, &snap_after)
+            .await
+            .unwrap();
         assert!(!diff.is_identical);
         assert!(diff.all_transactional);
         assert!(diff
@@ -2019,8 +2046,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlite_routines_introspection_and_ddl_interception() {
-        let adapter =
-            SqliteAdapter::open_memory_with_seed("sqlite-sample", SAMPLE_SEED).unwrap();
+        let adapter = SqliteAdapter::open_memory_with_seed("sqlite-sample", SAMPLE_SEED).unwrap();
 
         adapter
             .execute_batch(
@@ -2096,6 +2122,9 @@ $$ LANGUAGE plpgsql;
         assert!(out.contains("'first_proc'"), "{out}");
         assert!(out.contains("'dollar_fn'"), "{out}");
         let first = out.split("'dollar_fn'").next().unwrap();
-        assert!(!first.contains("RETURNS INTEGER AS $$"), "first_proc swallowed dollar_fn: {out}");
+        assert!(
+            !first.contains("RETURNS INTEGER AS $$"),
+            "first_proc swallowed dollar_fn: {out}"
+        );
     }
 }

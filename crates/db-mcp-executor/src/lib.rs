@@ -227,7 +227,7 @@ impl BoundedExecutor {
         let token = self
             .active_executions
             .entry(execution_id.clone())
-            .or_insert_with(CancellationToken::new)
+            .or_default()
             .value()
             .clone();
         if let Some(req_id) = request_id {
@@ -1014,14 +1014,14 @@ mod tests {
                 allow_multi_statement: false,
             },
         );
-        let res_rows = executor.execute_bounded(&adapter, query_rows).await.unwrap();
+        let res_rows = executor
+            .execute_bounded(&adapter, query_rows)
+            .await
+            .unwrap();
         assert_eq!(res_rows.returned_rows, 3);
         assert_eq!(res_rows.rows.len(), 3);
         assert!(res_rows.truncated);
-        assert!(res_rows
-            .warnings
-            .iter()
-            .any(|w| w.contains("max_rows=3")));
+        assert!(res_rows.warnings.iter().any(|w| w.contains("max_rows=3")));
 
         // 2. Test max_bytes = 90 (each row is ~45 bytes JSON, so at most 1-2 rows fit)
         let query_bytes = AuthorizedQuery::new_read(

@@ -400,7 +400,10 @@ impl ChangeManager {
         }
 
         // 2. Lifecycle state checks
-        if matches!(proposal.state, ChangeState::Applied | ChangeState::Executing) {
+        if matches!(
+            proposal.state,
+            ChangeState::Applied | ChangeState::Executing
+        ) {
             return Err(DbMcpError::ApprovalAlreadyConsumed(format!(
                 "Change '{}' has already been executed (state: {:?})",
                 change_id, proposal.state
@@ -408,8 +411,10 @@ impl ChangeManager {
         }
 
         if proposal.state == ChangeState::Expired
-            || (matches!(proposal.state, ChangeState::Proposed | ChangeState::Approved)
-                && Utc::now() >= proposal.expires_at)
+            || (matches!(
+                proposal.state,
+                ChangeState::Proposed | ChangeState::Approved
+            ) && Utc::now() >= proposal.expires_at)
         {
             proposal.state = ChangeState::Expired;
             let _ = self.store_proposal(&proposal);
@@ -437,7 +442,9 @@ impl ChangeManager {
             &proposal.expires_at,
             &proposal.constraints,
         );
-        if expected_hash != proposal.approval_hash || normalize_sql(&proposal.sql) != proposal.normalized_sql {
+        if expected_hash != proposal.approval_hash
+            || normalize_sql(&proposal.sql) != proposal.normalized_sql
+        {
             return Err(DbMcpError::ApprovalHashMismatch(format!(
                 "Stored proposal '{}' failed cryptographic integrity verification prior to approval",
                 change_id
@@ -474,16 +481,18 @@ impl ChangeManager {
         reason: Option<String>,
     ) -> DbMcpResult<ChangeProposal> {
         let mut proposal = self.load_proposal(change_id)?;
-        if matches!(proposal.state, ChangeState::Applied | ChangeState::Executing) {
+        if matches!(
+            proposal.state,
+            ChangeState::Applied | ChangeState::Executing
+        ) {
             return Err(DbMcpError::ApprovalAlreadyConsumed(format!(
                 "Change '{}' has already been executed and cannot be rejected",
                 change_id
             )));
         }
         proposal.state = ChangeState::Rejected;
-        proposal.execution_error = reason.or_else(|| {
-            Some(format!("Rejected by principal '{}'", reviewer.principal))
-        });
+        proposal.execution_error =
+            reason.or_else(|| Some(format!("Rejected by principal '{}'", reviewer.principal)));
         self.store_proposal(&proposal)?;
         Ok(proposal)
     }
@@ -492,8 +501,10 @@ impl ChangeManager {
     /// `ChangeState::Expired` if its `expires_at` deadline has passed.
     pub fn get_change(&self, change_id: &str) -> DbMcpResult<ChangeProposal> {
         let mut proposal = self.load_proposal(change_id)?;
-        if matches!(proposal.state, ChangeState::Proposed | ChangeState::Approved)
-            && Utc::now() >= proposal.expires_at
+        if matches!(
+            proposal.state,
+            ChangeState::Proposed | ChangeState::Approved
+        ) && Utc::now() >= proposal.expires_at
         {
             proposal.state = ChangeState::Expired;
             self.store_proposal(&proposal)?;
@@ -520,7 +531,7 @@ impl ChangeManager {
             }
             out.push(prop);
         }
-        out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        out.sort_by_key(|a| a.created_at);
         Ok(out)
     }
 
@@ -531,13 +542,8 @@ impl ChangeManager {
         caller: &CallerIdentity,
         adapter: &dyn DatabaseAdapter,
     ) -> DbMcpResult<ApplyChangeOutcome> {
-        self.apply_change_with_options(
-            change_id,
-            caller,
-            adapter,
-            ApplyChangeOptions::default(),
-        )
-        .await
+        self.apply_change_with_options(change_id, caller, adapter, ApplyChangeOptions::default())
+            .await
     }
 
     /// Execute an approved `ChangeProposal` enforcing all 6 steps from Build Plan Section 6:
@@ -576,7 +582,10 @@ impl ChangeManager {
         }
 
         // Step 2: Check replay state, expiry, and approval presence
-        if matches!(proposal.state, ChangeState::Applied | ChangeState::Executing) {
+        if matches!(
+            proposal.state,
+            ChangeState::Applied | ChangeState::Executing
+        ) {
             return Err(DbMcpError::ApprovalAlreadyConsumed(format!(
                 "Approval for change '{}' has already been consumed (state: {:?})",
                 change_id, proposal.state
@@ -693,10 +702,7 @@ impl ChangeManager {
             )));
         }
 
-        let effective_params = options
-            .verify_params
-            .as_deref()
-            .unwrap_or(&proposal.params);
+        let effective_params = options.verify_params.as_deref().unwrap_or(&proposal.params);
         let effective_policy_revision = options
             .current_policy_revision
             .as_deref()
@@ -897,7 +903,11 @@ impl ChangeManager {
 
     /// Compare-and-swap: persist `proposal` only while the stored state still equals `expected`.
     /// Returns `Ok(false)` (and writes nothing) when another writer changed the state first.
-    fn store_if_state(&self, proposal: &ChangeProposal, expected: ChangeState) -> DbMcpResult<bool> {
+    fn store_if_state(
+        &self,
+        proposal: &ChangeProposal,
+        expected: ChangeState,
+    ) -> DbMcpResult<bool> {
         match &self.backend {
             StorageBackend::InMemory => {
                 let mut guard = self.memory_store.lock().map_err(|_| {
@@ -1229,14 +1239,16 @@ pub fn validate_change_statement(analysis: &SqlAnalysis) -> DbMcpResult<()> {
         }),
         SqlStatementClass::Read if !analysis.has_cte_write => Err(DbMcpError::PolicyDenied {
             code: CODE_NOT_A_CHANGE.to_string(),
-            message: "Read-only statements change nothing and cannot be proposed as governed changes"
-                .to_string(),
+            message:
+                "Read-only statements change nothing and cannot be proposed as governed changes"
+                    .to_string(),
             next_action: Some("execute_query".to_string()),
         }),
         SqlStatementClass::PrivilegeOrAdmin => Err(DbMcpError::PolicyDenied {
             code: "PRIVILEGED_FUNCTION_FORBIDDEN".to_string(),
-            message: "Administrative or privilege statements cannot be proposed as governed changes"
-                .to_string(),
+            message:
+                "Administrative or privilege statements cannot be proposed as governed changes"
+                    .to_string(),
             next_action: None,
         }),
         _ => Ok(()),
@@ -1846,10 +1858,17 @@ mod tests {
     const TEST_KEY: &str = "unit-test-approval-key-0123456789";
 
     fn temp_store(ext: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("db_mcp_changes_test_{}.{ext}", Uuid::new_v4().simple()))
+        std::env::temp_dir().join(format!(
+            "db_mcp_changes_test_{}.{ext}",
+            Uuid::new_v4().simple()
+        ))
     }
 
-    async fn propose(mgr: &ChangeManager, adapter: &MockChangeAdapter, sql: &str) -> ChangeProposal {
+    async fn propose(
+        mgr: &ChangeManager,
+        adapter: &MockChangeAdapter,
+        sql: &str,
+    ) -> ChangeProposal {
         mgr.propose_change_with_adapter(
             &CallerIdentity::local_agent("agent:cursor"),
             adapter,
@@ -1864,12 +1883,20 @@ mod tests {
 
     #[test]
     fn test_validate_change_statement_rejects_reads_and_admin_statements() {
-        let select = parse_and_analyze_sql(DatabaseEngine::Postgres, "SELECT id FROM users").unwrap();
-        assert_eq!(validate_change_statement(&select).unwrap_err().code(), CODE_NOT_A_CHANGE);
+        let select =
+            parse_and_analyze_sql(DatabaseEngine::Postgres, "SELECT id FROM users").unwrap();
+        assert_eq!(
+            validate_change_statement(&select).unwrap_err().code(),
+            CODE_NOT_A_CHANGE
+        );
         let vacuum = parse_and_analyze_sql(DatabaseEngine::Sqlite, "VACUUM").unwrap();
         assert_eq!(vacuum.overall_class, SqlStatementClass::PrivilegeOrAdmin);
         assert!(validate_change_statement(&vacuum).is_err());
-        let update = parse_and_analyze_sql(DatabaseEngine::Postgres, "UPDATE users SET role = 'x' WHERE id = 1").unwrap();
+        let update = parse_and_analyze_sql(
+            DatabaseEngine::Postgres,
+            "UPDATE users SET role = 'x' WHERE id = 1",
+        )
+        .unwrap();
         assert!(validate_change_statement(&update).is_ok());
     }
 
@@ -1877,12 +1904,24 @@ mod tests {
     async fn test_second_rejected_and_concurrent_approvals_only_one_wins() {
         let path = temp_store("db");
         let adapter = MockChangeAdapter::new("prod-pg", DatabaseEngine::Postgres);
-        let mgr = ChangeManager::with_sqlite_path(&path).unwrap().with_approval_key(TEST_KEY).unwrap();
+        let mgr = ChangeManager::with_sqlite_path(&path)
+            .unwrap()
+            .with_approval_key(TEST_KEY)
+            .unwrap();
 
         // Second approval never replaces the first.
-        let p = propose(&mgr, &adapter, "CREATE INDEX idx_users_role ON public.users (role)").await;
-        mgr.approve_change(&p.change_id, &CallerIdentity::admin("admin:alice"), Some("first".to_string()))
-            .unwrap();
+        let p = propose(
+            &mgr,
+            &adapter,
+            "CREATE INDEX idx_users_role ON public.users (role)",
+        )
+        .await;
+        mgr.approve_change(
+            &p.change_id,
+            &CallerIdentity::admin("admin:alice"),
+            Some("first".to_string()),
+        )
+        .unwrap();
         let err = mgr
             .approve_change(&p.change_id, &CallerIdentity::admin("admin:bob"), None)
             .unwrap_err();
@@ -1892,26 +1931,45 @@ mod tests {
         assert_eq!(kept.comment.as_deref(), Some("first"));
 
         // A rejected change cannot be re-approved.
-        let r = propose(&mgr, &adapter, "ALTER TABLE public.users ADD COLUMN bio TEXT").await;
-        mgr.reject_change(&r.change_id, &CallerIdentity::admin("admin:alice"), None).unwrap();
+        let r = propose(
+            &mgr,
+            &adapter,
+            "ALTER TABLE public.users ADD COLUMN bio TEXT",
+        )
+        .await;
+        mgr.reject_change(&r.change_id, &CallerIdentity::admin("admin:alice"), None)
+            .unwrap();
         let err = mgr
             .approve_change(&r.change_id, &CallerIdentity::admin("admin:bob"), None)
             .unwrap_err();
         assert_eq!(err.code(), CODE_CHANGE_NOT_PENDING);
 
         // Concurrent approvals from separate managers (processes) over one store: exactly one wins.
-        let c = propose(&mgr, &adapter, "UPDATE public.users SET role = 'x' WHERE id = 1").await;
+        let c = propose(
+            &mgr,
+            &adapter,
+            "UPDATE public.users SET role = 'x' WHERE id = 1",
+        )
+        .await;
         let handles: Vec<_> = (0..6)
             .map(|i| {
                 let path = path.clone();
                 let id = c.change_id.clone();
                 std::thread::spawn(move || {
-                    let m = ChangeManager::with_sqlite_path(&path).unwrap().with_approval_key(TEST_KEY).unwrap();
-                    m.approve_change(&id, &CallerIdentity::admin(format!("admin:{i}")), None).is_ok()
+                    let m = ChangeManager::with_sqlite_path(&path)
+                        .unwrap()
+                        .with_approval_key(TEST_KEY)
+                        .unwrap();
+                    m.approve_change(&id, &CallerIdentity::admin(format!("admin:{i}")), None)
+                        .is_ok()
                 })
             })
             .collect();
-        let wins = handles.into_iter().map(|h| h.join().unwrap()).filter(|ok| *ok).count();
+        let wins = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|ok| *ok)
+            .count();
         assert_eq!(wins, 1);
         let _ = fs::remove_file(&path);
     }
@@ -1921,10 +1979,18 @@ mod tests {
         let path = temp_store("db");
         let adapter = MockChangeAdapter::new("prod-pg", DatabaseEngine::Postgres);
         let agent = CallerIdentity::local_agent("agent:cursor");
-        let keyed = ChangeManager::with_sqlite_path(&path).unwrap().with_approval_key(TEST_KEY).unwrap();
+        let keyed = ChangeManager::with_sqlite_path(&path)
+            .unwrap()
+            .with_approval_key(TEST_KEY)
+            .unwrap();
 
         // Approval record forged directly in the store (no MAC) is rejected before execution.
-        let p = propose(&keyed, &adapter, "UPDATE public.users SET role = 'x' WHERE id = 1").await;
+        let p = propose(
+            &keyed,
+            &adapter,
+            "UPDATE public.users SET role = 'x' WHERE id = 1",
+        )
+        .await;
         let mut forged = p.clone();
         forged.state = ChangeState::Approved;
         forged.approval = Some(ApprovalRecord {
@@ -1935,7 +2001,10 @@ mod tests {
             approval_mac: Some("00".repeat(32)),
         });
         keyed.overwrite_proposal_unchecked(&forged).unwrap();
-        let err = keyed.apply_change(&p.change_id, &agent, &adapter).await.unwrap_err();
+        let err = keyed
+            .apply_change(&p.change_id, &agent, &adapter)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), "APPROVAL_HASH_MISMATCH");
 
         // A MAC made with another key is rejected too.
@@ -1943,25 +2012,48 @@ mod tests {
             .unwrap()
             .with_approval_key("another-approval-key-9876543210")
             .unwrap();
-        let q = propose(&keyed, &adapter, "UPDATE public.users SET role = 'y' WHERE id = 1").await;
-        other.approve_change(&q.change_id, &CallerIdentity::admin("admin:alice"), None).unwrap();
-        let err = keyed.apply_change(&q.change_id, &agent, &adapter).await.unwrap_err();
+        let q = propose(
+            &keyed,
+            &adapter,
+            "UPDATE public.users SET role = 'y' WHERE id = 1",
+        )
+        .await;
+        other
+            .approve_change(&q.change_id, &CallerIdentity::admin("admin:alice"), None)
+            .unwrap();
+        let err = keyed
+            .apply_change(&q.change_id, &agent, &adapter)
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), "APPROVAL_HASH_MISMATCH");
         assert_eq!(adapter.execute_count.load(Ordering::SeqCst), 0);
 
         // Unkeyed store: refused when keyed approvals are required, warned otherwise.
         let unkeyed = ChangeManager::with_sqlite_path(&path).unwrap();
         assert!(!unkeyed.approval_warnings().is_empty());
-        let u = propose(&unkeyed, &adapter, "UPDATE public.users SET role = 'z' WHERE id = 1").await;
-        let approved = unkeyed.approve_change(&u.change_id, &CallerIdentity::admin("admin:alice"), None).unwrap();
+        let u = propose(
+            &unkeyed,
+            &adapter,
+            "UPDATE public.users SET role = 'z' WHERE id = 1",
+        )
+        .await;
+        let approved = unkeyed
+            .approve_change(&u.change_id, &CallerIdentity::admin("admin:alice"), None)
+            .unwrap();
         assert!(approved.approval.unwrap().approval_mac.is_none());
-        let strict = ApplyChangeOptions { require_approval_mac: true, ..ApplyChangeOptions::default() };
+        let strict = ApplyChangeOptions {
+            require_approval_mac: true,
+            ..ApplyChangeOptions::default()
+        };
         let err = unkeyed
             .apply_change_with_options(&u.change_id, &agent, &adapter, strict)
             .await
             .unwrap_err();
         assert_eq!(err.code(), CODE_APPROVAL_KEY_REQUIRED);
-        let outcome = unkeyed.apply_change(&u.change_id, &agent, &adapter).await.unwrap();
+        let outcome = unkeyed
+            .apply_change(&u.change_id, &agent, &adapter)
+            .await
+            .unwrap();
         assert_eq!(outcome.warnings, vec![UNKEYED_APPROVAL_WARNING.to_string()]);
         assert_eq!(outcome.proposal.applied_by.as_deref(), Some("agent:cursor"));
         assert_eq!(outcome.proposal.rows_affected, Some(1));
@@ -1970,7 +2062,9 @@ mod tests {
         assert_eq!(stored.rows_affected, Some(1));
 
         // Short keys are refused (fail closed).
-        assert!(ChangeManager::new_in_memory().with_approval_key("short").is_err());
+        assert!(ChangeManager::new_in_memory()
+            .with_approval_key("short")
+            .is_err());
         let _ = fs::remove_file(&path);
     }
 
@@ -1978,15 +2072,30 @@ mod tests {
     async fn test_apply_before_approval_points_to_out_of_band_approval() {
         let adapter = MockChangeAdapter::new("prod-pg", DatabaseEngine::Postgres);
         let mgr = ChangeManager::new_in_memory();
-        let p = propose(&mgr, &adapter, "CREATE INDEX idx_users_role ON public.users (role)").await;
+        let p = propose(
+            &mgr,
+            &adapter,
+            "CREATE INDEX idx_users_role ON public.users (role)",
+        )
+        .await;
         let err = mgr
-            .apply_change(&p.change_id, &CallerIdentity::local_agent("agent:cursor"), &adapter)
+            .apply_change(
+                &p.change_id,
+                &CallerIdentity::local_agent("agent:cursor"),
+                &adapter,
+            )
             .await
             .unwrap_err();
         assert_eq!(err.code(), "APPROVAL_REQUIRED");
         assert_eq!(
             err.next_action(),
-            Some(format!("db-mcp approve --change-id {} --approver <admin>", p.change_id).as_str())
+            Some(
+                format!(
+                    "db-mcp approve --change-id {} --approver <admin>",
+                    p.change_id
+                )
+                .as_str()
+            )
         );
     }
 }

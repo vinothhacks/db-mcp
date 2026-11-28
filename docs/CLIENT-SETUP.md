@@ -60,6 +60,8 @@ Same JSON shape as Cursor under the `mcpServers` key.
 
 Use the generic stdio shape: command `/abs/path/db-mcp-server`, args `["serve", "--transport", "stdio", "--config", "<path>"]`.
 
+Each stdio request line is limited to 2 MiB, including its line ending. An oversized line closes the transport.
+
 ## Streamable HTTP (shared or self-hosted)
 
 ```bash
@@ -78,6 +80,8 @@ Endpoints:
 | POST | `/admin/approve` | `Authorization: Bearer <DB_MCP_ADMIN_TOKEN>` | approve a `chg_*` proposal out of band |
 
 Only share the HTTP bearer token with trusted clients. Token holders can set `X-MCP-Principal` and `X-MCP-Role`. For a shared deployment, keep the agent token at a trusted proxy that authenticates clients and sets those headers. Non-loopback binds require a configured agent token.
+
+Configured agent and admin tokens must resolve to nonempty strings of visible ASCII characters.
 
 Example:
 

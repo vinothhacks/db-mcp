@@ -51,7 +51,9 @@ fn hex_upper(bytes: &[u8]) -> String {
 }
 
 fn float(v: f64) -> Value {
-    serde_json::Number::from_f64(v).map(Value::Number).unwrap_or(Value::Null)
+    serde_json::Number::from_f64(v)
+        .map(Value::Number)
+        .unwrap_or(Value::Null)
 }
 
 /// Map one cell to JSON: integers and floats as numbers, decimals as exact strings, dates as
@@ -65,11 +67,24 @@ pub fn column_data_to_json(data: &ColumnData<'static>) -> Value {
         ColumnData::F32(v) => v.map(|f| float(f as f64)).unwrap_or(Value::Null),
         ColumnData::F64(v) => v.map(float).unwrap_or(Value::Null),
         ColumnData::Bit(v) => v.map(Value::Bool).unwrap_or(Value::Null),
-        ColumnData::String(v) => v.as_ref().map(|s| Value::String(s.to_string())).unwrap_or(Value::Null),
-        ColumnData::Guid(v) => v.map(|g| Value::String(g.to_string().to_uppercase())).unwrap_or(Value::Null),
-        ColumnData::Binary(v) => v.as_ref().map(|b| Value::String(hex_upper(b))).unwrap_or(Value::Null),
-        ColumnData::Numeric(v) => v.map(|n| Value::String(n.to_string())).unwrap_or(Value::Null),
-        ColumnData::Xml(v) => v.as_ref().map(|x| Value::String(x.to_string())).unwrap_or(Value::Null),
+        ColumnData::String(v) => v
+            .as_ref()
+            .map(|s| Value::String(s.to_string()))
+            .unwrap_or(Value::Null),
+        ColumnData::Guid(v) => v
+            .map(|g| Value::String(g.to_string().to_uppercase()))
+            .unwrap_or(Value::Null),
+        ColumnData::Binary(v) => v
+            .as_ref()
+            .map(|b| Value::String(hex_upper(b)))
+            .unwrap_or(Value::Null),
+        ColumnData::Numeric(v) => v
+            .map(|n| Value::String(n.to_string()))
+            .unwrap_or(Value::Null),
+        ColumnData::Xml(v) => v
+            .as_ref()
+            .map(|x| Value::String(x.to_string()))
+            .unwrap_or(Value::Null),
         ColumnData::DateTime(_) | ColumnData::SmallDateTime(_) | ColumnData::DateTime2(_) => {
             match NaiveDateTime::from_sql(data) {
                 Ok(Some(dt)) => Value::String(dt.format("%Y-%m-%dT%H:%M:%S%.f").to_string()),
@@ -208,8 +223,14 @@ pub fn rewrite_placeholders(sql: &str, param_count: usize) -> String {
                     j += 1;
                 }
                 let digits: String = chars[i + 1..j].iter().collect();
-                let prev_is_ident = i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_' || chars[i - 1] == '@');
-                if prev_is_ident || (c == '$' && digits.is_empty()) || (c == '$' && chars.get(j) == Some(&'.')) {
+                let prev_is_ident = i > 0
+                    && (chars[i - 1].is_alphanumeric()
+                        || chars[i - 1] == '_'
+                        || chars[i - 1] == '@');
+                if prev_is_ident
+                    || (c == '$' && digits.is_empty())
+                    || (c == '$' && chars.get(j) == Some(&'.'))
+                {
                     out.push(c);
                     i += 1;
                     continue;
@@ -240,44 +261,81 @@ mod tests {
 
     #[test]
     fn maps_scalar_values() {
-        assert_eq!(column_data_to_json(&ColumnData::I32(Some(7))), Value::from(7));
+        assert_eq!(
+            column_data_to_json(&ColumnData::I32(Some(7))),
+            Value::from(7)
+        );
         assert_eq!(column_data_to_json(&ColumnData::I64(None)), Value::Null);
-        assert_eq!(column_data_to_json(&ColumnData::Bit(Some(true))), Value::Bool(true));
-        assert_eq!(column_data_to_json(&ColumnData::F64(Some(1.5))), Value::from(1.5));
-        assert_eq!(column_data_to_json(&ColumnData::F64(Some(f64::NAN))), Value::Null);
+        assert_eq!(
+            column_data_to_json(&ColumnData::Bit(Some(true))),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            column_data_to_json(&ColumnData::F64(Some(1.5))),
+            Value::from(1.5)
+        );
+        assert_eq!(
+            column_data_to_json(&ColumnData::F64(Some(f64::NAN))),
+            Value::Null
+        );
         assert_eq!(
             column_data_to_json(&ColumnData::String(Some(Cow::Borrowed("héllo")))),
             Value::from("héllo")
         );
         assert_eq!(
-            column_data_to_json(&ColumnData::Binary(Some(Cow::Borrowed(&[0xde, 0xad, 0x01])))),
+            column_data_to_json(&ColumnData::Binary(Some(Cow::Borrowed(&[
+                0xde, 0xad, 0x01
+            ])))),
             Value::from("0xDEAD01")
         );
         let g = uuid::Uuid::parse_str("6f9619ff-8b86-d011-b42d-00c04fc964ff").unwrap();
-        assert_eq!(column_data_to_json(&ColumnData::Guid(Some(g))), Value::from("6F9619FF-8B86-D011-B42D-00C04FC964FF"));
+        assert_eq!(
+            column_data_to_json(&ColumnData::Guid(Some(g))),
+            Value::from("6F9619FF-8B86-D011-B42D-00C04FC964FF")
+        );
         let n = tiberius::numeric::Numeric::new_with_scale(12345, 2);
-        assert_eq!(column_data_to_json(&ColumnData::Numeric(Some(n))), Value::from("123.45"));
+        assert_eq!(
+            column_data_to_json(&ColumnData::Numeric(Some(n))),
+            Value::from("123.45")
+        );
     }
 
     #[test]
     fn maps_dates_to_iso_strings() {
         use tiberius::IntoSql as _;
-        let dt = NaiveDate::from_ymd_opt(2025, 1, 3).unwrap().and_hms_milli_opt(10, 0, 1, 250).unwrap();
+        let dt = NaiveDate::from_ymd_opt(2025, 1, 3)
+            .unwrap()
+            .and_hms_milli_opt(10, 0, 1, 250)
+            .unwrap();
         let data = dt.into_sql();
-        assert_eq!(column_data_to_json(&data), Value::from("2025-01-03T10:00:01.250"));
+        assert_eq!(
+            column_data_to_json(&data),
+            Value::from("2025-01-03T10:00:01.250")
+        );
         let d = NaiveDate::from_ymd_opt(2024, 2, 29).unwrap().into_sql();
         assert_eq!(column_data_to_json(&d), Value::from("2024-02-29"));
-        let off = DateTime::parse_from_rfc3339("2025-05-06T07:08:09+02:00").unwrap().into_sql();
-        assert_eq!(column_data_to_json(&off), Value::from("2025-05-06T07:08:09+02:00"));
+        let off = DateTime::parse_from_rfc3339("2025-05-06T07:08:09+02:00")
+            .unwrap()
+            .into_sql();
+        assert_eq!(
+            column_data_to_json(&off),
+            Value::from("2025-05-06T07:08:09+02:00")
+        );
     }
 
     #[test]
     fn json_params_convert() {
         assert_eq!(SqlParam::from_json(&Value::from(5)), SqlParam::Int(5));
         assert_eq!(SqlParam::from_json(&Value::from(2.5)), SqlParam::Float(2.5));
-        assert_eq!(SqlParam::from_json(&Value::from("x")), SqlParam::Text("x".into()));
+        assert_eq!(
+            SqlParam::from_json(&Value::from("x")),
+            SqlParam::Text("x".into())
+        );
         assert_eq!(SqlParam::from_json(&Value::Null), SqlParam::Null);
-        assert_eq!(SqlParam::from_json(&serde_json::json!([1])), SqlParam::Text("[1]".into()));
+        assert_eq!(
+            SqlParam::from_json(&serde_json::json!([1])),
+            SqlParam::Text("[1]".into())
+        );
     }
 
     #[test]
@@ -287,9 +345,18 @@ mod tests {
             "SELECT * FROM t WHERE a = @P1 AND b = @P2 AND c = '?'"
         );
         assert_eq!(rewrite_placeholders("SELECT ?2, ?1", 2), "SELECT @P2, @P1");
-        assert_eq!(rewrite_placeholders("SELECT $1 -- $2\n, [a$1]", 1), "SELECT @P1 -- $2\n, [a$1]");
-        assert_eq!(rewrite_placeholders("SELECT x FROM t WHERE id = @P1", 1), "SELECT x FROM t WHERE id = @P1");
+        assert_eq!(
+            rewrite_placeholders("SELECT $1 -- $2\n, [a$1]", 1),
+            "SELECT @P1 -- $2\n, [a$1]"
+        );
+        assert_eq!(
+            rewrite_placeholders("SELECT x FROM t WHERE id = @P1", 1),
+            "SELECT x FROM t WHERE id = @P1"
+        );
         assert_eq!(rewrite_placeholders("SELECT ? ", 0), "SELECT ? ");
-        assert_eq!(rewrite_placeholders("SELECT $5.00, ?", 1), "SELECT $5.00, @P1");
+        assert_eq!(
+            rewrite_placeholders("SELECT $5.00, ?", 1),
+            "SELECT $5.00, @P1"
+        );
     }
 }

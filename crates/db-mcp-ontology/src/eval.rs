@@ -83,19 +83,30 @@ fn check(case: &GoldenCase, plan: &SemanticPlan) -> (Vec<String>, bool) {
     let mut failures = Vec::new();
     let got = status_name(plan.status);
     if got != case.expect.status {
-        failures.push(format!("status {got} != expected {} ({:?})", case.expect.status, plan.missing));
+        failures.push(format!(
+            "status {got} != expected {} ({:?})",
+            case.expect.status, plan.missing
+        ));
     }
     let mut retrieval_ok = true;
     if let Some(m) = &case.expect.metric {
         if plan.metric.as_ref().map(|u| &u.def_id) != Some(m) {
             retrieval_ok = false;
-            failures.push(format!("metric {:?} != expected {m}", plan.metric.as_ref().map(|u| &u.def_id)));
+            failures.push(format!(
+                "metric {:?} != expected {m}",
+                plan.metric.as_ref().map(|u| &u.def_id)
+            ));
         }
     }
     let dims: Vec<&String> = plan.dimensions.iter().map(|d| &d.def_id).collect();
-    if !case.expect.dimensions.is_empty() && dims != case.expect.dimensions.iter().collect::<Vec<_>>() {
+    if !case.expect.dimensions.is_empty()
+        && dims != case.expect.dimensions.iter().collect::<Vec<_>>()
+    {
         retrieval_ok = false;
-        failures.push(format!("dimensions {dims:?} != expected {:?}", case.expect.dimensions));
+        failures.push(format!(
+            "dimensions {dims:?} != expected {:?}",
+            case.expect.dimensions
+        ));
     }
     for f in &case.expect.filters {
         if !plan.filters.iter().any(|u| &u.def_id == f) {
@@ -105,22 +116,36 @@ fn check(case: &GoldenCase, plan: &SemanticPlan) -> (Vec<String>, bool) {
     }
     let sql = plan.sql.clone().unwrap_or_default();
     for needle in &case.expect.sql_contains {
-        if !sql.to_ascii_lowercase().contains(&needle.to_ascii_lowercase()) {
+        if !sql
+            .to_ascii_lowercase()
+            .contains(&needle.to_ascii_lowercase())
+        {
             failures.push(format!("SQL lacks '{needle}': {sql}"));
         }
     }
     if let Some(r) = &case.expect.reason_contains {
-        if !plan.missing.iter().any(|m| m.to_ascii_lowercase().contains(&r.to_ascii_lowercase())) {
-            failures.push(format!("no refusal reason contains '{r}': {:?}", plan.missing));
+        if !plan
+            .missing
+            .iter()
+            .any(|m| m.to_ascii_lowercase().contains(&r.to_ascii_lowercase()))
+        {
+            failures.push(format!(
+                "no refusal reason contains '{r}': {:?}",
+                plan.missing
+            ));
         }
     }
     (failures, retrieval_ok)
 }
 
 /// Run golden cases through `planner` and compute gates.
-pub fn evaluate(cases: &[GoldenCase], mut planner: impl FnMut(&GoldenCase) -> SemanticPlan) -> EvalReport {
+pub fn evaluate(
+    cases: &[GoldenCase],
+    mut planner: impl FnMut(&GoldenCase) -> SemanticPlan,
+) -> EvalReport {
     let mut results = Vec::new();
-    let (mut refusal_cases, mut refusal_passed, mut answerable, mut retrieval_ok_count) = (0, 0, 0, 0);
+    let (mut refusal_cases, mut refusal_passed, mut answerable, mut retrieval_ok_count) =
+        (0, 0, 0, 0);
     let mut published_only = true;
     for case in cases {
         let plan = planner(case);
@@ -148,7 +173,11 @@ pub fn evaluate(cases: &[GoldenCase], mut planner: impl FnMut(&GoldenCase) -> Se
         });
     }
     let passed = results.iter().filter(|r| r.passed).count();
-    let retrieval_rate = if answerable == 0 { 1.0 } else { retrieval_ok_count as f64 / answerable as f64 };
+    let retrieval_rate = if answerable == 0 {
+        1.0
+    } else {
+        retrieval_ok_count as f64 / answerable as f64
+    };
     let gates = vec![
         GateResult {
             name: "unanswerable/stale/ambiguous/fan-out cases refuse".to_string(),

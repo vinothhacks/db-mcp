@@ -10,8 +10,9 @@ use std::collections::BTreeMap;
 
 use chrono::Utc;
 use db_mcp_core::{
-    CatalogObject, CatalogObjectType, DbMcpError, DbMcpResult, ExplainFormat, ExplainRequest, HealthFinding,
-    HealthReport, HealthSeverity, IndexRecommendation, WorkloadAnalysis, WorkloadQueryStat, DatabaseEngine,
+    CatalogObject, CatalogObjectType, DatabaseEngine, DbMcpError, DbMcpResult, ExplainFormat,
+    ExplainRequest, HealthFinding, HealthReport, HealthSeverity, IndexRecommendation,
+    WorkloadAnalysis, WorkloadQueryStat,
 };
 use db_mcp_sql::{fingerprint_sql, hash_sql, parse_and_analyze_sql};
 use serde_json::{json, Value as J};
@@ -23,7 +24,11 @@ const DIAG_TIMEOUT_MS: u64 = 10_000;
 fn as_u64(v: Option<&J>) -> Option<u64> {
     match v {
         Some(J::Number(n)) => n.as_u64().or_else(|| n.as_f64().map(|f| f.max(0.0) as u64)),
-        Some(J::String(s)) => s.trim().parse::<u64>().ok().or_else(|| s.trim().parse::<f64>().ok().map(|f| f.max(0.0) as u64)),
+        Some(J::String(s)) => s
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .or_else(|| s.trim().parse::<f64>().ok().map(|f| f.max(0.0) as u64)),
         _ => None,
     }
 }
@@ -36,7 +41,14 @@ fn as_str(v: Option<&J>) -> String {
     }
 }
 
-fn finding(check_id: &str, category: &str, severity: HealthSeverity, summary: String, evidence: J, remediation: Option<String>) -> HealthFinding {
+fn finding(
+    check_id: &str,
+    category: &str,
+    severity: HealthSeverity,
+    summary: String,
+    evidence: J,
+    remediation: Option<String>,
+) -> HealthFinding {
     HealthFinding {
         check_id: check_id.to_string(),
         category: category.to_string(),
@@ -50,12 +62,18 @@ fn finding(check_id: &str, category: &str, severity: HealthSeverity, summary: St
 /// Non-unique indexes whose column list is a leading prefix of another index on the same table.
 pub fn redundant_indexes(objects: &[CatalogObject]) -> Vec<J> {
     let mut out = Vec::new();
-    for t in objects.iter().filter(|o| o.object_type == CatalogObjectType::Table) {
+    for t in objects
+        .iter()
+        .filter(|o| o.object_type == CatalogObjectType::Table)
+    {
         for a in t.indexes.iter().filter(|i| !i.unique && !i.primary) {
             if let Some(b) = t.indexes.iter().find(|b| {
                 b.name != a.name
                     && b.columns.len() > a.columns.len()
-                    && b.columns.iter().zip(a.columns.iter()).all(|(x, y)| x.eq_ignore_ascii_case(y))
+                    && b.columns
+                        .iter()
+                        .zip(a.columns.iter())
+                        .all(|(x, y)| x.eq_ignore_ascii_case(y))
             }) {
                 out.push(json!({
                     "table": t.qualified_name(),
@@ -74,17 +92,22 @@ pub fn tables_without_primary_key(objects: &[CatalogObject]) -> Vec<String> {
     objects
         .iter()
         .filter(|o| o.object_type == CatalogObjectType::Table)
-        .filter(|o| !o.indexes.iter().any(|i| i.primary) && !o.columns.iter().any(|c| c.is_primary_key))
+        .filter(|o| {
+            !o.indexes.iter().any(|i| i.primary) && !o.columns.iter().any(|c| c.is_primary_key)
+        })
         .map(|o| o.qualified_name())
         .collect()
 }
 
 /// Turn `SHOW GLOBAL STATUS` / `VARIABLES` rows into a lowercase name -> value map.
 fn kv(rows: &[Vec<J>]) -> BTreeMap<String, String> {
-    rows.iter().map(|r| (as_str(r.first()).to_ascii_lowercase(), as_str(r.get(1)))).collect()
+    rows.iter()
+        .map(|r| (as_str(r.first()).to_ascii_lowercase(), as_str(r.get(1))))
+        .collect()
 }
 
 /// Build the health report from collected inputs (pure; unit-tested without a server).
+#[allow(clippy::too_many_arguments)]
 pub fn build_health_report(
     connection: &str,
     status: Option<&BTreeMap<String, String>>,
@@ -96,7 +119,9 @@ pub fn build_health_report(
     user: &str,
 ) -> HealthReport {
     let mut findings = Vec::new();
-    let num = |m: Option<&BTreeMap<String, String>>, k: &str| m.and_then(|m| m.get(k)).and_then(|v| v.parse::<f64>().ok());
+    let num = |m: Option<&BTreeMap<String, String>>, k: &str| {
+        m.and_then(|m| m.get(k)).and_then(|v| v.parse::<f64>().ok())
+    };
 
     let threads = num(status, "threads_connected");
     let max_conn = num(variables, "max_connections");
@@ -126,7 +151,11 @@ pub fn build_health_report(
         _ => None,
     };
     if let Some(h) = hit_ratio {
-        let severity = if requests.unwrap_or(0.0) >= 10_000.0 && h < 0.95 { HealthSeverity::Warning } else { HealthSeverity::Healthy };
+        let severity = if requests.unwrap_or(0.0) >= 10_000.0 && h < 0.95 {
+            HealthSeverity::Warning
+        } else {
+            HealthSeverity::Healthy
+        };
         findings.push(finding(
             "buffer_pool_hit_ratio",
             "memory",
@@ -147,14 +176,24 @@ pub fn build_health_report(
             (slow > 0.0).then(|| "Review the slow query log or analyze_workload for the statements responsible.".to_string()),
         ));
     }
-    if let (Some(disk), Some(all)) = (num(status, "created_tmp_disk_tables"), num(status, "created_tmp_tables")) {
+    if let (Some(disk), Some(all)) = (
+        num(status, "created_tmp_disk_tables"),
+        num(status, "created_tmp_tables"),
+    ) {
         if all > 0.0 {
             let ratio = disk / all;
             findings.push(finding(
                 "tmp_tables_on_disk",
                 "performance",
-                if all >= 100.0 && ratio > 0.25 { HealthSeverity::Warning } else { HealthSeverity::Healthy },
-                format!("{:.1}% of internal temporary tables spilled to disk", ratio * 100.0),
+                if all >= 100.0 && ratio > 0.25 {
+                    HealthSeverity::Warning
+                } else {
+                    HealthSeverity::Healthy
+                },
+                format!(
+                    "{:.1}% of internal temporary tables spilled to disk",
+                    ratio * 100.0
+                ),
                 json!({"created_tmp_disk_tables": disk, "created_tmp_tables": all}),
                 None,
             ));
@@ -165,9 +204,12 @@ pub fn build_health_report(
             "server_status_visibility",
             "permissions",
             HealthSeverity::Info,
-            "SHOW GLOBAL STATUS is not readable by this login; server counters are omitted".to_string(),
+            "SHOW GLOBAL STATUS is not readable by this login; server counters are omitted"
+                .to_string(),
             json!({"user": user}),
-            Some(format!("Optional: GRANT SELECT ON performance_schema.global_status TO '{user}'")),
+            Some(format!(
+                "Optional: GRANT SELECT ON performance_schema.global_status TO '{user}'"
+            )),
         ));
     }
 
@@ -182,10 +224,16 @@ pub fn build_health_report(
         findings.push(finding(
             "long_running_queries",
             "activity",
-            if long_count > 0 { HealthSeverity::Warning } else { HealthSeverity::Healthy },
+            if long_count > 0 {
+                HealthSeverity::Warning
+            } else {
+                HealthSeverity::Healthy
+            },
             format!("{long_count} statement(s) running for 30 s or more"),
             json!({"queries": sample, "all_sessions_visible": has_process}),
-            (long_count > 0).then(|| "Inspect the statements; cancel runaway queries with KILL QUERY <id>.".to_string()),
+            (long_count > 0).then(|| {
+                "Inspect the statements; cancel runaway queries with KILL QUERY <id>.".to_string()
+            }),
         ));
     }
     if !has_process {
@@ -193,7 +241,8 @@ pub fn build_health_report(
             "process_visibility",
             "permissions",
             HealthSeverity::Info,
-            "Only this login's own sessions are visible (long-running query check is partial)".to_string(),
+            "Only this login's own sessions are visible (long-running query check is partial)"
+                .to_string(),
             json!({"user": user}),
             Some(format!("Optional: GRANT PROCESS ON *.* TO '{user}'")),
         ));
@@ -228,7 +277,11 @@ pub fn build_health_report(
         ));
     }
 
-    let overall_status = findings.iter().map(|f| f.severity).max().unwrap_or(HealthSeverity::Healthy);
+    let overall_status = findings
+        .iter()
+        .map(|f| f.severity)
+        .max()
+        .unwrap_or(HealthSeverity::Healthy);
     HealthReport {
         connection: connection.to_string(),
         engine: DatabaseEngine::MySql,
@@ -253,7 +306,11 @@ pub fn build_digest_query(schemas: &[String], top_n: usize) -> String {
     let list = if schemas.is_empty() {
         "''".to_string()
     } else {
-        schemas.iter().map(|s| format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))).collect::<Vec<_>>().join(", ")
+        schemas
+            .iter()
+            .map(|s| format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
     format!(
         "SELECT SCHEMA_NAME, DIGEST, DIGEST_TEXT, COUNT_STAR, SUM_TIMER_WAIT, AVG_TIMER_WAIT, SUM_ROWS_SENT, SUM_ROWS_EXAMINED
@@ -270,8 +327,14 @@ pub fn build_digest_query(schemas: &[String], top_n: usize) -> String {
 }
 
 impl LiveMySql {
-    async fn try_rows(&self, conn: &mut mysql_async::Conn, sql: &str) -> Result<Vec<Vec<J>>, DbMcpError> {
-        self.query_json(conn, sql, DIAG_TIMEOUT_MS).await.map(|(_, rows)| rows)
+    async fn try_rows(
+        &self,
+        conn: &mut mysql_async::Conn,
+        sql: &str,
+    ) -> Result<Vec<Vec<J>>, DbMcpError> {
+        self.query_json(conn, sql, DIAG_TIMEOUT_MS)
+            .await
+            .map(|(_, rows)| rows)
     }
 
     /// `database_health` on a live server. `objects` is the policy-visible catalog (restricted
@@ -281,12 +344,18 @@ impl LiveMySql {
         let grants = self.grants(&mut conn).await.unwrap_or_default();
         let privileges = crate::live::summarize_grants(&grants);
         let status = self
-            .try_rows(&mut conn, &format!("SHOW GLOBAL STATUS WHERE Variable_name IN ({STATUS_NAMES})"))
+            .try_rows(
+                &mut conn,
+                &format!("SHOW GLOBAL STATUS WHERE Variable_name IN ({STATUS_NAMES})"),
+            )
             .await
             .ok()
             .map(|r| kv(&r));
         let variables = self
-            .try_rows(&mut conn, &format!("SHOW GLOBAL VARIABLES WHERE Variable_name IN ({VARIABLE_NAMES})"))
+            .try_rows(
+                &mut conn,
+                &format!("SHOW GLOBAL VARIABLES WHERE Variable_name IN ({VARIABLE_NAMES})"),
+            )
             .await
             .ok()
             .map(|r| kv(&r));
@@ -299,7 +368,10 @@ impl LiveMySql {
             .await
             .ok();
         let workload_readable = match self
-            .try_rows(&mut conn, "SELECT 1 FROM performance_schema.events_statements_summary_by_digest LIMIT 1")
+            .try_rows(
+                &mut conn,
+                "SELECT 1 FROM performance_schema.events_statements_summary_by_digest LIMIT 1",
+            )
             .await
         {
             Ok(_) => Some(true),
@@ -318,8 +390,14 @@ impl LiveMySql {
             &self.dsn.user,
         );
         if let Some(v) = variables.as_ref() {
-            let ro = v.get("read_only").map(|s| s == "ON" || s == "1").unwrap_or(false);
-            let sro = v.get("super_read_only").map(|s| s == "ON" || s == "1").unwrap_or(false);
+            let ro = v
+                .get("read_only")
+                .map(|s| s == "ON" || s == "1")
+                .unwrap_or(false);
+            let sro = v
+                .get("super_read_only")
+                .map(|s| s == "ON" || s == "1")
+                .unwrap_or(false);
             report.findings.push(finding(
                 "server_read_only",
                 "configuration",
@@ -334,7 +412,10 @@ impl LiveMySql {
 
     /// Workload from `performance_schema` digests. `Ok(Err(note))` when the login lacks the
     /// optional grant (the caller falls back to session history and adds the note).
-    pub async fn analyze_workload(&self, top_n: usize) -> DbMcpResult<Result<WorkloadAnalysis, String>> {
+    pub async fn analyze_workload(
+        &self,
+        top_n: usize,
+    ) -> DbMcpResult<Result<WorkloadAnalysis, String>> {
         let catalog = self.catalog(false).await?;
         let mut schemas: Vec<String> = catalog.objects.iter().map(|o| o.schema.clone()).collect();
         if let Some(db) = &self.dsn.database {
@@ -369,7 +450,14 @@ impl LiveMySql {
             }
             let digest = as_str(r.get(1));
             top.push(WorkloadQueryStat {
-                query_id: format!("q_{}", if digest.len() >= 12 { digest[..12].to_string() } else { hash_sql(&normalized)[..12].to_string() }),
+                query_id: format!(
+                    "q_{}",
+                    if digest.len() >= 12 {
+                        digest[..12].to_string()
+                    } else {
+                        hash_sql(&normalized)[..12].to_string()
+                    }
+                ),
                 normalized_query: normalized,
                 calls,
                 total_exec_time_ms: (total_ms * 1000.0).round() / 1000.0,
@@ -399,21 +487,41 @@ impl LiveMySql {
     /// Finish heuristic index advice for MySQL: validate each candidate with a real
     /// `EXPLAIN FORMAT=JSON`, emit MySQL DDL, and state the privileges a change would need.
     /// Candidates whose query already uses an index on that table are dropped.
-    pub async fn finish_index_recommendations(&self, recs: Vec<IndexRecommendation>) -> Vec<IndexRecommendation> {
+    pub async fn finish_index_recommendations(
+        &self,
+        recs: Vec<IndexRecommendation>,
+    ) -> Vec<IndexRecommendation> {
         let mut out = Vec::new();
         for mut rec in recs {
             let (schema, table) = match rec.table_name.split_once('.') {
                 Some((s, t)) => (s.to_string(), t.to_string()),
-                None => (self.dsn.database.clone().unwrap_or_default(), rec.table_name.clone()),
+                None => (
+                    self.dsn.database.clone().unwrap_or_default(),
+                    rec.table_name.clone(),
+                ),
             };
-            let qualified = if schema.is_empty() { format!("`{table}`") } else { format!("`{schema}`.`{table}`") };
+            let qualified = if schema.is_empty() {
+                format!("`{table}`")
+            } else {
+                format!("`{schema}`.`{table}`")
+            };
             let index_name = format!(
                 "idx_{}_{}",
                 table.replace(|c: char| !c.is_ascii_alphanumeric() && c != '_', "_"),
-                rec.columns.iter().map(|c| c.replace(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_', "_")).collect::<Vec<_>>().join("_")
+                rec.columns
+                    .iter()
+                    .map(|c| c.replace(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_', "_"))
+                    .collect::<Vec<_>>()
+                    .join("_")
             );
-            let cols = rec.columns.iter().map(|c| format!("`{}`", c.replace('`', "``"))).collect::<Vec<_>>().join(", ");
-            rec.suggested_ddl = format!("ALTER TABLE {qualified} ADD INDEX `{index_name}` ({cols});");
+            let cols = rec
+                .columns
+                .iter()
+                .map(|c| format!("`{}`", c.replace('`', "``")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            rec.suggested_ddl =
+                format!("ALTER TABLE {qualified} ADD INDEX `{index_name}` ({cols});");
             rec.recovery_considerations = format!(
                 "Online DDL (ALGORITHM=INPLACE, LOCK=NONE) builds the index without blocking reads/writes on InnoDB; roll back with `ALTER TABLE {qualified} DROP INDEX `{index_name}`;`. MySQL DDL is not transactional."
             );
@@ -430,9 +538,14 @@ impl LiveMySql {
             rec.hypopg_validated = false;
             rec.assumptions = vec![
                 "InnoDB index statistics are current (ANALYZE TABLE has run recently).".to_string(),
-                "Predicate selectivity of the observed queries is representative of the workload.".to_string(),
+                "Predicate selectivity of the observed queries is representative of the workload."
+                    .to_string(),
             ];
-            let probe = rec.relevant_queries.iter().find(|q| !q.trim_start().starts_with("/*") && !q.contains('?')).cloned();
+            let probe = rec
+                .relevant_queries
+                .iter()
+                .find(|q| !q.trim_start().starts_with("/*") && !q.contains('?'))
+                .cloned();
             let mut validation = json!({"explain_validated": false});
             if let Some(sql) = probe {
                 let req = ExplainRequest {
@@ -445,7 +558,10 @@ impl LiveMySql {
                     timeout_ms: 5_000,
                 };
                 if let Ok(plan) = self.explain(&req).await {
-                    let full_scan = plan.seq_scans.iter().any(|t| t.eq_ignore_ascii_case(&table));
+                    let full_scan = plan
+                        .seq_scans
+                        .iter()
+                        .any(|t| t.eq_ignore_ascii_case(&table));
                     if !full_scan && !plan.index_scans.is_empty() && plan.seq_scans.is_empty() {
                         continue;
                     }
@@ -525,7 +641,14 @@ mod tests {
     #[test]
     fn health_report_from_counters_catalog_and_missing_grants() {
         let objects = vec![
-            table("orders", true, vec![("idx_status", vec!["status"], false), ("idx_status_created", vec!["status", "created_at"], false)]),
+            table(
+                "orders",
+                true,
+                vec![
+                    ("idx_status", vec!["status"], false),
+                    ("idx_status_created", vec!["status", "created_at"], false),
+                ],
+            ),
             table("event_log", false, vec![]),
         ];
         let status: BTreeMap<String, String> = [
@@ -537,18 +660,55 @@ mod tests {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-        let variables: BTreeMap<String, String> = [("max_connections", "100")].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        let r = build_health_report("m", Some(&status), Some(&variables), Some(&[]), false, Some(false), &objects, "ro");
-        let f = |id: &str| r.findings.iter().find(|f| f.check_id == id).unwrap_or_else(|| panic!("{id} missing"));
-        assert_eq!(f("connection_saturation").severity, HealthSeverity::Critical);
+        let variables: BTreeMap<String, String> = [("max_connections", "100")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let r = build_health_report(
+            "m",
+            Some(&status),
+            Some(&variables),
+            Some(&[]),
+            false,
+            Some(false),
+            &objects,
+            "ro",
+        );
+        let f = |id: &str| {
+            r.findings
+                .iter()
+                .find(|f| f.check_id == id)
+                .unwrap_or_else(|| panic!("{id} missing"))
+        };
+        assert_eq!(
+            f("connection_saturation").severity,
+            HealthSeverity::Critical
+        );
         assert_eq!(r.overall_status, HealthSeverity::Critical);
         assert!((r.cache_hit_ratio.unwrap() - 0.999).abs() < 1e-9);
-        assert_eq!(f("tables_without_primary_key").evidence["tables"], json!(["appdb.event_log"]));
-        assert_eq!(f("redundant_indexes").evidence["indexes"][0]["redundant_index"], json!("idx_status"));
-        assert!(f("process_visibility").remediation.as_deref().unwrap().contains("GRANT PROCESS"));
-        assert!(f("workload_visibility").remediation.as_deref().unwrap().contains("performance_schema"));
+        assert_eq!(
+            f("tables_without_primary_key").evidence["tables"],
+            json!(["appdb.event_log"])
+        );
+        assert_eq!(
+            f("redundant_indexes").evidence["indexes"][0]["redundant_index"],
+            json!("idx_status")
+        );
+        assert!(f("process_visibility")
+            .remediation
+            .as_deref()
+            .unwrap()
+            .contains("GRANT PROCESS"));
+        assert!(f("workload_visibility")
+            .remediation
+            .as_deref()
+            .unwrap()
+            .contains("performance_schema"));
         let none = build_health_report("m", None, None, None, true, Some(true), &objects, "ro");
-        assert!(none.findings.iter().any(|f| f.check_id == "server_status_visibility"));
+        assert!(none
+            .findings
+            .iter()
+            .any(|f| f.check_id == "server_status_visibility"));
         assert!(none.active_connections.is_none());
     }
 

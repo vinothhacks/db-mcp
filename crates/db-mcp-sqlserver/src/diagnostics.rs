@@ -12,8 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::Utc;
 use db_mcp_core::{
-    CatalogObject, CatalogObjectType, DatabaseAdapter, DatabaseEngine, DbMcpResult, ExplainFormat, ExplainRequest,
-    HealthFinding, HealthReport, HealthSeverity, IndexRecommendation, WorkloadAnalysis, WorkloadQueryStat,
+    CatalogObject, CatalogObjectType, DatabaseAdapter, DatabaseEngine, DbMcpResult, ExplainFormat,
+    ExplainRequest, HealthFinding, HealthReport, HealthSeverity, IndexRecommendation,
+    WorkloadAnalysis, WorkloadQueryStat,
 };
 use db_mcp_sql::{fingerprint_sql, hash_sql, parse_and_analyze_sql};
 use serde_json::{json, Value};
@@ -60,10 +61,17 @@ fn is_clustered(idx: &db_mcp_core::IndexSpec) -> bool {
 
 /// Catalog-only checks: they need nothing beyond `db_datareader`.
 pub fn catalog_findings(objects: &[CatalogObject]) -> Vec<HealthFinding> {
-    let tables: Vec<&CatalogObject> = objects.iter().filter(|o| o.object_type == CatalogObjectType::Table).collect();
+    let tables: Vec<&CatalogObject> = objects
+        .iter()
+        .filter(|o| o.object_type == CatalogObjectType::Table)
+        .collect();
     let mut out = Vec::new();
 
-    let no_pk: Vec<String> = tables.iter().filter(|t| !t.indexes.iter().any(|i| i.primary)).map(|t| t.qualified_name()).collect();
+    let no_pk: Vec<String> = tables
+        .iter()
+        .filter(|t| !t.indexes.iter().any(|i| i.primary))
+        .map(|t| t.qualified_name())
+        .collect();
     out.push(finding(
         "tables_without_primary_key",
         "schema",
@@ -73,7 +81,11 @@ pub fn catalog_findings(objects: &[CatalogObject]) -> Vec<HealthFinding> {
         (!no_pk.is_empty()).then(|| "Add a primary key (ALTER TABLE ... ADD CONSTRAINT pk_... PRIMARY KEY (...)) so rows are addressable and replication/CDC work.".to_string()),
     ));
 
-    let heaps: Vec<String> = tables.iter().filter(|t| !t.indexes.iter().any(is_clustered)).map(|t| t.qualified_name()).collect();
+    let heaps: Vec<String> = tables
+        .iter()
+        .filter(|t| !t.indexes.iter().any(is_clustered))
+        .map(|t| t.qualified_name())
+        .collect();
     out.push(finding(
         "heap_tables",
         "storage",
@@ -87,7 +99,12 @@ pub fn catalog_findings(objects: &[CatalogObject]) -> Vec<HealthFinding> {
     for t in &tables {
         let mut seen: BTreeMap<String, String> = BTreeMap::new();
         for i in &t.indexes {
-            let key = i.columns.iter().map(|c| c.to_ascii_lowercase()).collect::<Vec<_>>().join(",");
+            let key = i
+                .columns
+                .iter()
+                .map(|c| c.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+                .join(",");
             if key.is_empty() {
                 continue;
             }
@@ -109,15 +126,25 @@ pub fn catalog_findings(objects: &[CatalogObject]) -> Vec<HealthFinding> {
 
     let disabled: Vec<String> = tables
         .iter()
-        .flat_map(|t| t.indexes.iter().filter(|i| i.index_type.as_deref().unwrap_or("").contains("disabled")).map(move |i| format!("{}.{}", t.qualified_name(), i.name)))
+        .flat_map(|t| {
+            t.indexes
+                .iter()
+                .filter(|i| i.index_type.as_deref().unwrap_or("").contains("disabled"))
+                .map(move |i| format!("{}.{}", t.qualified_name(), i.name))
+        })
         .collect();
     out.push(finding(
         "disabled_indexes",
         "indexes",
-        if disabled.is_empty() { HealthSeverity::Healthy } else { HealthSeverity::Warning },
+        if disabled.is_empty() {
+            HealthSeverity::Healthy
+        } else {
+            HealthSeverity::Warning
+        },
         format!("{} disabled index(es)", disabled.len()),
         json!({ "indexes": disabled }),
-        (!disabled.is_empty()).then(|| "Rebuild (ALTER INDEX ... REBUILD) or drop disabled indexes.".to_string()),
+        (!disabled.is_empty())
+            .then(|| "Rebuild (ALTER INDEX ... REBUILD) or drop disabled indexes.".to_string()),
     ));
 
     let mut unindexed = Vec::new();
@@ -125,7 +152,10 @@ pub fn catalog_findings(objects: &[CatalogObject]) -> Vec<HealthFinding> {
         for fk in &t.foreign_keys {
             let covered = t.indexes.iter().any(|i| {
                 i.columns.len() >= fk.columns.len()
-                    && i.columns.iter().zip(fk.columns.iter()).all(|(a, b)| a.eq_ignore_ascii_case(b))
+                    && i.columns
+                        .iter()
+                        .zip(fk.columns.iter())
+                        .all(|(a, b)| a.eq_ignore_ascii_case(b))
             });
             if !covered {
                 unindexed.push(json!({ "table": t.qualified_name(), "columns": fk.columns, "references": fk.referenced_table, "constraint": fk.name }));
@@ -148,7 +178,10 @@ fn first_row(set: &FetchedRows) -> Option<&Vec<Value>> {
 }
 
 fn num(v: Option<&Value>) -> Option<f64> {
-    v.and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+    v.and_then(|v| {
+        v.as_f64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    })
 }
 
 /// `database_health` for a live SQL Server connection.
@@ -167,7 +200,12 @@ pub async fn database_health(adapter: &SqlServerAdapter) -> DbMcpResult<HealthRe
         dead_tuples_total: None,
         invalid_indexes: objects
             .iter()
-            .flat_map(|t| t.indexes.iter().filter(|i| i.index_type.as_deref().unwrap_or("").contains("disabled")).map(move |i| format!("{}.{}", t.qualified_name(), i.name)))
+            .flat_map(|t| {
+                t.indexes
+                    .iter()
+                    .filter(|i| i.index_type.as_deref().unwrap_or("").contains("disabled"))
+                    .map(move |i| format!("{}.{}", t.qualified_name(), i.name))
+            })
             .collect(),
         long_running_queries: 0,
         findings: Vec::new(),
@@ -218,7 +256,17 @@ pub async fn database_health(adapter: &SqlServerAdapter) -> DbMcpResult<HealthRe
          UNION ALL SELECT OBJECT_SCHEMA_NAME(parent_object_id) + '.' + OBJECT_NAME(parent_object_id), name FROM sys.check_constraints WHERE is_not_trusted = 1"
     );
     if let Ok(set) = adapter.query_rows(&untrusted_sql, 500).await {
-        let items: Vec<String> = set.rows.iter().map(|r| format!("{}.{}", r[0].as_str().unwrap_or("?"), r[1].as_str().unwrap_or("?"))).collect();
+        let items: Vec<String> = set
+            .rows
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}.{}",
+                    r[0].as_str().unwrap_or("?"),
+                    r[1].as_str().unwrap_or("?")
+                )
+            })
+            .collect();
         findings.push(finding(
             "untrusted_constraints",
             "schema",
@@ -243,7 +291,10 @@ pub async fn database_health(adapter: &SqlServerAdapter) -> DbMcpResult<HealthRe
                         c.insert(k.to_string(), v);
                     }
                 }
-                if let (Some(hit), Some(base)) = (c.get("Buffer cache hit ratio"), c.get("Buffer cache hit ratio base")) {
+                if let (Some(hit), Some(base)) = (
+                    c.get("Buffer cache hit ratio"),
+                    c.get("Buffer cache hit ratio base"),
+                ) {
                     if *base > 0.0 {
                         let ratio = hit / base;
                         report.cache_hit_ratio = Some(ratio);
@@ -268,7 +319,11 @@ pub async fn database_health(adapter: &SqlServerAdapter) -> DbMcpResult<HealthRe
                     ));
                 }
             }
-            Err(_) => findings.push(needs_grant("performance_counters", "Performance counter check", format!("GRANT VIEW SERVER STATE TO [{}]", info.login))),
+            Err(_) => findings.push(needs_grant(
+                "performance_counters",
+                "Performance counter check",
+                format!("GRANT VIEW SERVER STATE TO [{}]", info.login),
+            )),
         }
         let conns = format!(
             "SELECT {INTERNAL_MARKER} (SELECT COUNT(*) FROM sys.dm_exec_connections), @@MAX_CONNECTIONS, \
@@ -288,7 +343,11 @@ pub async fn database_health(adapter: &SqlServerAdapter) -> DbMcpResult<HealthRe
                 findings.push(finding(
                     "connection_saturation",
                     "connections",
-                    if util >= 0.8 { HealthSeverity::Warning } else { HealthSeverity::Healthy },
+                    if util >= 0.8 {
+                        HealthSeverity::Warning
+                    } else {
+                        HealthSeverity::Healthy
+                    },
                     format!("{active} of {max} connections in use"),
                     json!({ "active_connections": active, "max_connections": max }),
                     None,
@@ -296,10 +355,17 @@ pub async fn database_health(adapter: &SqlServerAdapter) -> DbMcpResult<HealthRe
                 findings.push(finding(
                     "long_running_requests",
                     "queries",
-                    if long > 0 || blocked > 0 { HealthSeverity::Warning } else { HealthSeverity::Healthy },
+                    if long > 0 || blocked > 0 {
+                        HealthSeverity::Warning
+                    } else {
+                        HealthSeverity::Healthy
+                    },
                     format!("{long} request(s) running over 60 s, {blocked} blocked request(s)"),
                     json!({ "long_running": long, "blocked": blocked }),
-                    (long > 0 || blocked > 0).then(|| "Inspect sys.dm_exec_requests / sys.dm_os_waiting_tasks for blockers.".to_string()),
+                    (long > 0 || blocked > 0).then(|| {
+                        "Inspect sys.dm_exec_requests / sys.dm_os_waiting_tasks for blockers."
+                            .to_string()
+                    }),
                 ));
             }
         }
@@ -318,7 +384,11 @@ pub async fn database_health(adapter: &SqlServerAdapter) -> DbMcpResult<HealthRe
         ));
     }
 
-    report.overall_status = findings.iter().map(|f| f.severity).max().unwrap_or(HealthSeverity::Healthy);
+    report.overall_status = findings
+        .iter()
+        .map(|f| f.severity)
+        .max()
+        .unwrap_or(HealthSeverity::Healthy);
     report.findings = findings;
     Ok(report)
 }
@@ -369,12 +439,25 @@ fn rows_to_stats(set: &FetchedRows) -> Vec<WorkloadQueryStat> {
             let total = num(r.get(3)).unwrap_or(0.0);
             let normalized = fingerprint_sql(&text);
             Some(WorkloadQueryStat {
-                query_id: r.first().map(|v| v.as_str().map(ToOwned::to_owned).unwrap_or_else(|| v.to_string())).unwrap_or_else(|| format!("q_{}", &hash_sql(&normalized)[..12])),
-                tables_referenced: parse_and_analyze_sql(DatabaseEngine::SqlServer, &text).map(|a| a.referenced_tables).unwrap_or_default(),
+                query_id: r
+                    .first()
+                    .map(|v| {
+                        v.as_str()
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_else(|| v.to_string())
+                    })
+                    .unwrap_or_else(|| format!("q_{}", &hash_sql(&normalized)[..12])),
+                tables_referenced: parse_and_analyze_sql(DatabaseEngine::SqlServer, &text)
+                    .map(|a| a.referenced_tables)
+                    .unwrap_or_default(),
                 normalized_query: normalized,
                 calls,
                 total_exec_time_ms: total,
-                mean_exec_time_ms: if calls > 0 { total / calls as f64 } else { total },
+                mean_exec_time_ms: if calls > 0 {
+                    total / calls as f64
+                } else {
+                    total
+                },
                 rows: num(r.get(4)).unwrap_or(0.0).max(0.0) as u64,
                 shared_blks_hit: num(r.get(5)).unwrap_or(0.0).max(0.0) as u64,
                 shared_blks_read: num(r.get(6)).unwrap_or(0.0).max(0.0) as u64,
@@ -384,7 +467,10 @@ fn rows_to_stats(set: &FetchedRows) -> Vec<WorkloadQueryStat> {
 }
 
 /// Statements from Query Store (preferred) or the plan cache; `None` when neither is readable.
-pub async fn server_workload(adapter: &SqlServerAdapter, top_n: usize) -> DbMcpResult<(Option<(String, Vec<WorkloadQueryStat>)>, Vec<String>)> {
+pub async fn server_workload(
+    adapter: &SqlServerAdapter,
+    top_n: usize,
+) -> DbMcpResult<(Option<(String, Vec<WorkloadQueryStat>)>, Vec<String>)> {
     let info = adapter.server_info().await?;
     let mut notes = Vec::new();
     let fetch = (top_n * 3).clamp(10, 300);
@@ -409,9 +495,15 @@ pub async fn server_workload(adapter: &SqlServerAdapter, top_n: usize) -> DbMcpR
             Err(e) => notes.push(format!("Query Store could not be read: {e}")),
         }
     } else if !info.has_query_store() {
-        notes.push(format!("Query Store needs SQL Server 2016+ (server is {}).", info.product_version));
+        notes.push(format!(
+            "Query Store needs SQL Server 2016+ (server is {}).",
+            info.product_version
+        ));
     } else {
-        notes.push(format!("Query Store needs GRANT VIEW DATABASE STATE TO [{}].", info.database_user));
+        notes.push(format!(
+            "Query Store needs GRANT VIEW DATABASE STATE TO [{}].",
+            info.database_user
+        ));
     }
     if info.can_view_server_state() {
         let dmv = format!(
@@ -432,13 +524,22 @@ pub async fn server_workload(adapter: &SqlServerAdapter, top_n: usize) -> DbMcpR
             Err(e) => notes.push(format!("plan cache could not be read: {e}")),
         }
     } else {
-        notes.push(format!("plan-cache statistics need GRANT VIEW SERVER STATE TO [{}].", info.login));
+        notes.push(format!(
+            "plan-cache statistics need GRANT VIEW SERVER STATE TO [{}].",
+            info.login
+        ));
     }
     Ok((None, notes))
 }
 
 /// Finish a workload analysis from server statistics.
-pub fn workload_from_stats(connection: &str, source: String, mut stats: Vec<WorkloadQueryStat>, top_n: usize, notes: Vec<String>) -> WorkloadAnalysis {
+pub fn workload_from_stats(
+    connection: &str,
+    source: String,
+    mut stats: Vec<WorkloadQueryStat>,
+    top_n: usize,
+    notes: Vec<String>,
+) -> WorkloadAnalysis {
     // Merge statements that share a fingerprint (literal-only differences).
     let mut merged: BTreeMap<String, WorkloadQueryStat> = BTreeMap::new();
     for s in stats.drain(..) {
@@ -449,7 +550,11 @@ pub fn workload_from_stats(connection: &str, source: String, mut stats: Vec<Work
                 m.rows += s.rows;
                 m.shared_blks_hit += s.shared_blks_hit;
                 m.shared_blks_read += s.shared_blks_read;
-                m.mean_exec_time_ms = if m.calls > 0 { m.total_exec_time_ms / m.calls as f64 } else { m.total_exec_time_ms };
+                m.mean_exec_time_ms = if m.calls > 0 {
+                    m.total_exec_time_ms / m.calls as f64
+                } else {
+                    m.total_exec_time_ms
+                };
             }
             None => {
                 merged.insert(s.normalized_query.clone(), s);
@@ -457,7 +562,11 @@ pub fn workload_from_stats(connection: &str, source: String, mut stats: Vec<Work
         }
     }
     let mut stats: Vec<WorkloadQueryStat> = merged.into_values().collect();
-    stats.sort_by(|a, b| b.total_exec_time_ms.partial_cmp(&a.total_exec_time_ms).unwrap_or(std::cmp::Ordering::Equal));
+    stats.sort_by(|a, b| {
+        b.total_exec_time_ms
+            .partial_cmp(&a.total_exec_time_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let total = stats.len();
     stats.truncate(top_n.max(1));
     let mut scores: BTreeMap<String, f64> = BTreeMap::new();
@@ -481,14 +590,33 @@ pub fn workload_from_stats(connection: &str, source: String, mut stats: Vec<Work
 
 fn split_columns(raw: Option<&Value>) -> Vec<String> {
     raw.and_then(|v| v.as_str())
-        .map(|s| s.split(',').map(|c| c.trim().trim_start_matches('[').trim_end_matches(']').to_string()).filter(|c| !c.is_empty()).collect())
+        .map(|s| {
+            s.split(',')
+                .map(|c| {
+                    c.trim()
+                        .trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .to_string()
+                })
+                .filter(|c| !c.is_empty())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
 /// Missing-index suggestions recorded by the server (`sys.dm_db_missing_index_*`).
-pub async fn missing_index_dmv(adapter: &SqlServerAdapter, info: &ServerInfo) -> (Vec<(MissingIndexHint, Value)>, Vec<String>) {
+pub async fn missing_index_dmv(
+    adapter: &SqlServerAdapter,
+    info: &ServerInfo,
+) -> (Vec<(MissingIndexHint, Value)>, Vec<String>) {
     if !info.can_view_server_state() {
-        return (Vec::new(), vec![format!("missing-index DMVs need GRANT VIEW SERVER STATE TO [{}]", info.login)]);
+        return (
+            Vec::new(),
+            vec![format!(
+                "missing-index DMVs need GRANT VIEW SERVER STATE TO [{}]",
+                info.login
+            )],
+        );
     }
     let sql = format!(
         "SELECT {INTERNAL_MARKER} TOP (50) OBJECT_SCHEMA_NAME(d.object_id), OBJECT_NAME(d.object_id), d.equality_columns, d.inequality_columns, d.included_columns, \
@@ -522,17 +650,42 @@ pub async fn missing_index_dmv(adapter: &SqlServerAdapter, info: &ServerInfo) ->
 
 fn covered(objects: &[CatalogObject], table: &str, cols: &[String]) -> bool {
     let base = table.rsplit('.').next().unwrap_or(table);
-    objects.iter().filter(|o| o.qualified_name().eq_ignore_ascii_case(table) || o.name.eq_ignore_ascii_case(base)).any(|o| {
-        o.indexes.iter().any(|i| i.columns.len() >= cols.len() && i.columns.iter().zip(cols).all(|(a, b)| a.eq_ignore_ascii_case(b)))
-    })
+    objects
+        .iter()
+        .filter(|o| {
+            o.qualified_name().eq_ignore_ascii_case(table) || o.name.eq_ignore_ascii_case(base)
+        })
+        .any(|o| {
+            o.indexes.iter().any(|i| {
+                i.columns.len() >= cols.len()
+                    && i.columns
+                        .iter()
+                        .zip(cols)
+                        .all(|(a, b)| a.eq_ignore_ascii_case(b))
+            })
+        })
 }
 
 /// Turn a missing-index hint into an advisory recommendation.
-pub fn hint_to_recommendation(hint: &MissingIndexHint, evidence: Value, queries: Vec<String>, observed: &str) -> IndexRecommendation {
+pub fn hint_to_recommendation(
+    hint: &MissingIndexHint,
+    evidence: Value,
+    queries: Vec<String>,
+    observed: &str,
+) -> IndexRecommendation {
     let table = hint.qualified_table();
-    let columns: Vec<String> = hint.equality.iter().chain(hint.inequality.iter()).cloned().collect();
+    let columns: Vec<String> = hint
+        .equality
+        .iter()
+        .chain(hint.inequality.iter())
+        .cloned()
+        .collect();
     let ddl = hint.suggested_ddl();
-    let name = ddl.split_whitespace().nth(3).unwrap_or("ix_new").to_string();
+    let name = ddl
+        .split_whitespace()
+        .nth(3)
+        .unwrap_or("ix_new")
+        .to_string();
     IndexRecommendation {
         id: format!("rec_{}_{}", hint.table, columns.join("_")),
         table_name: table.clone(),
@@ -576,7 +729,11 @@ pub fn merge_recommendations(
         if r.columns.is_empty() || covered(objects, &r.table_name, &r.columns) {
             continue;
         }
-        let key = format!("{}|{}", r.table_name.to_ascii_lowercase(), r.columns.join(",").to_ascii_lowercase());
+        let key = format!(
+            "{}|{}",
+            r.table_name.to_ascii_lowercase(),
+            r.columns.join(",").to_ascii_lowercase()
+        );
         if seen.insert(key) {
             out.push(r);
         }
@@ -586,7 +743,10 @@ pub fn merge_recommendations(
 }
 
 /// Showplan missing-index hints for the given queries (needs SHOWPLAN).
-pub async fn showplan_hints(adapter: &SqlServerAdapter, queries: &[String]) -> (Vec<IndexRecommendation>, Vec<String>) {
+pub async fn showplan_hints(
+    adapter: &SqlServerAdapter,
+    queries: &[String],
+) -> (Vec<IndexRecommendation>, Vec<String>) {
     let mut recs = Vec::new();
     let mut notes = Vec::new();
     for q in queries.iter().take(20) {
@@ -601,9 +761,24 @@ pub async fn showplan_hints(adapter: &SqlServerAdapter, queries: &[String]) -> (
         };
         match adapter.explain(req).await {
             Ok(plan) => {
-                let hints = plan.structured_plan.as_ref().and_then(|s| s.get("missing_indexes")).and_then(|m| m.as_array()).cloned().unwrap_or_default();
+                let hints = plan
+                    .structured_plan
+                    .as_ref()
+                    .and_then(|s| s.get("missing_indexes"))
+                    .and_then(|m| m.as_array())
+                    .cloned()
+                    .unwrap_or_default();
                 for h in hints {
-                    let cols = |k: &str| h.get(k).and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|c| c.as_str().map(ToOwned::to_owned)).collect()).unwrap_or_default();
+                    let cols = |k: &str| {
+                        h.get(k)
+                            .and_then(|v| v.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|c| c.as_str().map(ToOwned::to_owned))
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    };
                     let table = h.get("table").and_then(|v| v.as_str()).unwrap_or_default();
                     let (schema, tname) = table.split_once('.').unwrap_or(("dbo", table));
                     let hint = MissingIndexHint {
@@ -615,7 +790,12 @@ pub async fn showplan_hints(adapter: &SqlServerAdapter, queries: &[String]) -> (
                         include: cols("include_columns"),
                     };
                     let evidence = json!({ "source": "showplan_xml", "statement_subtree_cost": plan.estimated_cost, "impact": hint.impact });
-                    recs.push(hint_to_recommendation(&hint, evidence, vec![fingerprint_sql(q)], "Estimated plan"));
+                    recs.push(hint_to_recommendation(
+                        &hint,
+                        evidence,
+                        vec![fingerprint_sql(q)],
+                        "Estimated plan",
+                    ));
                 }
             }
             Err(e) => {
@@ -642,43 +822,103 @@ mod tests {
             comment: None,
             estimated_rows: None,
             size_bytes: None,
-            columns: vec![ColumnSpec { name: "id".into(), data_type: "int".into(), nullable: false, default_value: None, is_primary_key: false, comment: None, ordinal_position: 1 }],
+            columns: vec![ColumnSpec {
+                name: "id".into(),
+                data_type: "int".into(),
+                nullable: false,
+                default_value: None,
+                is_primary_key: false,
+                comment: None,
+                ordinal_position: 1,
+            }],
             indexes,
             foreign_keys: fks,
             definition: None,
         }
     }
     fn idx(name: &str, cols: &[&str], primary: bool, ty: &str) -> IndexSpec {
-        IndexSpec { name: name.into(), table_name: String::new(), columns: cols.iter().map(|c| c.to_string()).collect(), unique: primary, primary, index_type: Some(ty.into()), predicate: None, definition: None }
+        IndexSpec {
+            name: name.into(),
+            table_name: String::new(),
+            columns: cols.iter().map(|c| c.to_string()).collect(),
+            unique: primary,
+            primary,
+            index_type: Some(ty.into()),
+            predicate: None,
+            definition: None,
+        }
     }
 
     #[test]
     fn catalog_findings_detect_heaps_missing_pk_duplicates_and_unindexed_fks() {
         let objs = vec![
-            table("users", vec![idx("pk_users", &["id"], true, "clustered")], vec![]),
-            table("event_staging", vec![idx("ix_a", &["event_id"], false, "nonclustered"), idx("ix_b", &["event_id"], false, "nonclustered")], vec![]),
+            table(
+                "users",
+                vec![idx("pk_users", &["id"], true, "clustered")],
+                vec![],
+            ),
+            table(
+                "event_staging",
+                vec![
+                    idx("ix_a", &["event_id"], false, "nonclustered"),
+                    idx("ix_b", &["event_id"], false, "nonclustered"),
+                ],
+                vec![],
+            ),
             table(
                 "orders",
                 vec![idx("pk_orders", &["id"], true, "clustered")],
-                vec![ForeignKeySpec { name: Some("fk".into()), columns: vec!["user_id".into()], referenced_table: "dbo.users".into(), referenced_columns: vec!["id".into()], on_delete: None, on_update: None }],
+                vec![ForeignKeySpec {
+                    name: Some("fk".into()),
+                    columns: vec!["user_id".into()],
+                    referenced_table: "dbo.users".into(),
+                    referenced_columns: vec!["id".into()],
+                    on_delete: None,
+                    on_update: None,
+                }],
             ),
         ];
         let f = catalog_findings(&objs);
         let get = |id: &str| f.iter().find(|x| x.check_id == id).unwrap();
-        assert_eq!(get("tables_without_primary_key").evidence["tables"], json!(["dbo.event_staging"]));
-        assert_eq!(get("heap_tables").evidence["tables"], json!(["dbo.event_staging"]));
+        assert_eq!(
+            get("tables_without_primary_key").evidence["tables"],
+            json!(["dbo.event_staging"])
+        );
+        assert_eq!(
+            get("heap_tables").evidence["tables"],
+            json!(["dbo.event_staging"])
+        );
         assert_eq!(get("duplicate_indexes").severity, HealthSeverity::Warning);
-        assert_eq!(get("unindexed_foreign_keys").evidence["foreign_keys"][0]["table"], "dbo.orders");
+        assert_eq!(
+            get("unindexed_foreign_keys").evidence["foreign_keys"][0]["table"],
+            "dbo.orders"
+        );
         assert_eq!(get("disabled_indexes").severity, HealthSeverity::Healthy);
     }
 
     #[test]
     fn recommendations_merge_dedupe_and_skip_covered() {
-        let objs = vec![table("orders", vec![idx("pk_orders", &["id"], true, "clustered")], vec![])];
-        let h = |cols: &[&str]| MissingIndexHint { impact: 80.0, schema: "dbo".into(), table: "orders".into(), equality: cols.iter().map(|c| c.to_string()).collect(), inequality: vec![], include: vec![] };
+        let objs = vec![table(
+            "orders",
+            vec![idx("pk_orders", &["id"], true, "clustered")],
+            vec![],
+        )];
+        let h = |cols: &[&str]| MissingIndexHint {
+            impact: 80.0,
+            schema: "dbo".into(),
+            table: "orders".into(),
+            equality: cols.iter().map(|c| c.to_string()).collect(),
+            inequality: vec![],
+            include: vec![],
+        };
         let a = hint_to_recommendation(&h(&["status"]), json!({}), vec![], "x");
-        assert_eq!(a.suggested_ddl, "CREATE NONCLUSTERED INDEX ix_orders_status ON dbo.orders (status);");
-        assert!(a.recovery_considerations.contains("DROP INDEX ix_orders_status ON dbo.orders"));
+        assert_eq!(
+            a.suggested_ddl,
+            "CREATE NONCLUSTERED INDEX ix_orders_status ON dbo.orders (status);"
+        );
+        assert!(a
+            .recovery_considerations
+            .contains("DROP INDEX ix_orders_status ON dbo.orders"));
         let b = hint_to_recommendation(&h(&["status"]), json!({}), vec![], "y");
         let c = hint_to_recommendation(&h(&["id"]), json!({}), vec![], "z");
         let merged = merge_recommendations(&objs, vec![a, b], vec![c], 5);
@@ -689,9 +929,33 @@ mod tests {
     fn workload_merges_fingerprints_and_skips_internal_statements() {
         let set = FetchedRows {
             rows: vec![
-                vec![json!("1"), json!("SELECT id FROM dbo.orders WHERE status = 'a'"), json!(2), json!(10.0), json!(4), json!(0), json!(0)],
-                vec![json!("2"), json!("SELECT id FROM dbo.orders WHERE status = 'b'"), json!(3), json!(5.0), json!(6), json!(0), json!(0)],
-                vec![json!("3"), json!("SELECT /* db-mcp:internal */ 1"), json!(9), json!(99.0), json!(1), json!(0), json!(0)],
+                vec![
+                    json!("1"),
+                    json!("SELECT id FROM dbo.orders WHERE status = 'a'"),
+                    json!(2),
+                    json!(10.0),
+                    json!(4),
+                    json!(0),
+                    json!(0),
+                ],
+                vec![
+                    json!("2"),
+                    json!("SELECT id FROM dbo.orders WHERE status = 'b'"),
+                    json!(3),
+                    json!(5.0),
+                    json!(6),
+                    json!(0),
+                    json!(0),
+                ],
+                vec![
+                    json!("3"),
+                    json!("SELECT /* db-mcp:internal */ 1"),
+                    json!(9),
+                    json!(99.0),
+                    json!(1),
+                    json!(0),
+                    json!(0),
+                ],
             ],
             ..FetchedRows::default()
         };
@@ -702,7 +966,10 @@ mod tests {
         assert_eq!(w.top_queries[0].calls, 5);
         assert!(!w.top_queries[0].normalized_query.contains("'a'"));
         assert_eq!(w.hot_tables, vec!["dbo.orders"]);
-        assert_eq!(strip_param_prefix("(@P1 nvarchar(4000),@P2 int)SELECT 1"), "SELECT 1");
+        assert_eq!(
+            strip_param_prefix("(@P1 nvarchar(4000),@P2 int)SELECT 1"),
+            "SELECT 1"
+        );
         assert_eq!(strip_param_prefix("SELECT (1)"), "SELECT (1)");
     }
 }
