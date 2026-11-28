@@ -94,9 +94,9 @@ mssql_up() {
     -v "RO_PASSWORD=$ro_pw" "FULL_PASSWORD=$full_pw" -i /tmp/fixture/02-logins.sql >&2
   log "ready: db_datareader login dbmcp_ro (default database dbmcp_fixture), extra-grants login dbmcp_ro_full"
   # Read-only login, login default database, named-instance style DSN on an explicit port.
-  echo "export DB_MCP_MSSQL_TEST_DSN='sqlserver://dbmcp_ro:$(pct "$ro_pw")@127.0.0.1:$port?instance=V2DEMO&encrypt=optional&trustServerCertificate=true'"
-  echo "export DB_MCP_MSSQL_FULL_TEST_DSN='sqlserver://dbmcp_ro_full:$(pct "$full_pw")@127.0.0.1:$port?database=dbmcp_fixture'"
-  echo "export DB_MCP_MSSQL_ADMIN_DSN='sqlserver://sa:$(pct "$sa_pw")@127.0.0.1:$port?database=dbmcp_fixture'"
+  echo "export DB_MCP_MSSQL_TEST_DSN='sqlserver://dbmcp_ro:$(pct "$ro_pw")@127.0.0.1:$port?instance=V2DEMO&trustServerCertificate=true'"
+  echo "export DB_MCP_MSSQL_FULL_TEST_DSN='sqlserver://dbmcp_ro_full:$(pct "$full_pw")@127.0.0.1:$port?database=dbmcp_fixture&trustServerCertificate=true'"
+  echo "export DB_MCP_MSSQL_ADMIN_DSN='sqlserver://sa:$(pct "$sa_pw")@127.0.0.1:$port?database=dbmcp_fixture&trustServerCertificate=true'"
 }
 
 case "$ENGINE" in

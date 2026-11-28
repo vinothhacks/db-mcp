@@ -169,8 +169,8 @@ impl SqlServerDsn {
         } else {
             Some(decode(path.trim_end_matches('/'), "database")?)
         };
-        let mut encryption = SqlServerEncryption::Optional;
-        let mut trust_server_certificate = true;
+        let mut encryption = SqlServerEncryption::Required;
+        let mut trust_server_certificate = false;
         let mut connect_timeout_secs = 15;
         let mut application_name = "db-mcp".to_string();
 
@@ -292,8 +292,8 @@ mod tests {
         assert_eq!(d.port, Some(33333));
         assert_eq!(d.instance.as_deref(), Some("V2DEMO"));
         assert_eq!(d.database, None);
-        assert_eq!(d.encryption, SqlServerEncryption::Optional);
-        assert!(d.trust_server_certificate);
+        assert_eq!(d.encryption, SqlServerEncryption::Required);
+        assert!(!d.trust_server_certificate);
         let shown = d.display_target();
         assert!(!shown.contains("P@ss") && shown.contains("instance V2DEMO") && shown.contains(":33333"), "{shown}");
         assert!(!format!("{d:?}").contains("P@ss"));

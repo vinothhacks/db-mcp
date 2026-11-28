@@ -27,8 +27,12 @@ use db_mcp_core::{
 use db_mcp_secrets::redact_sensitive_text;
 use db_mcp_sql::{normalize_sql, parse_and_analyze_sql, split_sql_statements};
 use regex::Regex;
+use rusqlite::fallible_iterator::FallibleIterator;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
-use rusqlite::{ params_from_iter, Batch, Connection, Error as RusqliteError, ErrorCode, InterruptHandle, OpenFlags};
+use rusqlite::{
+    params_from_iter, Batch, Connection, Error as RusqliteError, ErrorCode, InterruptHandle,
+    OpenFlags,
+};
 use serde::{Deserialize, Serialize};
 
 /// Configuration for a `SqliteAdapter` connection.
