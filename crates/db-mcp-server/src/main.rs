@@ -1,6 +1,7 @@
 //! DB-MCP server binary entrypoint supporting stdio, Streamable HTTP, and out-of-band admin approvals.
 
 use std::collections::VecDeque;
+use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,7 +19,8 @@ use db_mcp_mcp::{JsonRpcRequest, McpProtocolHandler, ServerConfig};
 use db_mcp_secrets::{CompositeSecretProvider, SecretProvider, StaticSecretProvider};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use subtle::ConstantTimeEq;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -243,12 +245,15 @@ fn resolve_optional_token(raw: Option<&str>) -> anyhow::Result<Option<String>> {
     let secrets = CompositeSecretProvider::with_static_and_env(StaticSecretProvider::new());
     // Fail closed: a configured token reference that cannot be resolved must never
     // silently disable authentication.
-    let sec = secrets.resolve_dsn(token_ref).map_err(|e| {
-        anyhow::anyhow!(
-            "HTTP token reference '{token_ref}' could not be resolved ({e}); set the variable or remove the setting"
-        )
+    let sec = secrets.resolve_dsn(token_ref).map_err(|_| {
+        anyhow::anyhow!("HTTP token reference could not be resolved; check the configured secret")
     })?;
-    Ok(Some(sec.expose_secret().to_string()))
+    let token = sec.expose_secret();
+    anyhow::ensure!(
+        !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_graphic()),
+        "HTTP token must be non-empty and contain only visible ASCII characters"
+    );
+    Ok(Some(token.to_owned()))
 }
 
 fn check_bearer(headers: &HeaderMap, expected: Option<&str>) -> bool {
@@ -258,11 +263,11 @@ fn check_bearer(headers: &HeaderMap, expected: Option<&str>) -> bool {
     let Some(header_val) = headers.get("authorization").and_then(|v| v.to_str().ok()) else {
         return false;
     };
-    header_val
-        .strip_prefix("Bearer ")
-        .or_else(|| header_val.strip_prefix("bearer "))
-        .map(|tok| tok.trim() == exp)
-        .unwrap_or(false)
+    let Some((scheme, token)) = header_val.split_once(' ') else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case("Bearer")
+        && bool::from(token.trim().as_bytes().ct_eq(exp.as_bytes()))
 }
 
 /// Guard for `/admin/*` endpoints: they fail closed when no admin token is configured.
@@ -375,7 +380,7 @@ async fn handle_health(State(state): State<Arc<HttpAppState>>) -> impl IntoRespo
         "server_name": cfg.server_name,
         "server_version": cfg.server_version,
         "connections": cfg.connections.len(),
-        "tools": state.handler.list_tools().len()
+        "tools": state.handler.tool_count()
     }))
 }
 
@@ -384,7 +389,7 @@ async fn handle_metrics(State(state): State<Arc<HttpAppState>>) -> impl IntoResp
     Json(json!({
         "status": "ok",
         "audit_events_total": audit_count,
-        "registered_tools": state.handler.list_tools().len(),
+        "registered_tools": state.handler.tool_count(),
         "configured_connections": state.handler.config().connections.len()
     }))
 }
@@ -618,6 +623,27 @@ async fn check_sqlserver_connection(
     (report, c.can_connect && c.select_1)
 }
 
+const MAX_STDIO_LINE_BYTES: usize = 2 * 1024 * 1024;
+
+async fn read_stdio_line(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    line: &mut Vec<u8>,
+) -> io::Result<usize> {
+    // A cancelled read may already have appended bytes. Include them in the limit.
+    let remaining = MAX_STDIO_LINE_BYTES.saturating_sub(line.len());
+    let read = reader
+        .take((remaining + 1) as u64)
+        .read_until(b'\n', line)
+        .await?;
+    if line.len() > MAX_STDIO_LINE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "stdio request exceeds the 2 MiB line limit",
+        ));
+    }
+    Ok(read)
+}
+
 async fn run_stdio_loop(handler: McpProtocolHandler, caller: CallerIdentity) -> anyhow::Result<()> {
     let mut reader = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
@@ -630,7 +656,7 @@ async fn run_stdio_loop(handler: McpProtocolHandler, caller: CallerIdentity) -> 
             Some(line) => line,
             None => {
                 if !eof {
-                    eof = reader.read_until(b'\n', &mut incoming).await? == 0;
+                    eof = read_stdio_line(&mut reader, &mut incoming).await? == 0;
                 }
                 if incoming.is_empty() {
                     break;
@@ -665,7 +691,7 @@ async fn run_stdio_loop(handler: McpProtocolHandler, caller: CallerIdentity) -> 
                     write_stdio_response(&mut stdout, result).await?;
                     break;
                 }
-                read = reader.read_until(b'\n', &mut incoming), if !eof && pending.len() < 64 => {
+                read = read_stdio_line(&mut reader, &mut incoming), if !eof && pending.len() < 64 => {
                     eof = read? == 0;
                     if incoming.is_empty() {
                         continue;
@@ -1310,5 +1336,36 @@ mod tests {
             .approve_change(&change_id, &admin, Some("LGTM".to_string()))
             .unwrap();
         assert_eq!(approved.change_id, change_id);
+    }
+
+    #[tokio::test]
+    async fn stdio_line_limit_counts_bytes_from_an_interrupted_read() {
+        let mut line = vec![b' '; MAX_STDIO_LINE_BYTES - 1];
+        let mut reader = b"\nnext\n".as_slice();
+        assert_eq!(read_stdio_line(&mut reader, &mut line).await.unwrap(), 1);
+        assert_eq!(line.len(), MAX_STDIO_LINE_BYTES);
+        line.clear();
+        read_stdio_line(&mut reader, &mut line).await.unwrap();
+        assert_eq!(line, b"next\n");
+
+        line.resize(MAX_STDIO_LINE_BYTES, b' ');
+        let err = read_stdio_line(&mut b" ".as_slice(), &mut line)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn invalid_resolved_http_tokens_are_rejected() {
+        let path = std::env::temp_dir().join(format!("db-mcp-token-{}", uuid::Uuid::new_v4()));
+        let reference = format!("file:{}", path.display());
+        for value in ["", "  \r\n", "a\nb", "a b"] {
+            std::fs::write(&path, value).unwrap();
+            let resolved = resolve_optional_token(Some(&reference));
+            std::fs::remove_file(&path).unwrap();
+            assert!(resolved.is_err());
+        }
+        let err = resolve_optional_token(Some(&reference)).unwrap_err();
+        assert!(!err.to_string().contains(path.to_str().unwrap()));
     }
 }

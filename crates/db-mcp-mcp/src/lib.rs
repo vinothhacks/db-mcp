@@ -178,6 +178,7 @@ fn scrub_restricted(value: &mut Value, cfg: &db_mcp_policy::ConnectionPolicyConf
 /// Core governed runtime coordinating adapters, policy, executor, audit, named tools, and changes.
 pub struct DbMcpRuntime {
     config: ServerConfig,
+    tools: Vec<McpToolDefinition>,
     adapters: BTreeMap<String, Arc<dyn DatabaseAdapter>>,
     /// Live SQL Server adapters (also in `adapters`), for engine-specific diagnostics.
     sqlserver: BTreeMap<String, Arc<SqlServerAdapter>>,
@@ -556,6 +557,7 @@ impl DbMcpRuntime {
         let ontology = build_ontology_service(&config)?;
 
         Ok(Self {
+            tools: build_tool_definitions(&config.active_profiles),
             config,
             adapters,
             sqlserver,
@@ -581,7 +583,11 @@ impl DbMcpRuntime {
     }
 
     pub fn list_tools(&self) -> Vec<McpToolDefinition> {
-        build_tool_definitions(&self.config.active_profiles)
+        self.tools.clone()
+    }
+
+    pub fn tool_count(&self) -> usize {
+        self.tools.len()
     }
 
     pub fn approve_change(
@@ -1258,7 +1264,7 @@ impl DbMcpRuntime {
             .and_then(|v| v.as_str())
             .map(ToOwned::to_owned);
 
-        if !self.list_tools().iter().any(|t| t.name == tool_name) {
+        if !self.tools.iter().any(|t| t.name == tool_name) {
             let err = DbMcpError::PolicyDenied {
                 code: "TOOL_NOT_ENABLED".to_string(),
                 message: format!("Tool '{tool_name}' is not enabled in active profiles"),
@@ -2703,7 +2709,7 @@ impl DbMcpRuntime {
                 }),
             ),
             "notifications/initialized" | "ping" => JsonRpcResponse::ok(id, json!({})),
-            "tools/list" => JsonRpcResponse::ok(id, json!({ "tools": self.list_tools() })),
+            "tools/list" => JsonRpcResponse::ok(id, json!({ "tools": self.tools })),
             "tools/call" => {
                 let params = request.params.unwrap_or_else(|| json!({}));
                 let Some(name) = params
