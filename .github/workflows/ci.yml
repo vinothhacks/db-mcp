@@ -71,7 +71,10 @@ jobs:
           failed=0
           for file in npm/test/features/{01..16}-*.test.js; do
             printf '== %s\n' "$file"
-            node "$file" || failed=1
+            if ! node "$file"; then
+              printf '::error file=%s::Feature suite failed\n' "$file"
+              failed=1
+            fi
           done
           exit "$failed"
       - name: npm pack dry run

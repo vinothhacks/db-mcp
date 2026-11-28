@@ -464,12 +464,16 @@ async function storesSuite() {
       assert.equal(sqliteRows(c.sqlite, "SELECT count(*) FROM audit_events")[0][0], 1);
     } finally { s.close(); }
   });
-  await check("stores: jsonl_path on a non-existent drive fails at startup with a clear error", async () => {
-    const c = isoConfig("znope", (t) => t.replace(/^jsonl_path = "[^"]+"/m, 'jsonl_path = "Z:/nope/audit.jsonl"'));
+  const fileParent = path.join(BASE, "audit-parent-is-file");
+  fs.writeFileSync(fileParent, "");
+  await check("stores: jsonl_path under a regular file fails at startup with a clear error", async () => {
+    const target = JSON.stringify(toPosix(path.join(fileParent, "audit.jsonl")));
+    const c = isoConfig("invalid-jsonl-parent", (t) => t.replace(/^jsonl_path = "[^"]+"/m, `jsonl_path = ${target}`));
     await assert.rejects(startStdio(c.configPath, "p", "agent"), (e) => { assert.equal(e.exitCode, 1); assert.match(e.stderr, /audit log directory|Storage error/); return true; });
   });
-  await check("stores: sqlite_path on a non-existent drive fails at startup with a clear error", async () => {
-    const c = isoConfig("sqlite_znope", (t) => t.replace(/^sqlite_path = "[^"]+"/m, 'sqlite_path = "Z:/nope/audit.db"'));
+  await check("stores: sqlite_path under a regular file fails at startup with a clear error", async () => {
+    const target = JSON.stringify(toPosix(path.join(fileParent, "audit.db")));
+    const c = isoConfig("invalid-sqlite-parent", (t) => t.replace(/^sqlite_path = "[^"]+"/m, `sqlite_path = ${target}`));
     await assert.rejects(startStdio(c.configPath, "p", "agent"), (e) => { assert.equal(e.exitCode, 1); assert.match(e.stderr, /SQLite audit|Storage error/); return true; });
   });
   await check("stores: jsonl_path pointing at an existing DIRECTORY is rejected at startup (not at first write)", async () => {
