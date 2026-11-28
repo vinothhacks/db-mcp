@@ -69,7 +69,7 @@ jobs:
         run: |
           set -uo pipefail
           failed=0
-          for file in npm/test/features/{01..16}-*.test.js; do
+          for file in npm/test/features/0{1..9}-*.test.js npm/test/features/1{0..6}-*.test.js; do
             printf '== %s\n' "$file"
             if ! node "$file"; then
               printf '::error file=%s::Feature suite failed\n' "$file"

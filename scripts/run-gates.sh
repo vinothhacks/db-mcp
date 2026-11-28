@@ -25,7 +25,7 @@ run_gate target/release/db-mcp-server verify-config --config config/db-mcp.examp
 run_gate cargo test --locked --workspace --release
 run_gate npm test
 run_gate npm run verify:features
-for file in npm/test/features/{01..16}-*.test.js; do
+for file in npm/test/features/0{1..9}-*.test.js npm/test/features/1{0..6}-*.test.js; do
   run_gate node "$file"
 done
 run_gate npm pack --dry-run
