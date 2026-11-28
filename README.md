@@ -19,11 +19,11 @@ It combines, in one binary:
 Engines:
 - **SQLite**: native.
 - **MySQL 8**: live server over plain TCP (`mysql_async`). A read-only login (`GRANT SELECT, SHOW VIEW`) is enough; every session runs `READ ONLY`.
-- **Microsoft SQL Server** (2016+ for Query Store, any version detected at connect): live server over TDS with optional encryption (`tiberius` + rustls), named instances, SQL logins. A `db_datareader` login is enough; every statement runs inside `BEGIN TRAN ... ROLLBACK`.
+- **Microsoft SQL Server** (2016+ for Query Store, version detected at connect): live server over TDS with TLS and certificate validation by default, named instances, and SQL logins. A `db_datareader` login is enough. Queries run inside `BEGIN TRAN ... ROLLBACK`.
 - **PostgreSQL**: deterministic embedded simulation (no wire-protocol client yet). MySQL can also be simulated with `backend = "simulated"`, which the bundled example config uses. Simulated responses always carry a warning, so an agent never mistakes them for production data. See `research/findings/capability-matrix.md`.
 
 A live connection that cannot be reached fails with `CONNECTION_UNAVAILABLE`. It never falls back to the simulation.
-Check a connection before you point an agent at it: `npx @vinoth_n_3000/db-mcp check-connection --config db-mcp.toml --connection <id>`
+Check a connection before you point an agent at it: `db-mcp-server check-connection --config db-mcp.toml --connection <id>`
 prints server version, permissions, `SELECT 1`, object count and a warning if the account can write. Setup, DSN format and
 grants per feature: [docs/CLIENT-SETUP.md](docs/CLIENT-SETUP.md) ("Connect to MySQL", "Connect to SQL Server").
 
@@ -33,19 +33,13 @@ Transports: **stdio** (local agents) and **Streamable HTTP** JSON-RPC (`POST /mc
 
 ## Quick start
 
-### Option A: npx (no Rust toolchain needed)
+### Option A: GitHub release archive
 
-```bash
-npx @vinoth_n_3000/db-mcp init                                   # writes ./db-mcp.toml starter config
-npx @vinoth_n_3000/db-mcp verify-config --config ./db-mcp.toml
-npx @vinoth_n_3000/db-mcp serve --transport stdio --config ./db-mcp.toml
-```
-
-On first run the launcher downloads the prebuilt `db-mcp-server` binary for your platform from the
-[GitHub release](https://github.com/vinothhacks/db-mcp/releases) matching the package version, verifies its SHA-256,
-and caches it under `~/.db-mcp/bin/`. If no prebuilt binary exists for your platform it falls back to
-`cargo install` from this repository (requires Rust), or to a binary you point at with `DB_MCP_BINARY_PATH`. If the `.sha256` file cannot be fetched the launcher refuses to install (fail closed); set
-`DB_MCP_ALLOW_UNVERIFIED=1` to override at your own risk.
+Download the archive for your platform and its matching `.sha256` file from the same
+[GitHub release](https://github.com/vinothhacks/db-mcp/releases). Compare the archive digest
+using `sha256sum`, `shasum -a 256`, or PowerShell’s `Get-FileHash -Algorithm SHA256`
+before extracting. Use the bundled example configuration to confirm local configuration parsing.
+For the Academy first-use check, follow the [Windows x64 SQLite guide](docs/ACADEMY-FIRST-USE.md).
 
 ### Option B: cargo
 
@@ -57,16 +51,19 @@ db-mcp-server serve --transport stdio --config ./db-mcp.toml
 ### Verify your install
 
 ```bash
-npx @vinoth_n_3000/db-mcp selftest
+db-mcp-server --version
+db-mcp-server verify-config --config ./db-mcp.example.toml
 ```
 
-Runs an end-to-end check of every feature (all tools, HTTP, audit, governed ontology) against a temporary copy of the
-bundled example config. It never touches your own config, databases or audit logs.
+If `db-mcp-server --help` lists `selftest`, run `db-mcp-server selftest` for an in-memory SQLite check.
+Run `npm test` from a source checkout for the broader end-to-end checks.
 
 ### Option C: Docker (self-hosted HTTP)
 
 ```bash
-docker compose up --build            # db-mcp on :8080 with the bundled example config
+export DB_MCP_AUTH_TOKEN="$(openssl rand -hex 32)"
+export DB_MCP_ADMIN_TOKEN="$(openssl rand -hex 32)"
+docker compose up --build            # db-mcp on 127.0.0.1:8080 with the bundled example config
 curl -s http://127.0.0.1:8080/health
 ```
 
@@ -74,7 +71,7 @@ curl -s http://127.0.0.1:8080/health
 
 ```bash
 git clone https://github.com/vinothhacks/db-mcp && cd db-mcp
-npm run build                        # cargo build --release -p db-mcp-server
+npm run build                        # cargo build --locked --release -p db-mcp-server
 npm test                             # stdio + HTTP + CLI approval end-to-end
 npm run verify:features              # exercises all 24 tools and prints a feature matrix
 ```
@@ -83,12 +80,12 @@ npm run verify:features              # exercises all 24 tools and prints a featu
 
 ## Connect your coding agent
 
-The server speaks MCP over stdio. Point your client at the launcher (or the binary) and a config file.
+The server speaks MCP over stdio. Point your client at the installed binary and a config file.
 
 **Claude Code**
 
 ```bash
-claude mcp add db-mcp -- npx -y @vinoth_n_3000/db-mcp serve --transport stdio --config /abs/path/db-mcp.toml
+claude mcp add db-mcp -- /abs/path/db-mcp-server serve --transport stdio --config /abs/path/db-mcp.toml
 ```
 
 **Cursor / Windsurf / Claude Desktop** (`mcp.json`, `claude_desktop_config.json`)
@@ -97,9 +94,8 @@ claude mcp add db-mcp -- npx -y @vinoth_n_3000/db-mcp serve --transport stdio --
 {
   "mcpServers": {
     "db-mcp": {
-      "command": "npx",
-      "args": ["-y", "@vinoth_n_3000/db-mcp", "serve", "--transport", "stdio", "--config", "/abs/path/db-mcp.toml"],
-      "env": { "DATABASE_URL": "postgres://user:pass@host:5432/app" }
+      "command": "/abs/path/db-mcp-server",
+      "args": ["serve", "--transport", "stdio", "--config", "/abs/path/db-mcp.toml"]
     }
   }
 }
@@ -263,7 +259,7 @@ tests/             contract, integration and adversarial-security suite indexes 
 ## Development
 
 ```bash
-cargo test --workspace            # unit + contract + adversarial security + runtime integration
+cargo test --locked --workspace   # unit + contract + adversarial security + runtime integration
 npm test                          # Node E2E over the npx launcher
 npm run verify:features           # feature matrix (used by CI)
 ```

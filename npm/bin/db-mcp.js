@@ -259,7 +259,7 @@ function buildWithCargo({ repoRoot = PKG_ROOT, version = VERSION } = {}) {
   }
   if (isDevCheckout(repoRoot)) {
     log("building db-mcp-server from source with cargo (this can take several minutes)...");
-    const res = spawnSync("cargo", ["build", "--release", "-p", "db-mcp-server"], { cwd: repoRoot, env: process.env, stdio: "inherit" });
+    const res = spawnSync("cargo", ["build", "--locked", "--release", "-p", "db-mcp-server"], { cwd: repoRoot, env: process.env, stdio: "inherit" });
     if (res.status !== 0) {
       throw new Error(`cargo build failed: ${res.error ? res.error.message : `exit code ${res.status}`}`);
     }
@@ -437,18 +437,12 @@ async function runCli() {
     process.exit(writeStarterConfig(argv.slice(1)));
   }
   if (cmd === "install" || cmd === "where") {
-    try {
-      const bin = cmd === "where" ? findLocalBinary() : await ensureBinary();
-      if (!bin) {
-        process.stderr.write("[db-mcp] no binary installed yet; run `db-mcp install`\n");
-        process.exit(1);
-      }
-      process.stdout.write(`${bin}\n`);
-      process.exit(0);
-    } catch (err) {
-      process.stderr.write(`[db-mcp] ${err.message}\n`);
-      process.exit(1);
+    const bin = cmd === "where" ? findLocalBinary() : await ensureBinary();
+    if (!bin) {
+      throw new Error("no binary installed yet; run `db-mcp install`");
     }
+    process.stdout.write(`${bin}\n`);
+    return;
   }
   if (cmd === "selftest") {
     // Runs scripts/feature-smoke.js (shipped in the package) against an isolated temp copy of the bundled
@@ -512,7 +506,7 @@ async function runCli() {
 if (require.main === module) {
   runCli().catch((err) => {
     process.stderr.write(`[db-mcp] ${err.message}\n`);
-    process.exit(1);
+    process.exitCode = 1;
   });
 }
 

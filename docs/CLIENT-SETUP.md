@@ -1,14 +1,13 @@
 # Connecting coding agents to DB-MCP
 
-All recipes assume a config file at `/abs/path/db-mcp.toml` (create one with `npx @vinoth_n_3000/db-mcp init`).
-Replace `npx -y @vinoth_n_3000/db-mcp` with the path to `db-mcp-server` if you installed the binary directly.
+Install the native binary using the [release archive instructions](../README.md#quick-start). Copy the bundled example config to `db-mcp.toml` and point each client at the absolute paths to the binary and config. On Windows, include the `.exe` suffix and escape backslashes in JSON.
 
 ## stdio (local agents)
 
 ### Claude Code
 
 ```bash
-claude mcp add db-mcp -- npx -y @vinoth_n_3000/db-mcp serve --transport stdio --config /abs/path/db-mcp.toml
+claude mcp add db-mcp -- /abs/path/db-mcp-server serve --transport stdio --config /abs/path/db-mcp.toml
 claude mcp list
 ```
 
@@ -18,8 +17,8 @@ Project-scoped alternative (`.mcp.json` in the repo root):
 {
   "mcpServers": {
     "db-mcp": {
-      "command": "npx",
-      "args": ["-y", "@vinoth_n_3000/db-mcp", "serve", "--transport", "stdio", "--config", "/abs/path/db-mcp.toml"]
+      "command": "/abs/path/db-mcp-server",
+      "args": ["serve", "--transport", "stdio", "--config", "/abs/path/db-mcp.toml"]
     }
   }
 }
@@ -31,9 +30,9 @@ Project-scoped alternative (`.mcp.json` in the repo root):
 {
   "mcpServers": {
     "db-mcp": {
-      "command": "npx",
-      "args": ["-y", "@vinoth_n_3000/db-mcp", "serve", "--transport", "stdio", "--config", "/abs/path/db-mcp.toml"],
-      "env": { "DATABASE_URL": "postgres://user:pass@localhost:5432/app" }
+      "command": "/abs/path/db-mcp-server",
+      "args": ["serve", "--transport", "stdio", "--config", "/abs/path/db-mcp.toml"],
+      "env": { "DATABASE_URL": "<database-dsn>" }
     }
   }
 }
@@ -50,8 +49,8 @@ Same JSON shape as Cursor under the `mcpServers` key.
   "servers": {
     "db-mcp": {
       "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "@vinoth_n_3000/db-mcp", "serve", "--transport", "stdio", "--config", "${workspaceFolder}/db-mcp.toml"]
+      "command": "/abs/path/db-mcp-server",
+      "args": ["serve", "--transport", "stdio", "--config", "${workspaceFolder}/db-mcp.toml"]
     }
   }
 }
@@ -59,14 +58,14 @@ Same JSON shape as Cursor under the `mcpServers` key.
 
 ### Windsurf / Cline / Continue
 
-Use the generic stdio shape: command `npx`, args `["-y", "@vinoth_n_3000/db-mcp", "serve", "--transport", "stdio", "--config", "<path>"]`.
+Use the generic stdio shape: command `/abs/path/db-mcp-server`, args `["serve", "--transport", "stdio", "--config", "<path>"]`.
 
 ## Streamable HTTP (shared or self-hosted)
 
 ```bash
-export DB_MCP_AUTH_TOKEN=agent-secret
-export DB_MCP_ADMIN_TOKEN=admin-secret
-npx @vinoth_n_3000/db-mcp serve --transport http --bind 0.0.0.0:8080 --config /abs/path/db-mcp.toml
+export DB_MCP_AUTH_TOKEN="<agent-token>"
+export DB_MCP_ADMIN_TOKEN="<admin-token>"
+/abs/path/db-mcp-server serve --transport http --bind 127.0.0.1:8080 --config /abs/path/db-mcp.toml
 ```
 
 Endpoints:
@@ -78,7 +77,7 @@ Endpoints:
 | GET | `/metrics` | none | audit event count, registered tools |
 | POST | `/admin/approve` | `Authorization: Bearer <DB_MCP_ADMIN_TOKEN>` | approve a `chg_*` proposal out of band |
 
-Caller identity over HTTP comes from `X-MCP-Principal` and `X-MCP-Role` headers (defaults: `local-agent` / `agent`).
+Only share the HTTP bearer token with trusted clients. Token holders can set `X-MCP-Principal` and `X-MCP-Role`. For a shared deployment, keep the agent token at a trusted proxy that authenticates clients and sets those headers. Non-loopback binds require a configured agent token.
 
 Example:
 
@@ -95,7 +94,7 @@ Clients that support remote MCP servers can connect directly, for example
 
 ```bash
 # CLI (same machine / same changes.db)
-npx @vinoth_n_3000/db-mcp approve --change-id chg_abc123 --approver release-admin --config /abs/path/db-mcp.toml
+/abs/path/db-mcp-server approve --change-id chg_abc123 --approver release-admin --config /abs/path/db-mcp.toml
 
 # HTTP
 curl -s http://127.0.0.1:8080/admin/approve \
@@ -212,7 +211,8 @@ bash scripts/live-db-up.sh mysql --down
 
 ## Connect to SQL Server
 
-DB-MCP talks to Microsoft SQL Server directly over TDS (pure-Rust TLS, no ODBC driver needed). The
+DB-MCP talks to Microsoft SQL Server directly over TDS with platform TLS. Linux builds require OpenSSL 3
+and system CA certificates at runtime (`libssl3` and `ca-certificates` on Ubuntu 22.04 and Debian 12). The
 server version is detected at connect; Query Store diagnostics need SQL Server 2016 or newer.
 There is no simulated SQL Server backend: an unreachable server or a failed login is reported as
 `CONNECTION_UNAVAILABLE` with `next_action` pointing to `db-mcp check-connection`.
@@ -241,8 +241,8 @@ DSN shape: `sqlserver://user:password@host[:port][/database][?parameters]`.
 |---|---|---|
 | `instance` | none | Named instance. With an explicit port the client connects to that port directly and the name is informational; without a port it is resolved through the SQL Server Browser (UDP 1434). `host%5CINSTANCE` is accepted too. |
 | `database` (or `/database` path) | the login's default database | Database whose catalog is explored and queried. |
-| `encrypt` | `optional` | `optional`: TLS for the login packet when the server offers it (ODBC `Encrypt=Optional`); `true`: encrypt the whole session and fail without TLS; `disable`: no TLS at all. `strict` (TDS 8.0) is not supported yet. |
-| `trustServerCertificate` | `true` | Accept the server certificate without validation (typical for private networks with self-signed certificates). Set `false` to validate against the OS trust store. |
+| `encrypt` | `true` | Encrypt the whole session. `optional` allows login-only TLS and `disable` disables TLS. TDS 8.0 strict mode is pending. |
+| `trustServerCertificate` | `false` | Validate the certificate against the OS trust store. The disposable self-signed CI fixture explicitly uses `true`. |
 | `connectTimeout` | `15` | Seconds for TCP connect plus login. |
 | `applicationName` | `db-mcp` | Shown in `sys.dm_exec_sessions.program_name`. |
 

@@ -302,11 +302,10 @@ async function sectionDialects(s) {
   const p1 = await pg("SELECT id FROM users WHERE id = $1", [1]);
   await check("pg: single $1 positional parameter binds", () => { assert.equal(p1.status, "ok"); assert.deepEqual(p1.rows, [[1]]); });
   const p2 = await pg("SELECT $2 AS second, $1 AS first", ["A", "B"]);
-  // KNOWN-BUG: F15-05 $n placeholders are bound by order of appearance, not by number
   await check("pg: $2/$1 placeholders bind by number ($2 AS second -> 'B', $1 AS first -> 'A')", () => {
     assert.equal(p2.status, "ok", p2.message);
     assert.deepEqual(p2.rows, [["B", "A"]], `got ${JSON.stringify(p2.rows)}`);
-  }, { knownBug: "F15-05" });
+  });
   const lit = await pg("SELECT 'public.users' AS s");
   const upd = await pg("UPDATE users SET role = 'public.x' WHERE id = 2 RETURNING role");
   const rb = await pg("SELECT role FROM users WHERE id = 2");
@@ -495,8 +494,6 @@ async function sectionSqlite(s, cfgDir) {
   });
 
   // MCP cancellation: notifications/cancelled with the JSON-RPC id of an in-flight request.
-  // KNOWN-BUG: F15-14 stdio loop is sequential (main.rs run_stdio_loop) and request_to_execution is keyed by the
-  // internal req_ id, so the notification is only read after the request finished and never matches anyway.
   await check("notifications/cancelled {requestId:<jsonrpc id>} interrupts an in-flight long query (< 2500 ms)", async () => {
     const id = 777001;
     const start = Date.now();
@@ -511,7 +508,7 @@ async function sectionSqlite(s, cfgDir) {
     info(`cancel: long request answered after ${elapsed} ms with code=${sc && sc.code}`);
     assert.ok(elapsed < 2500, `request ran ${elapsed} ms after cancellation (code=${sc && sc.code})`);
     assert.equal(sc && sc.code, "EXECUTION_CANCELLED");
-  }, { knownBug: "F15-14" });
+  });
 
   const fk = await q("INSERT INTO orders (id,user_id,status,total_cents,created_at) VALUES (999, 12345, 'x', 1, 'now')");
   const fkOn = await q("PRAGMA foreign_keys");

@@ -500,10 +500,14 @@ async function runMultiStatementAllowed() {
       const res = await s[PG].call("execute_query", { connection: PG, sql: "SELECT 1; DELETE FROM users" });
       expectOutcome("gov", res, A);
     });
-    await check(`${MYSQL} multi allowed: two SELECTs accepted`, async () => {
-      const res = await s[MYSQL].call("execute_query", { connection: MYSQL, sql: "SELECT 1 AS a; SELECT 2 AS b" });
-      expectOutcome("two", res, OK);
-    });
+    for (const conn of [MYSQL, PG]) {
+      await check(`${conn} multi allowed: two SELECTs execute and return the last result`, async () => {
+        const res = await s[conn].call("execute_query", { connection: conn, sql: "SELECT 1 AS a; SELECT 2 AS b" });
+        expectOutcome("two", res, OK);
+        assert.deepEqual(res.columns.map((column) => column.name), ["b"]);
+        assert.deepEqual(res.rows, [[2]]);
+      });
+    }
     await check(`${MYSQL} multi allowed: explain_query still single-statement only`, async () => {
       const res = await s[MYSQL].call("explain_query", { connection: MYSQL, sql: "SELECT 1; SELECT 2", format: "text" });
       expectOutcome("explain-multi-allowed", res, [INV, M]);

@@ -28,8 +28,8 @@ use db_mcp_ontology::{
 };
 use db_mcp_core::{
     AuditDecision, AuditEvent, CallerIdentity, CatalogDetailLevel, CatalogObject, CatalogObjectType,
-    CatalogRequest, ChangeProposal, ConnectionSummary, DatabaseAdapter, DatabaseEngine,
-    DbMcpError, DbMcpResult, ExplainFormat, ExplainRequest, McpSuccessResponse,
+    CatalogRequest, ChangeProposal, ColumnMetadata, ConnectionSummary, DatabaseAdapter,
+    DatabaseEngine, DbMcpError, DbMcpResult, ExplainFormat, ExplainRequest, McpSuccessResponse,
     PostgresHealthProvider, PostgresIndexAdvisor, SchemaSnapshot, SqlStatementClass,
 };
 use db_mcp_executor::{BoundedExecutor, GovernedQueryRequest};
@@ -1076,6 +1076,17 @@ impl DbMcpRuntime {
         caller: &CallerIdentity,
     ) -> Value {
         let req_id = format!("req_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        self.call_tool_with_id(req_id, tool_name, arguments, caller)
+            .await
+    }
+
+    async fn call_tool_with_id(
+        &self,
+        req_id: String,
+        tool_name: &str,
+        arguments: Value,
+        caller: &CallerIdentity,
+    ) -> Value {
         let started = Instant::now();
         let conn_hint = arguments
             .get("connection")
@@ -1713,14 +1724,42 @@ impl DbMcpRuntime {
                 let conn = req_str("connection")?;
                 let adapter = self.get_authorized_adapter(caller, &conn)?;
                 let schema_pattern = args.get("schema_pattern").and_then(|v| v.as_str()).map(ToOwned::to_owned);
+                let filtered = schema_pattern.is_some();
                 let snapshot = self.capture_allowed(adapter.as_ref(), &conn, schema_pattern).await?;
-                to_json(McpSuccessResponse::with_data(
+                let table_count = snapshot
+                    .objects
+                    .iter()
+                    .filter(|obj| obj.object_type == CatalogObjectType::Table)
+                    .count();
+                let index_count: usize = snapshot.objects.iter().map(|obj| obj.indexes.len()).sum();
+                let summary = vec![
+                    json!(snapshot.schema_version),
+                    json!(table_count),
+                    json!(index_count),
+                    json!(snapshot.captured_at),
+                ];
+                let empty = snapshot.objects.is_empty();
+                let mut response = McpSuccessResponse::with_data(
                     req_id,
                     &conn,
                     snapshot.schema_version.clone(),
                     "schema_snapshot",
                     snapshot,
-                ))
+                );
+                response.columns = vec![
+                    ColumnMetadata::new("schema_version", "text"),
+                    ColumnMetadata::new("table_count", "integer"),
+                    ColumnMetadata::new("index_count", "integer"),
+                    ColumnMetadata::new("captured_at", "timestamp"),
+                ];
+                response.rows = vec![summary];
+                response.returned_rows = 1;
+                if filtered && empty {
+                    response
+                        .warnings
+                        .push("schema_pattern matched no visible objects".to_string());
+                }
+                to_json(response)
             }
             "diff_schema" => {
                 let schema_pattern = args.get("schema_pattern").and_then(|v| v.as_str()).map(ToOwned::to_owned);
@@ -2174,6 +2213,16 @@ impl DbMcpRuntime {
         request: JsonRpcRequest,
         caller: &CallerIdentity,
     ) -> JsonRpcResponse {
+        self.handle_jsonrpc_with_tool_id(request, caller, None)
+            .await
+    }
+
+    async fn handle_jsonrpc_with_tool_id(
+        &self,
+        request: JsonRpcRequest,
+        caller: &CallerIdentity,
+        tool_request_id: Option<String>,
+    ) -> JsonRpcResponse {
         let id = request.id.clone();
         match request.method.as_str() {
             "initialize" => JsonRpcResponse::ok(
@@ -2201,7 +2250,10 @@ impl DbMcpRuntime {
                     return JsonRpcResponse::err(id, -32602, "Missing tool 'name' in tools/call params", None);
                 };
                 let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-                let payload = self.call_tool(name, arguments, caller).await;
+                let payload = match tool_request_id {
+                    Some(req_id) => self.call_tool_with_id(req_id, name, arguments, caller).await,
+                    None => self.call_tool(name, arguments, caller).await,
+                };
                 let is_error = payload.get("status").and_then(|v| v.as_str()) == Some("denied");
                 let text = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
                 JsonRpcResponse::ok(
@@ -2238,6 +2290,17 @@ impl DbMcpRuntime {
     /// Invalid JSON -> `-32700`; valid JSON that is not a request object (array batch, missing or
     /// non-string `method`, bad `id` type) -> `-32600` with the id echoed when available.
     pub async fn handle_jsonrpc_line(&self, raw_json: &str, caller: &CallerIdentity) -> Option<String> {
+        self.handle_jsonrpc_line_with_tool_id(raw_json, caller, None)
+            .await
+    }
+
+    /// Handle a stdio message with a server-generated tool ID that the session can cancel.
+    pub async fn handle_jsonrpc_line_with_tool_id(
+        &self,
+        raw_json: &str,
+        caller: &CallerIdentity,
+        tool_request_id: Option<String>,
+    ) -> Option<String> {
         let resp = match serde_json::from_str::<Value>(raw_json) {
             Err(e) => JsonRpcResponse::err(None, -32700, format!("Parse error: {e}"), None),
             Ok(Value::Object(map)) => {
@@ -2255,7 +2318,7 @@ impl DbMcpRuntime {
                 } else {
                     match serde_json::from_value::<JsonRpcRequest>(Value::Object(map)) {
                         Ok(req) => {
-                            let resp = self.handle_jsonrpc(req, caller).await;
+                            let resp = self.handle_jsonrpc_with_tool_id(req, caller, tool_request_id).await;
                             if !has_id {
                                 return None;
                             }

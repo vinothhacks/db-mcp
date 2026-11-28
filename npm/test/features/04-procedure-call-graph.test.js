@@ -562,12 +562,11 @@ async function main() {
     assert.deepEqual(byName(nodesB, "robust_comments").tables_written, ["public.audit_logs"]);
   });
 
-  // KNOWN-BUG: F04-01 - string literals are not masked before call detection; 'CALL fake_proc_str()' inside a VALUES literal becomes a call edge + stub node
   await check("analyzer: CALL inside a string literal is ignored (no stub node / edge for fake_proc_str)", () => {
     assert.deepEqual(byName(nodesB, "robust_comments").direct_callees, [], `direct_callees=${JSON.stringify(byName(nodesB, "robust_comments").direct_callees)}`);
     assert.ok(!nodesB.some((n) => n.name === "fake_proc_str"), "stub node fake_proc_str present");
     assert.ok(!edgesB.some((e) => e.callee.endsWith("fake_proc_str")), "edge to fake_proc_str present");
-  }, "F04-01");
+  });
 
   await check("analyzer: EXEC and EXECUTE <routine>(...) both produce EXEC edges", () => {
     assert.deepEqual(sortedUnique(edgesB.filter((e) => e.caller === "public.robust_exec").map(edgeKey)), [
@@ -593,13 +592,12 @@ async function main() {
     assert.deepEqual(stub.direct_callers, ["public.robust_unknown"]);
   });
 
-  // KNOWN-BUG: F04-04 - stub node for an unresolved callee inherits the caller's schema ("public") while its qualified_name is bare ("totally_unknown_proc")
   await check("analyzer: external stub node's schema/name/qualified_name are mutually consistent", () => {
     const stub = nodesB.find((n) => n.name === "totally_unknown_proc");
     assert.ok(stub);
     const expected = stub.schema ? `${stub.schema}.${stub.name}` : stub.name;
     assert.equal(stub.qualified_name, expected, `schema=${JSON.stringify(stub.schema)} name=${stub.name} qualified_name=${stub.qualified_name}`);
-  }, "F04-04");
+  });
 
   await check("analyzer: dynamic SQL EXECUTE '<string>' yields no bogus call; routine is still listed as an isolated node", () => {
     const dyn = byName(nodesB, "robust_dynamic");

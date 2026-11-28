@@ -33,8 +33,9 @@ use db_mcp_core::{
 use db_mcp_secrets::{redact_dsn, redact_sensitive_text, SecretString};
 use db_mcp_sql::{parse_and_analyze_sql, split_sql_statements, PredicateOperator};
 use regex::Regex;
+use rusqlite::fallible_iterator::FallibleIterator;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
-use rusqlite::{params_from_iter, Connection};
+use rusqlite::{params_from_iter, Batch, Connection};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use url::Url;
@@ -1444,6 +1445,13 @@ impl DatabaseAdapter for MySqlAdapter {
             }
         }
 
+        if analysis.is_multi_statement && !request.params.is_empty() {
+            return Err(DbMcpError::InvalidArgument(
+                "Bound parameters are not supported in a multi-statement batch; send one statement per call"
+                    .to_string(),
+            ));
+        }
+
         let _thread_id = self
             .active_threads
             .entry(exec_id.clone())
@@ -1454,17 +1462,15 @@ impl DatabaseAdapter for MySqlAdapter {
         let is_ddl = analysis.overall_class == SqlStatementClass::Ddl || analysis.has_ddl;
         let conn_arc = Arc::clone(&self.engine_conn);
         let default_schema = self.config.default_schema.clone();
-        let active_threads = Arc::clone(&self.active_threads);
         let cancelled_map = Arc::clone(&self.cancelled_executions);
 
-        tokio::task::spawn_blocking(move || {
+        let outcome = tokio::task::spawn_blocking(move || {
             let started = Instant::now();
             let guard = conn_arc.lock().map_err(|_| {
                 DbMcpError::InternalError("MySqlAdapter engine lock poisoned".to_string())
             })?;
 
             if cancelled_map.contains_key(&request.execution_id) {
-                active_threads.remove(&request.execution_id);
                 return Err(DbMcpError::ExecutionCancelled(format!(
                     "MySQL execution '{}' cancelled",
                     request.execution_id
@@ -1485,20 +1491,48 @@ impl DatabaseAdapter for MySqlAdapter {
                 warnings.push(MYSQL_NON_TRANSACTIONAL_DDL_WARNING.to_string());
             }
 
-            let mut stmt = guard.prepare(&rewritten_sql).map_err(|e| {
-                DbMcpError::AdapterError(redact_sensitive_text(&e.to_string()))
-            })?;
-            let col_count = stmt.column_count();
-
-            let outcome = if col_count > 0 {
-                let mut columns: Vec<ColumnMetadata> = stmt
+            let mut batch = Batch::new(&guard, &rewritten_sql);
+            let mut single = if analysis.is_multi_statement {
+                None
+            } else {
+                Some(guard.prepare(&rewritten_sql).map_err(|e| {
+                    DbMcpError::AdapterError(redact_sensitive_text(&e.to_string()))
+                })?)
+            };
+            let mut executed = 0;
+            let mut rows_affected = None;
+            let mut columns: Vec<ColumnMetadata> = Vec::new();
+            let mut rows_out = Vec::new();
+            let mut bytes_used = 0;
+            let mut truncated = false;
+            let mut result_warnings = Vec::new();
+            loop {
+                let next = if analysis.is_multi_statement {
+                    batch.next().map_err(|e| {
+                        DbMcpError::AdapterError(redact_sensitive_text(&e.to_string()))
+                    })?
+                } else {
+                    single.take()
+                };
+                let Some(mut stmt) = next else { break };
+                executed += 1;
+                let col_count = stmt.column_count();
+                if col_count == 0 {
+                    let changed = stmt.execute(params_from_iter(params.iter())).map_err(|e| {
+                        DbMcpError::AdapterError(redact_sensitive_text(&e.to_string()))
+                    })?;
+                    *rows_affected.get_or_insert(0) += changed as u64;
+                    continue;
+                }
+                columns = stmt
                     .column_names()
                     .into_iter()
                     .map(|n| ColumnMetadata::new(n, "varchar"))
                     .collect();
-                let mut rows_out = Vec::new();
-                let mut bytes_used = 0usize;
-                let mut truncated = false;
+                rows_out.clear();
+                bytes_used = 0;
+                truncated = false;
+                result_warnings.clear();
 
                 let mut rows = stmt
                     .query(params_from_iter(params.iter()))
@@ -1510,7 +1544,7 @@ impl DatabaseAdapter for MySqlAdapter {
                 {
                     if rows_out.len() >= max_rows {
                         truncated = true;
-                        warnings.push(format!("Result truncated at max_rows={max_rows}"));
+                        result_warnings.push(format!("Result truncated at max_rows={max_rows}"));
                         break;
                     }
                     let mut vals = Vec::with_capacity(col_count);
@@ -1529,61 +1563,36 @@ impl DatabaseAdapter for MySqlAdapter {
                     if max_bytes > 0 && bytes_used + row_bytes > max_bytes && !rows_out.is_empty()
                     {
                         truncated = true;
-                        warnings.push(format!("Result truncated at max_bytes={max_bytes}"));
+                        result_warnings.push(format!("Result truncated at max_bytes={max_bytes}"));
                         break;
                     }
                     bytes_used += row_bytes;
                     rows_out.push(vals);
                 }
-                drop(rows);
-                drop(stmt);
-
-                let schema_version = introspect_embedded_mysql_catalog(&guard, &default_schema)
-                    .ok()
-                    .map(|objs| compute_schema_version(&objs));
-
-                let returned_rows = rows_out.len();
-                Ok(QueryResult {
-                    execution_id: request.execution_id.clone(),
-                    columns,
-                    rows: rows_out,
-                    returned_rows,
-                    rows_affected: None,
-                    truncated,
-                    bytes_used,
-                    execution_time_ms: started.elapsed().as_millis() as u64,
-                    warnings,
-                    schema_version,
-                })
-            } else {
-                drop(stmt);
-                let changed = guard
-                    .execute(&rewritten_sql, params_from_iter(params.iter()))
-                    .map_err(|e| DbMcpError::AdapterError(redact_sensitive_text(&e.to_string())))?;
-
-                let schema_version = introspect_embedded_mysql_catalog(&guard, &default_schema)
-                    .ok()
-                    .map(|objs| compute_schema_version(&objs));
-
-                Ok(QueryResult {
-                    execution_id: request.execution_id.clone(),
-                    columns: Vec::new(),
-                    rows: Vec::new(),
-                    returned_rows: 0,
-                    rows_affected: Some(changed as u64),
-                    truncated: false,
-                    bytes_used: 0,
-                    execution_time_ms: started.elapsed().as_millis() as u64,
-                    warnings,
-                    schema_version,
-                })
-            };
-
-            active_threads.remove(&request.execution_id);
-            outcome
+            }
+            if executed > 1 {
+                warnings.push(format!("Executed {executed} statements as one batch."));
+            }
+            warnings.extend(result_warnings);
+            let schema_version = introspect_embedded_mysql_catalog(&guard, &default_schema)
+                .ok()
+                .map(|objects| compute_schema_version(&objects));
+            Ok(QueryResult {
+                execution_id: request.execution_id,
+                columns,
+                returned_rows: rows_out.len(),
+                rows: rows_out,
+                rows_affected,
+                truncated,
+                bytes_used,
+                execution_time_ms: started.elapsed().as_millis() as u64,
+                warnings,
+                schema_version,
+            })
         })
-        .await
-        .map_err(|e| DbMcpError::InternalError(format!("MySQL execute join error: {e}")))?
+        .await;
+        self.active_threads.remove(&exec_id);
+        outcome.map_err(|e| DbMcpError::InternalError(format!("MySQL execute join error: {e}")))?
     }
 
     async fn explain(&self, request: ExplainRequest) -> DbMcpResult<ExplainPlan> {

@@ -228,19 +228,24 @@ impl OntologyStore {
         transitions: &[(String, u32, DefinitionStatus, DefinitionStatus)],
         revision: &OntologyRevision,
     ) -> DbMcpResult<()> {
+        let revision_seq = i64::try_from(revision.seq).map_err(|e| storage_err("revision seq", e))?;
         let rev_json = encode(revision)?;
         self.with_conn(|conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|e| storage_err("begin", e))?;
-            let current_seq: Option<u64> = tx
+            let current_seq: Option<i64> = tx
                 .query_row(
                     "SELECT MAX(seq) FROM ontology_revisions WHERE tenant_id=?1 AND connection=?2",
                     params![revision.tenant_id, revision.connection],
-                    |r| r.get::<_, Option<u64>>(0),
+                    |r| r.get(0),
                 )
                 .map_err(|e| storage_err("revision seq", e))?;
-            if revision.seq != current_seq.unwrap_or(0) + 1 {
+            let current_seq = current_seq.unwrap_or(0);
+            if current_seq < 0 {
+                return Err(storage_err("revision seq", "negative stored sequence"));
+            }
+            if current_seq.checked_add(1) != Some(revision_seq) {
                 return Err(DbMcpError::PolicyDenied {
                     code: "ONTOLOGY_VERSION_CONFLICT".to_string(),
                     message: "Another publish completed concurrently; retry".to_string(),
@@ -257,7 +262,7 @@ impl OntologyStore {
                     revision.revision_id,
                     revision.tenant_id,
                     revision.connection,
-                    revision.seq,
+                    revision_seq,
                     revision.content_hash,
                     revision.schema_fingerprint,
                     revision.published_at.to_rfc3339(),
@@ -449,12 +454,13 @@ impl OntologyStore {
 
     pub fn question_evidence_count(&self, tenant: &str, connection: &str) -> DbMcpResult<u64> {
         self.with_conn(|conn| {
-            conn.query_row(
+            let count: i64 = conn.query_row(
                 "SELECT COUNT(*) FROM ontology_question_evidence WHERE tenant_id=?1 AND connection=?2",
                 params![tenant, connection],
-                |r| r.get::<_, u64>(0),
+                |r| r.get(0),
             )
-            .map_err(|e| storage_err("count evidence", e))
+            .map_err(|e| storage_err("count evidence", e))?;
+            u64::try_from(count).map_err(|e| storage_err("count evidence", e))
         })
     }
 

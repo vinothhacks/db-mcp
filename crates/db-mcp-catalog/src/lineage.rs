@@ -753,16 +753,21 @@ pub fn build_procedure_call_graph(
             // Ensure external/unregistered callee still has a stub node if referenced
             nodes_map
                 .entry(callee_qname.clone())
-                .or_insert_with(|| ProcedureNode {
-                    schema: r_obj.schema.clone(),
-                    name: base_name(&callee_qname).to_string(),
-                    qualified_name: callee_qname,
-                    routine_kind: CatalogObjectType::Procedure,
-                    definition: None,
-                    direct_callees: Vec::new(),
-                    direct_callers: Vec::new(),
-                    tables_read: Vec::new(),
-                    tables_written: Vec::new(),
+                .or_insert_with(|| {
+                    let (schema, name) = callee_qname
+                        .rsplit_once('.')
+                        .unwrap_or(("", callee_qname.as_str()));
+                    ProcedureNode {
+                        schema: schema.to_owned(),
+                        name: name.to_owned(),
+                        qualified_name: callee_qname,
+                        routine_kind: CatalogObjectType::Procedure,
+                        definition: None,
+                        direct_callees: Vec::new(),
+                        direct_callers: Vec::new(),
+                        tables_read: Vec::new(),
+                        tables_written: Vec::new(),
+                    }
                 });
         }
 

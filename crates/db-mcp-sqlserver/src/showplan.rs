@@ -2,7 +2,7 @@
 
 use db_mcp_core::{DbMcpError, DbMcpResult};
 use quick_xml::events::{BytesStart, Event};
-use quick_xml::Reader;
+use quick_xml::{Reader, XmlVersion};
 use serde_json::{json, Value};
 
 /// Structured summary of a showplan document.
@@ -106,9 +106,14 @@ fn unbracket(s: &str) -> String {
 }
 
 fn attr(e: &BytesStart, name: &str) -> Option<String> {
-    e.attributes().flatten().find(|a| a.key.local_name().as_ref() == name.as_bytes()).and_then(|a| {
-        a.unescape_value().ok().map(|v| v.into_owned())
-    })
+    e.attributes()
+        .flatten()
+        .find(|a| a.key.local_name().as_ref() == name.as_bytes())
+        .and_then(|a| {
+            a.decoded_and_normalized_value(XmlVersion::Implicit1_0, e.decoder())
+                .ok()
+                .map(|value| value.into_owned())
+        })
 }
 
 fn attr_f64(e: &BytesStart, name: &str) -> Option<f64> {
@@ -204,7 +209,10 @@ pub fn parse_showplan_xml(xml: &str) -> DbMcpResult<ParsedShowplan> {
                 }
                 for a in e.attributes().flatten() {
                     let key = String::from_utf8_lossy(a.key.local_name().as_ref()).to_string();
-                    if a.unescape_value().map(|v| v == "true" || v == "1").unwrap_or(false) {
+                    if a.decoded_and_normalized_value(XmlVersion::Implicit1_0, e.decoder())
+                        .map(|value| value == "true" || value == "1")
+                        .unwrap_or(false)
+                    {
                         out.warnings.push(format!("plan warning: {key}"));
                     }
                 }

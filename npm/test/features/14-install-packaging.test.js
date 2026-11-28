@@ -456,9 +456,9 @@ async function main() {
   // ------------------------------------------------------------------ 2. release naming + download path
   console.log("\n[2] release asset naming vs release.yml, and the download path against a mock release server");
   const matrix = parseYamlMatrixTargets(releaseYml);
-  await check("release.yml matrix has the five targets the launcher maps and NAME=${BIN}-${TAG}-${target}", () => {
+  await check("release.yml matrix has the five targets the launcher maps and uses the release tag in archive names", () => {
     assert.equal(matrix.length, 5, JSON.stringify(matrix));
-    assert.match(releaseYml, /NAME="\$\{BIN\}-\$\{TAG\}-\$\{\{ matrix\.target \}\}"/);
+    assert.match(releaseYml, /NAME="\$\{BIN\}-\$\{RELEASE_TAG\}-\$\{\{ matrix\.target \}\}"/);
     assert.match(releaseYml, /\$Name = "\$env:BIN-\$Tag-\$\{\{ matrix\.target \}\}"/);
     assert.match(releaseYml, /BIN: db-mcp-server/);
     const mapped = new Set([
@@ -485,7 +485,7 @@ async function main() {
     assert.match(releaseYml, /dist\/\*\.tar\.gz/);
     assert.match(releaseYml, /dist\/\*\.zip/);
     assert.match(releaseYml, /dist\/\*\.sha256/);
-    assert.match(releaseYml, /softprops\/action-gh-release@v2/);
+    assert.match(releaseYml, /softprops\/action-gh-release@[0-9a-f]{40}\b/);
     assert.match(releaseYml, /permissions:\s*\n\s*contents: write/);
     assert.match(releaseYml, /merge-multiple: true/);
     assert.match(releaseYml, /files: artifacts\/\*/);
@@ -800,7 +800,7 @@ async function main() {
     assert.match(dockerfile, /^EXPOSE 8080/m);
     assert.match(dockerfile, /CMD \["db-mcp-server", "serve", "--transport", "http", "--bind", "0\.0\.0\.0:8080", "--config", "\/etc\/db-mcp\/db-mcp\.toml"\]/);
     assert.match(compose, /\.\/config\/db-mcp\.example\.toml:\/etc\/db-mcp\/db-mcp\.toml:ro/);
-    assert.match(compose, /"8080:8080"/);
+    assert.match(compose, /"127\.0\.0\.1:8080:8080"/);
   });
   await check("Dockerfile does not bake the research/ evidence bundle (~21 MB of traces/REA evidence) into the image", () => {
     assert.ok(!/^COPY research \.\/research/m.test(dockerfile), "builder copies the whole research/ tree");
@@ -812,9 +812,9 @@ async function main() {
     assert.ok(!/depends_on:/.test(compose), "compose still declares depends_on");
     assert.ok(!/^\s{2}(postgres|mysql):/m.test(compose), "compose still declares a postgres/mysql service");
   });
-  await check("docker-compose: default bearer tokens are explicit dev placeholders and RUST_LOG is overridable", () => {
-    assert.match(compose, /DB_MCP_AUTH_TOKEN: \$\{DB_MCP_AUTH_TOKEN:-dev-agent-token\}/);
-    assert.match(compose, /DB_MCP_ADMIN_TOKEN: \$\{DB_MCP_ADMIN_TOKEN:-dev-admin-token\}/);
+  await check("docker-compose: bearer tokens are required and RUST_LOG is overridable", () => {
+    assert.match(compose, /DB_MCP_AUTH_TOKEN: \$\{DB_MCP_AUTH_TOKEN:\?[^}]+\}/);
+    assert.match(compose, /DB_MCP_ADMIN_TOKEN: \$\{DB_MCP_ADMIN_TOKEN:\?[^}]+\}/);
     assert.match(compose, /RUST_LOG: \$\{RUST_LOG:-info\}/);
   });
   await check("example config init_sql never runs DDL against a live Postgres/MySQL (seeds only the embedded engine)", () => {
@@ -863,16 +863,16 @@ async function main() {
     assert.match(readme, /cargo install --git https:\/\/github\.com\/vinothhacks\/db-mcp --locked db-mcp-server/);
     assert.match(launcherSrc, /"install", "--git", `https:\/\/github\.com\/\$\{REPO_SLUG\}`, "--tag", `v\$\{version\}`, "--locked", "--root", root, "db-mcp-server"/);
   });
-  await check("README + CLIENT-SETUP: every ```json snippet is valid JSON and the claude mcp add line uses `--` before npx", () => {
+  await check("README + CLIENT-SETUP: every ```json snippet is valid JSON and the claude mcp add line uses `--` before the native binary", () => {
     for (const [label, doc] of [["README", readme], ["CLIENT-SETUP", clientSetup]]) {
       const snippets = [...doc.matchAll(/```json\s*\n([\s\S]*?)```/g)].map((m) => m[1]);
       assert.ok(snippets.length >= 1, `${label}: no json snippets`);
       for (const s of snippets) JSON.parse(s);
-      assert.match(doc, /claude mcp add db-mcp -- npx -y @vinoth_n_3000\/db-mcp serve --transport stdio --config/);
+      assert.match(doc, /claude mcp add db-mcp -- \/abs\/path\/db-mcp-server serve --transport stdio --config/);
     }
   });
-  await check("README: files it points at exist (docs/CLIENT-SETUP.md, research/findings/capability-matrix.md, research/contracts/tool-contracts.json, scripts/mcp-call.js)", () => {
-    for (const f of ["docs/CLIENT-SETUP.md", "research/findings/capability-matrix.md", "research/contracts/tool-contracts.json", "research/licenses/license-inventory.md", "scripts/mcp-call.js", "LICENSE-MIT", "LICENSE-APACHE"]) {
+  await check("README: files it points at exist", () => {
+    for (const f of ["docs/ACADEMY-FIRST-USE.md", "docs/CLIENT-SETUP.md", "research/findings/capability-matrix.md", "research/contracts/tool-contracts.json", "research/licenses/license-inventory.md", "scripts/mcp-call.js", "LICENSE-MIT", "LICENSE-APACHE"]) {
       assert.ok(readme.includes(f), `README no longer mentions ${f}`);
       assert.ok(exists(path.join(REPO_ROOT, f)), `${f} referenced by README is missing`);
     }
@@ -883,11 +883,10 @@ async function main() {
     const missing = knobs.filter((k) => !new RegExp(`\\|\\s*\`${k}`).test(clientSetup));
     assert.deepEqual(missing, [], `undocumented launcher env vars: ${missing.join(", ")}`);
   });
-  await check("README quick start: cache location and fallback description match the launcher (~/.db-mcp/bin, cargo install fallback, DB_MCP_BINARY_PATH)", () => {
-    assert.match(readme, /~\/\.db-mcp\/bin\//);
-    assert.match(readme, /verifies its SHA-256/);
-    assert.match(readme, /DB_MCP_BINARY_PATH/);
-    assert.match(launcherSrc, /path\.join\(os\.homedir\(\), "\.db-mcp"\)/);
+  await check("README quick start documents checksum verification and native config validation", () => {
+    assert.match(readme, /GitHub release/);
+    assert.match(readme, /Get-FileHash -Algorithm SHA256/);
+    assert.match(readme, /db-mcp-server verify-config --config \.\/db-mcp\.example\.toml/);
   });
 
   // ------------------------------------------------------------------ summary

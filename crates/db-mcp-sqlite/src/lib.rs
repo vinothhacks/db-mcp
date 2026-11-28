@@ -27,8 +27,12 @@ use db_mcp_core::{
 use db_mcp_secrets::redact_sensitive_text;
 use db_mcp_sql::{normalize_sql, parse_and_analyze_sql, split_sql_statements};
 use regex::Regex;
+use rusqlite::fallible_iterator::FallibleIterator;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
-use rusqlite::{ params_from_iter, Batch, Connection, Error as RusqliteError, ErrorCode, InterruptHandle, OpenFlags};
+use rusqlite::{
+    params_from_iter, Batch, Connection, Error as RusqliteError, ErrorCode, InterruptHandle,
+    OpenFlags,
+};
 use serde::{Deserialize, Serialize};
 
 /// Configuration for a `SqliteAdapter` connection.
@@ -330,15 +334,17 @@ fn map_rusqlite_error(err: RusqliteError) -> DbMcpError {
     }
 }
 
-fn json_to_sqlite_value(value: &serde_json::Value) -> SqliteValue {
-    match value {
+fn json_to_sqlite_value(value: &serde_json::Value) -> DbMcpResult<SqliteValue> {
+    Ok(match value {
         serde_json::Value::Null => SqliteValue::Null,
         serde_json::Value::Bool(b) => SqliteValue::Integer(if *b { 1 } else { 0 }),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 SqliteValue::Integer(i)
-            } else if let Some(u) = n.as_u64() {
-                SqliteValue::Integer(u as i64)
+            } else if n.is_u64() {
+                return Err(DbMcpError::InvalidArgument(
+                    "SQLite integer parameter exceeds the signed 64-bit range".to_string(),
+                ));
             } else if let Some(f) = n.as_f64() {
                 SqliteValue::Real(f)
             } else {
@@ -349,7 +355,7 @@ fn json_to_sqlite_value(value: &serde_json::Value) -> SqliteValue {
         serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
             SqliteValue::Text(serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()))
         }
-    }
+    })
 }
 
 fn sqlite_value_ref_to_json(val: ValueRef<'_>) -> (serde_json::Value, &'static str, usize) {
@@ -1252,7 +1258,11 @@ impl DatabaseAdapter for SqliteAdapter {
         }
 
         let explain_sql = format!("EXPLAIN QUERY PLAN {trimmed}");
-        let params: Vec<SqliteValue> = request.params.iter().map(json_to_sqlite_value).collect();
+        let params = request
+            .params
+            .iter()
+            .map(json_to_sqlite_value)
+            .collect::<DbMcpResult<Vec<_>>>()?;
         let conn_arc = Arc::clone(&self.conn);
         let connection_id = request.connection.clone();
         let orig_sql = request.sql.clone();
@@ -1364,7 +1374,11 @@ fn execute_sqlite_query_inner(
         ensure_sqlite_routines_table(conn)?;
     }
 
-    let params: Vec<SqliteValue> = request.params.iter().map(json_to_sqlite_value).collect();
+    let params = request
+        .params
+        .iter()
+        .map(json_to_sqlite_value)
+        .collect::<DbMcpResult<Vec<_>>>()?;
     let max_rows = if request.max_rows == 0 {
         usize::MAX
     } else {
@@ -1679,7 +1693,11 @@ impl TransactionalDdlProvider for SqliteAdapter {
             }
 
             let tx = guard.transaction().map_err(map_rusqlite_error)?;
-            let params: Vec<SqliteValue> = request.params.iter().map(json_to_sqlite_value).collect();
+            let params = request
+                .params
+                .iter()
+                .map(json_to_sqlite_value)
+                .collect::<DbMcpResult<Vec<_>>>()?;
             let mut total_affected = 0u64;
 
             for (idx, stmt_sql) in stmts.iter().enumerate() {

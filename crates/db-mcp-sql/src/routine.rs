@@ -7,8 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use db_mcp_core::{DatabaseEngine, SqlStatementClass};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sqlparser::tokenizer::Tokenizer;
 
-use crate::{parse_and_analyze_sql, split_sql_statements};
+use crate::{dialect_for_engine, is_literal_token, parse_and_analyze_sql, split_sql_statements};
 
 /// Standard SQL built-in functions and procedural keywords that should never be
 /// classified as user-defined stored procedure or function calls.
@@ -589,6 +590,22 @@ pub fn analyze_routine_definition(
     known_tables: &[String],
 ) -> RoutineBodyAnalysis {
     let body = extract_routine_body(definition_sql);
+    let dialect = dialect_for_engine(engine);
+    let masked = Tokenizer::new(dialect.as_ref(), &body)
+        .tokenize()
+        .map(|tokens| {
+            tokens
+                .into_iter()
+                .map(|token| {
+                    if is_literal_token(&token) {
+                        "''".to_owned()
+                    } else {
+                        token.to_string()
+                    }
+                })
+                .collect::<String>()
+        });
+    let call_body = masked.as_deref().unwrap_or(&body);
     let mut call_map: BTreeMap<String, RoutineCallRef> = BTreeMap::new();
     let mut call_order: Vec<String> = Vec::new();
 
@@ -639,7 +656,7 @@ pub fn analyze_routine_definition(
         r#"(?is)\bCALL\s+([A-Za-z_"\[`][A-Za-z0-9_."\]`]*)\s*(?:\(|;|$|\s)"#,
     )
     .expect("valid CALL regex");
-    for caps in call_re.captures_iter(&body) {
+    for caps in call_re.captures_iter(call_body) {
         if let Some(m) = caps.get(1) {
             record_call(m.as_str(), "CALL", false);
         }
@@ -650,7 +667,7 @@ pub fn analyze_routine_definition(
         r#"(?is)\bPERFORM\s+([A-Za-z_"\[`][A-Za-z0-9_."\]`]*)\s*\("#,
     )
     .expect("valid PERFORM regex");
-    for caps in perform_call_re.captures_iter(&body) {
+    for caps in perform_call_re.captures_iter(call_body) {
         if let Some(m) = caps.get(1) {
             record_call(m.as_str(), "PERFORM", false);
         }
@@ -661,7 +678,7 @@ pub fn analyze_routine_definition(
         r#"(?is)\bEXEC(?:UTE)?\s+(?:(?:FUNCTION|PROCEDURE)\s+)?([A-Za-z_"\[`][A-Za-z0-9_."\]`]*)\s*(?:\(|;|$|\s)"#,
     )
     .expect("valid EXEC regex");
-    for caps in exec_re.captures_iter(&body) {
+    for caps in exec_re.captures_iter(call_body) {
         if let Some(m) = caps.get(1) {
             let candidate = clean_identifier(m.as_str());
             let cand_upper = candidate.to_ascii_uppercase();
@@ -684,9 +701,9 @@ pub fn analyze_routine_definition(
     )
     .expect("valid skip fn prefix regex");
 
-    for caps in fn_expr_re.captures_iter(&body) {
+    for caps in fn_expr_re.captures_iter(call_body) {
         let full_match = caps.get(0).unwrap();
-        let prefix = &body[..full_match.start()];
+        let prefix = &call_body[..full_match.start()];
         if skip_fn_prefix_re.is_match(prefix) {
             continue;
         }
