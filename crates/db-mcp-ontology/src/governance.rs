@@ -688,8 +688,7 @@ impl OntologyService {
             .certifications(self.tenant(), &def.connection, &def.def_id)?;
         let cert = certs
             .into_iter()
-            .filter(|c| c.version == def.version && c.action == ReviewAction::Approve)
-            .last()
+            .rfind(|c| c.version == def.version && c.action == ReviewAction::Approve)
             .ok_or_else(|| {
                 denied(
                     "ONTOLOGY_CERTIFICATION_INVALID",

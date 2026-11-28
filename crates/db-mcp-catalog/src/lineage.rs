@@ -252,14 +252,12 @@ fn scan_dependent_objects(
                 obj.object_type,
                 CatalogObjectType::View | CatalogObjectType::MaterializedView
             )
-        {
-            if word_re
+            && word_re
                 .as_ref()
                 .map(|r| r.is_match(def_sql))
                 .unwrap_or(false)
-            {
-                is_read = true;
-            }
+        {
+            is_read = true;
         }
 
         if !is_read && !is_write {

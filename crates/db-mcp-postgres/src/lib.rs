@@ -44,19 +44,15 @@ use url::Url;
 /// Execution mode for `PostgresAdapter`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PostgresBackendMode {
     /// Uses live PostgreSQL wire connection if reachable, or deterministic embedded PG engine when offline.
+    #[default]
     LiveOrSimulated,
     /// Always uses the deterministic embedded PostgreSQL catalog and execution engine.
     SimulatedOnly,
     /// Requires a live reachable PostgreSQL TCP server; fails closed if unreachable.
     LiveOnly,
-}
-
-impl Default for PostgresBackendMode {
-    fn default() -> Self {
-        Self::LiveOrSimulated
-    }
 }
 
 /// Configuration for a `PostgresAdapter`.
@@ -1586,7 +1582,6 @@ impl DatabaseAdapter for PostgresAdapter {
                 }
                 columns = stmt
                     .column_names()
-                    .into_iter()
                     .map(|n| ColumnMetadata::new(n, "text"))
                     .collect();
                 rows_out.clear();
@@ -1607,13 +1602,13 @@ impl DatabaseAdapter for PostgresAdapter {
                     }
                     let mut vals = Vec::with_capacity(col_count);
                     let mut row_bytes = 0usize;
-                    for i in 0..col_count {
+                    for (i, column) in columns.iter_mut().enumerate() {
                         let vref = row.get_ref(i).map_err(|e| {
                             DbMcpError::AdapterError(redact_sensitive_text(&e.to_string()))
                         })?;
                         let (jval, ty, b) = value_ref_to_pg_json(vref);
-                        if columns[i].data_type == "text" && ty != "unknown" {
-                            columns[i].data_type = ty.to_string();
+                        if column.data_type == "text" && ty != "unknown" {
+                            column.data_type = ty.to_string();
                         }
                         row_bytes += b;
                         vals.push(jval);

@@ -992,7 +992,7 @@ impl SqlServerAdapter {
             .iter()
             .flatten()
             .filter_map(|r| r.get::<&str, _>(0).map(ToOwned::to_owned))
-            .last()
+            .next_back()
             .ok_or_else(|| {
                 DbMcpError::AdapterError("SQL Server returned no estimated plan".to_string())
             })?;

@@ -1193,6 +1193,7 @@ pub fn build_audit_sink(
 }
 
 /// Helper to build a sample `AuditEvent` with explicit timestamp.
+#[allow(clippy::too_many_arguments)]
 pub fn new_audit_event_at(
     event_id: impl Into<String>,
     request_id: impl Into<String>,

@@ -58,17 +58,13 @@ pub const MYSQL_NON_TRANSACTIONAL_DDL_WARNING: &str =
 /// connection never falls back to the simulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum MySqlBackendMode {
     /// Embedded simulation (bundled example config, offline tests). No server is contacted.
     SimulatedOnly,
     /// Real MySQL server reached through the DSN; failures are reported, never simulated.
+    #[default]
     LiveOnly,
-}
-
-impl Default for MySqlBackendMode {
-    fn default() -> Self {
-        Self::LiveOnly
-    }
 }
 
 impl MySqlBackendMode {
@@ -1558,7 +1554,6 @@ impl DatabaseAdapter for MySqlAdapter {
                 }
                 columns = stmt
                     .column_names()
-                    .into_iter()
                     .map(|n| ColumnMetadata::new(n, "varchar"))
                     .collect();
                 rows_out.clear();
@@ -1581,13 +1576,13 @@ impl DatabaseAdapter for MySqlAdapter {
                     }
                     let mut vals = Vec::with_capacity(col_count);
                     let mut row_bytes = 0usize;
-                    for i in 0..col_count {
+                    for (i, column) in columns.iter_mut().enumerate() {
                         let vref = row.get_ref(i).map_err(|e| {
                             DbMcpError::AdapterError(redact_sensitive_text(&e.to_string()))
                         })?;
                         let (jval, ty, b) = value_ref_to_mysql_json(vref);
-                        if columns[i].data_type == "varchar" && ty != "null" {
-                            columns[i].data_type = ty.to_string();
+                        if column.data_type == "varchar" && ty != "null" {
+                            column.data_type = ty.to_string();
                         }
                         row_bytes += b;
                         vals.push(jval);

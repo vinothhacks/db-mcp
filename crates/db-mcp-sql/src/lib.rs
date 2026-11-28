@@ -288,16 +288,8 @@ fn normalize_sql_tokens(sql: &str, mask_literals: bool) -> String {
                             | Token::Colon
                             | Token::DoubleColon
                     );
-                    if prev_was_word_or_num
-                        && !is_punct
-                        && !out.ends_with('(')
-                        && !out.ends_with('.')
-                        && !out.ends_with("::")
-                    {
-                        out.push(' ');
-                    } else if !out.is_empty()
-                        && !is_punct
-                        && !out.ends_with(' ')
+                    if !is_punct
+                        && (prev_was_word_or_num || (!out.is_empty() && !out.ends_with(' ')))
                         && !out.ends_with('(')
                         && !out.ends_with('.')
                         && !out.ends_with("::")

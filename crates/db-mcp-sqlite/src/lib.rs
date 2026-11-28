@@ -1487,7 +1487,6 @@ fn collect_sqlite_rows(
     let col_count = stmt.column_count();
     let mut columns: Vec<ColumnMetadata> = stmt
         .column_names()
-        .into_iter()
         .map(|name| ColumnMetadata::new(name, "ANY"))
         .collect();
 
@@ -1509,11 +1508,11 @@ fn collect_sqlite_rows(
 
         let mut row_vals = Vec::with_capacity(col_count);
         let mut row_bytes = 0usize;
-        for i in 0..col_count {
+        for (i, column) in columns.iter_mut().enumerate() {
             let val_ref = row.get_ref(i).map_err(map_rusqlite_error)?;
             let (json_val, inferred_type, val_bytes) = sqlite_value_ref_to_json(val_ref);
-            if columns[i].data_type == "ANY" && inferred_type != "NULL" {
-                columns[i].data_type = inferred_type.to_string();
+            if column.data_type == "ANY" && inferred_type != "NULL" {
+                column.data_type = inferred_type.to_string();
             }
             row_bytes += val_bytes;
             row_vals.push(json_val);

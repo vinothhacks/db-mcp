@@ -227,7 +227,7 @@ impl BoundedExecutor {
         let token = self
             .active_executions
             .entry(execution_id.clone())
-            .or_insert_with(CancellationToken::new)
+            .or_default()
             .value()
             .clone();
         if let Some(req_id) = request_id {

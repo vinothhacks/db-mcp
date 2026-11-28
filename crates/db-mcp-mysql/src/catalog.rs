@@ -441,71 +441,72 @@ impl LiveMySql {
         }
         let timeout_ms = 30_000;
         let mut conn = self.session(true, timeout_ms).await?;
-        let mut rows = CatalogRows::default();
-        rows.tables = self
-            .query_json(
-                &mut conn,
-                &crate::build_information_schema_tables_query(None),
-                timeout_ms,
-            )
-            .await?
-            .1;
-        rows.columns = self
-            .query_json(
-                &mut conn,
-                &build_information_schema_all_columns_query(),
-                timeout_ms,
-            )
-            .await?
-            .1;
-        rows.statistics = self
-            .query_json(
-                &mut conn,
-                &build_information_schema_all_statistics_query(),
-                timeout_ms,
-            )
-            .await?
-            .1;
-        rows.foreign_keys = self
-            .query_json(
-                &mut conn,
-                &build_information_schema_foreign_keys_query(),
-                timeout_ms,
-            )
-            .await?
-            .1;
-        rows.views = self
-            .query_json(
-                &mut conn,
-                &build_information_schema_views_query(),
-                timeout_ms,
-            )
-            .await?
-            .1;
-        rows.triggers = self
-            .query_json(
-                &mut conn,
-                &build_information_schema_triggers_query(),
-                timeout_ms,
-            )
-            .await?
-            .1;
-        rows.routines = self
-            .query_json(
-                &mut conn,
-                &crate::build_information_schema_routines_query(None),
-                timeout_ms,
-            )
-            .await?
-            .1;
-        rows.parameters = self
-            .query_json(
-                &mut conn,
-                &build_information_schema_parameters_query(),
-                timeout_ms,
-            )
-            .await?
-            .1;
+        let rows = CatalogRows {
+            tables: self
+                .query_json(
+                    &mut conn,
+                    &crate::build_information_schema_tables_query(None),
+                    timeout_ms,
+                )
+                .await?
+                .1,
+            columns: self
+                .query_json(
+                    &mut conn,
+                    &build_information_schema_all_columns_query(),
+                    timeout_ms,
+                )
+                .await?
+                .1,
+            statistics: self
+                .query_json(
+                    &mut conn,
+                    &build_information_schema_all_statistics_query(),
+                    timeout_ms,
+                )
+                .await?
+                .1,
+            foreign_keys: self
+                .query_json(
+                    &mut conn,
+                    &build_information_schema_foreign_keys_query(),
+                    timeout_ms,
+                )
+                .await?
+                .1,
+            views: self
+                .query_json(
+                    &mut conn,
+                    &build_information_schema_views_query(),
+                    timeout_ms,
+                )
+                .await?
+                .1,
+            triggers: self
+                .query_json(
+                    &mut conn,
+                    &build_information_schema_triggers_query(),
+                    timeout_ms,
+                )
+                .await?
+                .1,
+            routines: self
+                .query_json(
+                    &mut conn,
+                    &crate::build_information_schema_routines_query(None),
+                    timeout_ms,
+                )
+                .await?
+                .1,
+            parameters: self
+                .query_json(
+                    &mut conn,
+                    &build_information_schema_parameters_query(),
+                    timeout_ms,
+                )
+                .await?
+                .1,
+        };
         let grants = self.grants(&mut conn).await.unwrap_or_default();
         drop(conn);
 

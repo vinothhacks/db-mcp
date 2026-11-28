@@ -107,6 +107,7 @@ fn kv(rows: &[Vec<J>]) -> BTreeMap<String, String> {
 }
 
 /// Build the health report from collected inputs (pure; unit-tested without a server).
+#[allow(clippy::too_many_arguments)]
 pub fn build_health_report(
     connection: &str,
     status: Option<&BTreeMap<String, String>>,

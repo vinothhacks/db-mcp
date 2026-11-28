@@ -1656,9 +1656,8 @@ mod tests {
             "BEGIN TRAN",
             "USE master",
         ] {
-            match eval(sql) {
-                Ok(ev) => assert!(!ev.is_allowed(), "{sql} was allowed"),
-                Err(_) => {}
+            if let Ok(ev) = eval(sql) {
+                assert!(!ev.is_allowed(), "{sql} was allowed")
             }
         }
         assert_eq!(
